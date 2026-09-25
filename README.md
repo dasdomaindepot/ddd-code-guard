@@ -108,6 +108,19 @@ agent (`opencode`, `claude` or `none`) write the report text and commits only
 
 Thresholds live in `claude/skills/code-quality/guard-policy.yml`.
 
+### Contributing
+
+Enable the pre-commit hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+It runs `gitleaks` (local or via Docker) on staged changes and, if present, a
+private denylist of regexes from `~/.config/ddd-code-guard/denylist`
+(override with `DDD_GUARD_DENYLIST`) — handy for keeping customer names and
+internal hostnames out of a public repo.
+
 ### License
 
 MIT — see [LICENSE](LICENSE).
@@ -185,6 +198,13 @@ nachsehen) · `4` Umgebung ließ sich nicht starten (`--boot`).
 
 Für den wöchentlichen Turnus per Cron gibt es `bin/guard-weekly` — Details im
 englischen Teil und in `guard-weekly --help`.
+
+### Mitentwickeln
+
+Den Pre-Commit-Hook einmal pro Klon aktivieren:
+`git config core.hooksPath .githooks`. Er fährt `gitleaks` und, falls vorhanden,
+eine private Sperrliste aus `~/.config/ddd-code-guard/denylist` — damit
+Kundennamen und interne Hosts nicht in einem öffentlichen Repo landen.
 
 ### Lizenz
 

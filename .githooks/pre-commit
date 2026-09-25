@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# pre-commit — haelt Interna aus diesem oeffentlichen Repo heraus.
+#
+# Einmal pro Klon aktivieren:  git config core.hooksPath .githooks
+#
+# Zwei Pruefungen auf den gestagten Aenderungen:
+#   1. Sperrliste: eigene Kundennamen, Hosts, Ticketnummern. Die Liste liegt
+#      bewusst ausserhalb des Repos (sonst waere sie selbst oeffentlich) unter
+#      ${DDD_GUARD_DENYLIST:-~/.config/ddd-code-guard/denylist}, ein
+#      erweiterter Regex pro Zeile, '#' leitet Kommentare ein.
+#   2. gitleaks (lokal installiert oder per Docker), falls verfuegbar.
+#
+# Im Notfall umgehen: git commit --no-verify
+
+set -uo pipefail
+
+DENYLIST="${DDD_GUARD_DENYLIST:-$HOME/.config/ddd-code-guard/denylist}"
+fail=0
+
+# Nur hinzugefuegte Zeilen pruefen -- entfernte Interna sollen den Commit
+# nicht blockieren, der sie gerade loescht.
+added="$(git diff --cached --no-color -U0 --diff-filter=ACMR | grep -E '^\+' | grep -vE '^\+\+\+ ')"
+
+if [ -f "$DENYLIST" ]; then
+    while IFS= read -r pattern; do
+        case "$pattern" in ''|'#'*) continue ;; esac
+        hits="$(printf '%s\n' "$added" | grep -Ein -- "$pattern" || true)"
+        if [ -n "$hits" ]; then
+            echo "pre-commit: Sperrliste trifft '$pattern':" >&2
+            printf '%s\n' "$hits" | head -5 | sed 's/^/    /' >&2
+            fail=1
+        fi
+    done < "$DENYLIST"
+else
+    echo "pre-commit: keine Sperrliste unter $DENYLIST -- nur gitleaks." >&2
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks git --staged --no-banner --redact >&2 || fail=1
+elif command -v docker >/dev/null 2>&1; then
+    root="$(git rev-parse --show-toplevel)"
+    docker run --rm -v "$root":/repo -w /repo zricethezav/gitleaks:latest \
+        git --staged --no-banner --redact /repo >&2 || fail=1
+else
+    echo "pre-commit: gitleaks nicht verfuegbar -- Secret-Scan uebersprungen." >&2
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "pre-commit: Commit abgebrochen. Stellen neutral formulieren." >&2
+    exit 1
+fi
