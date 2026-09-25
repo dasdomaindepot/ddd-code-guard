@@ -1,0 +1,46 @@
+# Merge-Policy des Code Guard.
+#
+# Diese Datei entscheidet, ob ein Stand durchgeht — nicht das Modell nach Gefühl.
+# Ein Projekt darf sie ueberschreiben, indem es eine eigene .ai/guard-policy.yml
+# ablegt; fehlt sie dort, gilt diese hier.
+
+version: 1
+
+# Was das deterministische Script liefert, ist nicht verhandelbar.
+gates:
+  # Ein roter Check ist ein Blocker, ausser er steht hier drin.
+  fail_is_blocker: true
+  # Fehlende Checks blockieren nicht, sind aber immer ein Befund.
+  missing_is_blocker: false
+  # Ein Lauf, der den Worktree veraendert hat, blockiert immer.
+  side_effect_is_blocker: true
+
+# Schwellen fuer die Befunde des semantischen Reviews.
+severity:
+  blocker:
+    allowed: 0
+    beschreibung: >
+      Datenverlust, Sicherheitsluecke, kaputtes Deployment, verletzte
+      Anforderung. Geht nie durch.
+  high:
+    allowed: 0
+    beschreibung: >
+      Architekturverstoss, fehlende Autorisierungspruefung, erfundene API,
+      fehlende Migration zu einer Entity-Aenderung.
+  medium:
+    allowed: 3
+    bei_ueberschreitung: yellow
+    beschreibung: >
+      N+1-Risiko, fehlender Testfall zu neuem Verhalten, unklare Benennung,
+      Duplikat. Drei sind tolerierbar, mehr nicht.
+      Mehr als drei blockieren nicht wie ein Blocker, setzen das Verdikt aber
+      auf YELLOW: das ist kein Reflex-Fix, sondern eine Entscheidung, die
+      ein Mensch trifft. Der Report muss dann ausdrücklich sagen, welche der
+      MEDIUM-Befunde er für die dringendsten hält.
+  low:
+    allowed: unlimited
+    beschreibung: >
+      Stil, Kommentare, Kleinigkeiten. Werden berichtet, blockieren nie.
+
+# Wenn eine Achse gar nicht geprueft werden konnte, zaehlt sie nicht als gruen.
+unpruefbar_ist_nicht_gruen: true

@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+#
+# guard-weekly — der wiederkehrende Qualitaets-Turnus fuer ein Projekt.
+#
+# Gedacht fuer den unbeaufsichtigten Lauf (Cron o. ae.): einmal die
+# Woche je Projekt pruefen, den Report nach docs/quality-report.md schreiben und
+# ihn auf dem Entwicklungsbranch committen.
+#
+# Die Arbeitsteilung ist Absicht. Alles Riskante — Branch wechseln, Container
+# starten, committen — macht dieses Script, deterministisch und nachlesbar. Das
+# Sprachmodell bekommt genau eine Aufgabe: aus dem gemessenen Ergebnis den
+# Reporttext schreiben. Ein schwaches lokales Modell soll nachts keine Branches
+# anfassen, und ein starkes soll es auch nicht muessen.
+#
+# Der Zustandsautomat steckt im Frontmatter des Reports:
+#
+#   guard_status: open          Befunde liegen vor, ein Mensch arbeitet sie ab.
+#                               Ein Turnuslauf ruehrt die Datei nicht an.
+#   guard_status: acknowledged  Abgehakt. Der naechste Lauf misst neu.
+#
+# Abgehakt wird mit `guard-weekly --acknowledge --project DIR`. Das Frontmatter
+# schreibt immer dieses Script, nie das Modell: der Zustand entscheidet, ob
+# naechste Woche geprueft wird, und darf nicht davon abhaengen, ob ein Modell
+# einen YAML-Block korrekt reproduziert hat.
+#
+# Exit-Codes:
+#    0  Turnus gelaufen, Report geschrieben
+#    2  Nutzungsfehler
+#   10  uebersprungen: Worktree nicht sauber
+#   11  uebersprungen: Report noch offen
+#   12  abgebrochen: Zielbranch und Hauptbranch sind auseinandergelaufen
+#   13  abgebrochen: Umgebung liess sich nicht starten
+#   14  abgebrochen: der Agent hat keinen Report geschrieben
+#   15  abgebrochen: nach dem Lauf lagen fremde Aenderungen im Worktree
+
+set -uo pipefail
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_GUARD="$SCRIPT_DIR/code-guard"
+
+PROJECT_DIR="$PWD"
+TARGET_BRANCH="develop"
+AGENT="opencode"
+DO_ACKNOWLEDGE=0
+DO_STATUS=0
+FORCE=0
+NO_COMMIT=0
+NO_PUSH=0
+BOOT_TIMEOUT=180
+# Grosszuegig: darunter liegen das Hochfahren des Stacks (bis zu 300 s), die
+# Gates und bei grossen Projekten eine Testsuite. Die engere Grenze fuer das
+# Hochfahren zieht code-guard selbst -- ein haengender Start soll nicht die
+# ganze Zeit aufbrauchen und am Ende als "Umgebung kaputt" gemeldet werden.
+GUARD_TIMEOUT=1800
+AGENT_TIMEOUT=1800
+
+# Dateien, die dauerhaft vom committeten Stand abweichen duerfen, ohne dass der
+# Worktree als "in Arbeit" gilt. Auf jedem Rechner steht eine eigene .env --
+# ohne diese Liste braeche der Turnus auf einem zweiten Rechner in jedem
+# einzelnen Projekt sofort ab.
+#
+# Sicher ist das, weil der Turnus ausschliesslich docs/quality-report.md zum
+# Commit vormerkt: eine ignorierte Datei kann gar nicht mitcommittet werden.
+# Und einen Branchwechsel, der eine solche Aenderung ueberschreiben wuerde,
+# verweigert git von sich aus.
+IGNORE_DIRTY=(".env" ".env.local" ".env.*.local" "*.bak" "*.bak-*" "*.bak.*")
+
+usage() {
+    cat <<'USAGE'
+guard-weekly — wiederkehrender Qualitaets-Turnus fuer ein Projekt
+
+Verwendung: guard-weekly --project DIR [OPTIONEN]
+
+  --project DIR     Projektverzeichnis (Vorgabe: aktuelles Verzeichnis)
+  --branch NAME     Zielbranch fuer den Report (Vorgabe: develop)
+  --agent NAME      opencode | claude | none (Vorgabe: opencode)
+                    'none' misst nur und schreibt einen Report ohne Modell
+  --acknowledge     Report als abgearbeitet markieren und das committen
+  --status          nur zeigen, was ein Lauf jetzt tun wuerde
+  --force           auch laufen, wenn der Report noch offen ist
+  --no-commit       messen und Report schreiben, aber nicht committen
+  --no-push         committen, aber nicht pushen
+  --ignore-dirty P  Pfadmuster, das den Worktree nicht als schmutzig gelten
+                    laesst (mehrfach; zusaetzlich zu .env und *.bak*)
+  --boot-timeout N  Sekunden auf den Docker-Stack warten (Vorgabe: 180)
+  --agent-timeout N Sekunden fuer den Agentenlauf (Vorgabe: 1800)
+  -h, --help        diese Hilfe
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project)       PROJECT_DIR="${2:-}"; shift 2 ;;
+        --branch)        TARGET_BRANCH="${2:-develop}"; shift 2 ;;
+        --agent)         AGENT="${2:-opencode}"; shift 2 ;;
+        --acknowledge)   DO_ACKNOWLEDGE=1; shift ;;
+        --status)        DO_STATUS=1; shift ;;
+        --force)         FORCE=1; shift ;;
+        --no-commit)     NO_COMMIT=1; shift ;;
+        --no-push)       NO_PUSH=1; shift ;;
+        --ignore-dirty)  IGNORE_DIRTY+=("${2:-}"); shift 2 ;;
+        --boot-timeout)  BOOT_TIMEOUT="${2:-180}"; shift 2 ;;
+        --agent-timeout) AGENT_TIMEOUT="${2:-1800}"; shift 2 ;;
+        -h|--help)       usage; exit 0 ;;
+        *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+cd "$PROJECT_DIR" 2>/dev/null || { echo "Verzeichnis nicht gefunden: $PROJECT_DIR" >&2; exit 2; }
+PROJECT_DIR="$PWD"
+PROJECT_NAME="$(basename "$PROJECT_DIR")"
+REPORT="docs/quality-report.md"
+
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "Kein Git-Repository: $PROJECT_DIR" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo "guard-weekly braucht jq." >&2; exit 2; }
+[ -x "$CODE_GUARD" ] || { echo "code-guard nicht gefunden: $CODE_GUARD" >&2; exit 2; }
+
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+fail() { printf '[%s] ABBRUCH: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+is_ignored_path() {
+    local f="$1" pat
+    for pat in "${IGNORE_DIRTY[@]}"; do
+        [ -n "$pat" ] || continue
+        # shellcheck disable=SC2254 -- das Muster soll ausdruecklich globben
+        case "$f" in $pat) return 0 ;; esac
+    done
+    return 1
+}
+
+# Geaenderte Pfade im Worktree, ohne die eigene Guard-Ablage. `--ignored-too`
+# nimmt die bewusst geduldeten Dateien mit auf, sonst bleiben sie draussen.
+dirty_paths() {
+    local with_ignored="${1:-}" line path
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        path="${line:3}"
+        case "$path" in docs/.guard*) continue ;; esac
+        if [ "$with_ignored" != "--ignored-too" ] && is_ignored_path "$path"; then
+            continue
+        fi
+        printf '%s\n' "$path"
+    done < <(git status --porcelain -uall 2>/dev/null)
+}
+
+# ------------------------------------------------------------- Frontmatter ---
+#
+# Bewusst kein YAML-Parser: der Block ist von diesem Script erzeugt und hat
+# genau die Form, die es selbst schreibt. Gelesen wird nur bis zum schliessenden
+# `---`, damit ein `guard_status:` im Fliesstext des Reports nicht mitzaehlt.
+
+# Liest einen Wert aus dem Frontmatter des Textes auf stdin.
+frontmatter_read() {
+    awk -v k="$1" '
+        NR == 1 && $0 !~ /^---[[:space:]]*$/ { exit }
+        NR == 1 { next }
+        /^---[[:space:]]*$/ { exit }
+        $0 ~ "^" k ":" { sub("^" k ":[[:space:]]*", ""); print; exit }
+    '
+}
+
+frontmatter_value() {
+    [ -f "$REPORT" ] || return 1
+    frontmatter_read "$1" < "$REPORT"
+}
+
+# Der Zustand haengt am Report auf dem Zielbranch, nicht an dem im gerade
+# ausgecheckten Baum. Wer den Turnus von main aus anstoesst, sieht dort keinen
+# Report -- und wuerde ohne diese Unterscheidung den offenen Report auf develop
+# ueberschreiben, also genau das, was der Zustandsautomat verhindern soll.
+branch_report_status() {
+    local br="$1" text
+    text="$(git show "$br:$REPORT" 2>/dev/null)" || { echo "absent"; return; }
+    local v; v="$(printf '%s\n' "$text" | frontmatter_read guard_status)"
+    [ -n "$v" ] && echo "$v" || echo "unmarked"
+}
+
+branch_report_value() {
+    local br="$1" key="$2"
+    git show "$br:$REPORT" 2>/dev/null | frontmatter_read "$key"
+}
+
+# Zustand aus dem gerade ausgecheckten Baum.
+compute_status() {
+    if [ ! -f "$REPORT" ]; then STATUS="absent"; return; fi
+    STATUS="$(frontmatter_value guard_status || true)"
+    [ -n "$STATUS" ] || STATUS="unmarked"
+}
+
+# Gibt den Reportkoerper ohne Frontmatter aus.
+report_body() {
+    [ -f "$REPORT" ] || return 0
+    if head -1 "$REPORT" | grep -qx -- '---'; then
+        awk 'NR == 1 { next } !seen && /^---[[:space:]]*$/ { seen = 1; next } seen' "$REPORT"
+    else
+        cat "$REPORT"
+    fi
+}
+
+# Schreibt das Frontmatter neu und haengt den bisherigen Koerper an.
+write_frontmatter() {
+    local status="$1" generated="$2" branch="$3" commit="$4" ack_at="$5" ack_commit="$6"
+    local tmp; tmp="$(mktemp)"
+    {
+        echo '---'
+        echo "guard_status: $status"
+        echo "generated_at: $generated"
+        echo "guard_branch: $branch"
+        echo "commit: $commit"
+        echo "acknowledged_at: $ack_at"
+        echo "acknowledged_commit: $ack_commit"
+        echo '---'
+        echo
+        report_body
+    } > "$tmp"
+    mv "$tmp" "$REPORT"
+}
+
+# Frischer Report: alles neu gemessen.
+mark_open() {
+    write_frontmatter "open" \
+        "$(date -Iseconds)" \
+        "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')" \
+        "$(git rev-parse --short HEAD 2>/dev/null || echo '')" \
+        "" ""
+}
+
+# Abgehakt: wann und worauf gemessen wurde, bleibt stehen. Sonst waere nach dem
+# Abhaken nicht mehr erkennbar, welchen Stand eigentlich abgearbeitet wurde.
+mark_acknowledged() {
+    write_frontmatter "acknowledged" \
+        "$(frontmatter_value generated_at || true)" \
+        "$(frontmatter_value guard_branch || true)" \
+        "$(frontmatter_value commit || true)" \
+        "$(date -Iseconds)" \
+        "$(git rev-parse --short HEAD 2>/dev/null || echo '')"
+}
+
+STATUS=""
+compute_status
+
+# ------------------------------------------------------------------ --status --
+
+if [ "$DO_STATUS" -eq 1 ]; then
+    echo "Projekt:      $PROJECT_NAME ($PROJECT_DIR)"
+    echo "Branch:       $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    echo "Zielbranch:   $TARGET_BRANCH"
+    # Massgeblich ist der Report auf dem Zielbranch. Liegt der Branch nur
+    # entfernt vor, wird dieser gelesen.
+    ref="$TARGET_BRANCH"
+    git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH" || ref="origin/$TARGET_BRANCH"
+    if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+        branch_status="$(branch_report_status "$ref")"
+        case "$branch_status" in
+            absent)       echo "Report:       fehlt auf $ref — ein Lauf wuerde pruefen und ihn anlegen" ;;
+            acknowledged) echo "Report:       abgehakt am $(branch_report_value "$ref" acknowledged_at) — ein Lauf wuerde neu pruefen" ;;
+            open)         echo "Report:       OFFEN seit $(branch_report_value "$ref" generated_at) — ein Lauf wuerde ihn in Ruhe lassen" ;;
+            unmarked)     echo "Report:       auf $ref vorhanden, aber ohne Guard-Frontmatter — ein Lauf wuerde neu pruefen" ;;
+        esac
+    else
+        echo "Report:       $TARGET_BRANCH gibt es noch nicht — ein Lauf wuerde ihn anlegen"
+    fi
+    dirty="$(dirty_paths)"
+    tolerated="$(dirty_paths --ignored-too | grep -vxF "${dirty:-__nichts__}" 2>/dev/null || true)"
+    if [ -n "$dirty" ]; then
+        echo "Worktree:     NICHT sauber — ein Lauf wuerde abbrechen:"
+        printf '%s\n' "$dirty" | sed 's/^/              /'
+    else
+        echo "Worktree:     sauber"
+    fi
+    if [ -n "$tolerated" ]; then
+        echo "Geduldet:     weicht ab, blockiert aber nicht:"
+        printf '%s\n' "$tolerated" | sed 's/^/              /'
+    fi
+    exit 0
+fi
+
+# ------------------------------------------------------------- Vorbedingungen -
+
+log "guard-weekly $VERSION — $PROJECT_NAME"
+
+# 1. Der Worktree gehoert dem Menschen, nicht dem Turnus. Ein Turnuslauf, der hier den Branch
+#    wechselt, waehrend etwas Uncommittetes herumliegt, ist ein Datenverlust —
+#    deshalb ist das die erste und haerteste Sperre.
+DIRTY="$(dirty_paths)"
+if [ -n "$DIRTY" ]; then
+    fail "Der Worktree ist nicht sauber. Es wird nichts angefasst."
+    printf '%s\n' "$DIRTY" | sed 's/^/    /' >&2
+    exit 10
+fi
+TOLERATED="$(dirty_paths --ignored-too | grep -vxF "${DIRTY:-__nichts__}" 2>/dev/null || true)"
+if [ -n "$TOLERATED" ]; then
+    log "Geduldete Abweichungen (blockieren nicht): $(printf '%s' "$TOLERATED" | tr '\n' ' ')"
+fi
+
+ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+RESTORE_BRANCH=0
+PRESERVE_DIR=""
+TOLERATED_SAVED=()
+
+# Eine geduldete Datei zu ignorieren reicht nicht: weicht sie zwischen den
+# Branches ab, verweigert git den Wechsel ("lokale Aenderungen wuerden
+# ueberschrieben") und der Turnus kommt nicht los. Genau das passiert auf
+# Rechnern, auf denen jedes Projekt eine eigene .env hat.
+#
+# Also legen wir sie vor dem Wechsel beiseite, setzen sie auf den committeten
+# Stand zurueck und schreiben sie hinterher zurueck. Bewusst per Kopie und
+# nicht per `git stash`: ein Stash ueberlebt einen Abbruch und liegt dann
+# unbemerkt im Repo herum.
+preserve_tolerated() {
+    local line path
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        path="${line:3}"
+        case "$path" in docs/.guard*) continue ;; esac
+        is_ignored_path "$path" || continue
+        # Nur getrackte Dateien stehen dem Branchwechsel im Weg.
+        git ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || continue
+
+        [ -n "$PRESERVE_DIR" ] || PRESERVE_DIR="$(mktemp -d)"
+        mkdir -p "$PRESERVE_DIR/$(dirname "$path")"
+        cp -p "$path" "$PRESERVE_DIR/$path" || continue
+        git checkout --quiet -- "$path" || continue
+        TOLERATED_SAVED+=("$path")
+    done < <(git status --porcelain -uall 2>/dev/null)
+
+    [ ${#TOLERATED_SAVED[@]} -eq 0 ] \
+        || log "Beiseite gelegt fuer den Branchwechsel: ${TOLERATED_SAVED[*]}"
+}
+
+restore_tolerated() {
+    [ ${#TOLERATED_SAVED[@]} -gt 0 ] || return 0
+    local path
+    for path in "${TOLERATED_SAVED[@]}"; do
+        [ -f "$PRESERVE_DIR/$path" ] || continue
+        cp -p "$PRESERVE_DIR/$path" "$path" \
+            || fail "Konnte $path nicht zurueckschreiben — die Sicherung liegt in $PRESERVE_DIR."
+    done
+    log "Zurueckgeschrieben: ${TOLERATED_SAVED[*]}"
+    TOLERATED_SAVED=()
+    rm -rf "$PRESERVE_DIR"
+    PRESERVE_DIR=""
+}
+
+# Committet ausschliesslich den Report -- und nur, wenn wirklich nichts anderes
+# im Baum liegt. `git add` bekommt genau diesen einen Pfad, geduldete Dateien
+# wie .env koennen also gar nicht mitwandern.
+commit_report() {
+    local message="$1"
+
+    if [ "$NO_COMMIT" -eq 1 ]; then
+        log "--no-commit: der Report bleibt uncommitted liegen."
+        return 0
+    fi
+
+    local unexpected
+    unexpected="$(dirty_paths | grep -v "^${REPORT}$" | grep -v '^$' || true)"
+    if [ -n "$unexpected" ]; then
+        fail "Ausser dem Report haben sich weitere Dateien geaendert — es wird nichts committed:"
+        printf '%s\n' "$unexpected" | sed 's/^/    /' >&2
+        return 15
+    fi
+
+    if ! dirty_paths --ignored-too | grep -qx -- "$REPORT"; then
+        log "Der Report ist unveraendert — nichts zu committen."
+        return 0
+    fi
+
+    git add -- "$REPORT" || { fail "git add fehlgeschlagen."; return 15; }
+    git commit --quiet -m "$message" || { fail "git commit fehlgeschlagen."; return 15; }
+    log "Committed auf $TARGET_BRANCH: $(git rev-parse --short HEAD)"
+
+    if [ "$NO_PUSH" -eq 1 ]; then
+        log "--no-push: der Commit bleibt lokal."
+        return 0
+    fi
+
+    if git push --quiet origin "$TARGET_BRANCH" 2>/dev/null; then
+        log "Nach origin/$TARGET_BRANCH gepusht."
+    else
+        fail "Push nach origin/$TARGET_BRANCH fehlgeschlagen — der Commit liegt lokal."
+    fi
+    return 0
+}
+
+restore_branch() {
+    [ "$RESTORE_BRANCH" -eq 1 ] || return 0
+    RESTORE_BRANCH=0
+    local now; now="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [ "$now" = "$ORIGINAL_BRANCH" ] && return 0
+    log "Zurueck auf $ORIGINAL_BRANCH."
+    git checkout --quiet "$ORIGINAL_BRANCH" 2>/dev/null \
+        || fail "Konnte nicht auf $ORIGINAL_BRANCH zurueckwechseln — bitte selbst nachsehen."
+}
+
+# Erst den Branch zuruecksetzen, dann die Dateien: sonst raeumt der Wechsel die
+# gerade zurueckgeschriebenen Inhalte gleich wieder weg.
+cleanup() {
+    restore_branch
+    restore_tolerated
+}
+trap cleanup EXIT INT TERM
+
+preserve_tolerated
+
+# --------------------------------------------------------------- Zielbranch ---
+#
+# Der Report gehoert auf den Entwicklungsbranch. Fehlt der, wird er angelegt;
+# haengt er hinterher, wird er per Fast-Forward nachgezogen. Bei echter
+# Divergenz wird NICHT gemergt: ein automatischer Merge in einem Repo, das
+# gerade niemand beobachtet, ist genau die Art von Hilfsbereitschaft, die einem
+# spaeter den Abend kostet.
+
+MAIN_BRANCH=""
+for cand in main master; do
+    if git show-ref --verify --quiet "refs/heads/$cand" || git show-ref --verify --quiet "refs/remotes/origin/$cand"; then
+        MAIN_BRANCH="$cand"; break
+    fi
+done
+
+git fetch --quiet origin 2>/dev/null || log "Hinweis: 'git fetch' ging nicht durch — es wird mit dem lokalen Stand gearbeitet."
+
+if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+    git checkout --quiet "$TARGET_BRANCH" || { fail "Wechsel auf $TARGET_BRANCH fehlgeschlagen."; exit 12; }
+    RESTORE_BRANCH=1
+
+    # Erst dem eigenen Remote-Stand folgen, dann dem Hauptbranch.
+    for upstream in "origin/$TARGET_BRANCH" "${MAIN_BRANCH:+origin/$MAIN_BRANCH}"; do
+        [ -n "$upstream" ] || continue
+        git show-ref --verify --quiet "refs/remotes/$upstream" || continue
+
+        if git merge-base --is-ancestor "$upstream" HEAD 2>/dev/null; then
+            continue   # schon enthalten
+        fi
+        if git merge-base --is-ancestor HEAD "$upstream" 2>/dev/null; then
+            log "Ziehe $TARGET_BRANCH per Fast-Forward auf $upstream nach."
+            git merge --ff-only --quiet "$upstream" || { fail "Fast-Forward auf $upstream fehlgeschlagen."; exit 12; }
+        else
+            fail "$TARGET_BRANCH und $upstream sind auseinandergelaufen — hier wird nicht automatisch gemergt."
+            echo "    Bitte selbst zusammenfuehren, danach laeuft der Turnus wieder." >&2
+            exit 12
+        fi
+    done
+elif git show-ref --verify --quiet "refs/remotes/origin/$TARGET_BRANCH"; then
+    log "Lege $TARGET_BRANCH aus origin/$TARGET_BRANCH an."
+    git checkout --quiet -b "$TARGET_BRANCH" "origin/$TARGET_BRANCH" || { fail "Anlegen von $TARGET_BRANCH fehlgeschlagen."; exit 12; }
+    RESTORE_BRANCH=1
+elif [ -n "$MAIN_BRANCH" ]; then
+    base="origin/$MAIN_BRANCH"
+    git show-ref --verify --quiet "refs/remotes/$base" || base="$MAIN_BRANCH"
+    log "$TARGET_BRANCH gibt es noch nicht — wird aus $base angelegt."
+    git checkout --quiet -b "$TARGET_BRANCH" "$base" || { fail "Anlegen von $TARGET_BRANCH aus $base fehlgeschlagen."; exit 12; }
+    RESTORE_BRANCH=1
+else
+    fail "Weder $TARGET_BRANCH noch main/master gefunden."
+    exit 12
+fi
+
+log "Auf $TARGET_BRANCH @ $(git rev-parse --short HEAD)."
+
+# Jetzt erst laesst sich der Zustand beurteilen: der Report liegt auf dem
+# Zielbranch, nicht auf dem, von dem aus der Turnus angestossen wurde.
+compute_status
+
+# --------------------------------------------------------------- Abhaken -----
+#
+# Das Abhaken nimmt denselben Weg wie der Turnus und committet die Aenderung
+# gleich mit. Bliebe sie liegen, stuende beim naechsten Lauf eine uncommittete
+# Datei im Baum -- und die Dirty-Sperre haette das Abhaken ausgerechnet daran
+# scheitern lassen, dass es stattgefunden hat.
+
+if [ "$DO_ACKNOWLEDGE" -eq 1 ]; then
+    if [ "$STATUS" = "absent" ]; then
+        fail "Auf $TARGET_BRANCH liegt kein Report zum Abhaken."
+        exit 2
+    fi
+    if [ "$STATUS" = "acknowledged" ]; then
+        log "Der Report ist bereits abgehakt (am $(frontmatter_value acknowledged_at))."
+        exit 0
+    fi
+    mark_acknowledged
+    log "Report abgehakt — der naechste Turnuslauf misst neu."
+    commit_report "chore(guard): Qualitaets-Report abgehakt"
+    exit $?
+fi
+
+if [ "$STATUS" = "open" ] && [ "$FORCE" -eq 0 ]; then
+    since="$(frontmatter_value generated_at)"
+    fail "Der Report auf $TARGET_BRANCH ist seit ${since:-unbekannt} offen und noch nicht abgehakt."
+    echo "    Abhaken mit: guard-weekly --acknowledge --project $PROJECT_DIR" >&2
+    echo "    Trotzdem messen: --force" >&2
+    exit 11
+fi
+
+# ------------------------------------------------------------------- Messung --
+
+log "Fahre code-guard (mit --boot) …"
+timeout "$GUARD_TIMEOUT" "$CODE_GUARD" --project "$PROJECT_DIR" --boot \
+    --boot-timeout "$BOOT_TIMEOUT" --no-color
+GUARD_EXIT=$?
+
+case "$GUARD_EXIT" in
+    0|1)  log "code-guard fertig (Exit $GUARD_EXIT)." ;;
+    3)    fail "code-guard meldet UNSAFE SIDE EFFECT — der Lauf hat den Worktree veraendert. Nichts wird committed."
+          exit 15 ;;
+    4)    fail "Die Umgebung liess sich nicht starten."
+          exit 13 ;;
+    124)  fail "code-guard lief in den Timeout (${GUARD_TIMEOUT}s)."
+          exit 13 ;;
+    *)    fail "code-guard endete unerwartet mit Exit $GUARD_EXIT."
+          exit 13 ;;
+esac
+
+RESULTS="docs/.guard/results.json"
+[ -f "$RESULTS" ] || { fail "code-guard hat kein $RESULTS hinterlassen."; exit 13; }
+VERDICT="$(jq -r '.verdict // "?"' "$RESULTS")"
+log "Verdikt: $VERDICT"
+
+# -------------------------------------------------------------- Reporttext ----
+#
+# Der Agent hat genau eine Schreibdatei und genau eine Aufgabe. Der Prompt ist
+# absichtlich ein einziger, enger Auftrag: mehrteilige Auftraege bricht opencode
+# gern kommentarlos ab, und ein halb erledigter Turnus ist schlimmer als gar keiner.
+
+AGENT_PROMPT="Fuehre den semantischen Teil des Qualitaets-Audits fuer dieses Projekt aus.
+
+Die deterministischen Gates sind bereits gelaufen; das Ergebnis steht in
+docs/.guard/results.json, die Logs der roten Checks in docs/.guard/logs/.
+Fahre code-guard NICHT erneut.
+
+Arbeite nach dem code-quality-Skill und schreibe das Ergebnis nach
+docs/quality-report.md. Diese Datei ist deine einzige Schreibdatei.
+Schreibe KEIN YAML-Frontmatter an den Anfang — das ergaenzt das Turnus-Script.
+Committe nichts."
+
+# Im Cron ist der PATH karg (/usr/bin:/bin). opencode liegt als Snap in
+# /snap/bin und ist dort nicht auffindbar -- der Lauf kaeme bis hierher und
+# scheiterte dann daran, dass kein Report entsteht. Lieber vorher sagen, was
+# fehlt, als hinterher raten.
+if [ "$AGENT" != "none" ] && ! command -v "$AGENT" >/dev/null 2>&1; then
+    fail "Der Agent \"$AGENT\" ist nicht im PATH ($PATH)."
+    echo "    Im Cron fehlt oft /snap/bin — dort im Crontab eine PATH-Zeile setzen." >&2
+    exit 14
+fi
+
+case "$AGENT" in
+    none)
+        log "Kein Agent angefordert — schreibe einen Report ohne Modell."
+        mkdir -p docs
+        {
+            echo "# Qualitaets-Report — $PROJECT_NAME"
+            echo
+            echo "Verdikt: **$VERDICT** (Stand $(date '+%d.%m.%Y %H:%M'))"
+            echo
+            echo "Nur die deterministischen Gates, ohne semantisches Review."
+            echo
+            echo "| Check | Status |"
+            echo "|---|---|"
+            jq -r '.checks[] | "| \(.label) | \(.status) |"' "$RESULTS"
+            echo
+            echo "Einzelheiten: \`docs/.guard/results.json\` und \`docs/.guard/logs/\`."
+        } > "$REPORT"
+        ;;
+    opencode)
+        log "Uebergebe an opencode …"
+        timeout "$AGENT_TIMEOUT" opencode run --agent code-quality --dir "$PROJECT_DIR" \
+            "$AGENT_PROMPT" < /dev/null
+        agent_exit=$?
+        # Exit 0 heisst bei opencode nicht, dass etwas geliefert wurde. Ob der
+        # Lauf etwas wert war, entscheidet der Blick auf die Datei weiter unten.
+        [ "$agent_exit" -eq 0 ] || log "Hinweis: opencode endete mit Exit $agent_exit."
+        ;;
+    claude)
+        log "Uebergebe an claude …"
+        timeout "$AGENT_TIMEOUT" claude -p "$AGENT_PROMPT" < /dev/null
+        agent_exit=$?
+        [ "$agent_exit" -eq 0 ] || log "Hinweis: claude endete mit Exit $agent_exit."
+        ;;
+    *)
+        fail "Unbekannter Agent: $AGENT (opencode|claude|none)"
+        exit 2 ;;
+esac
+
+if [ ! -f "$REPORT" ]; then
+    fail "Es liegt kein $REPORT vor — der Agent hat nichts geschrieben."
+    exit 14
+fi
+
+# Das Frontmatter setzt immer dieses Script. Der Zustand entscheidet, ob
+# naechste Woche geprueft wird; er darf nicht davon abhaengen, ob ein Modell
+# einen YAML-Block sauber reproduziert hat.
+mark_open
+log "Report geschrieben und als offen markiert."
+
+# ----------------------------------------------------------------- Commit -----
+
+if [ "$NO_COMMIT" -eq 1 ]; then
+    log "--no-commit: der Report bleibt uncommitted liegen."
+    exit 0
+fi
+
+commit_report "chore(guard): Qualitaets-Report vom $(date '+%Y-%m-%d') ($VERDICT)"
+exit $?

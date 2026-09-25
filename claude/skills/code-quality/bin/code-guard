@@ -1,0 +1,740 @@
+#!/usr/bin/env bash
+#
+# code-guard — deterministische Qualitaets-Gates fuer PHP/Symfony- und Vue-Projekte.
+#
+# Faehrt alle im Projekt vorhandenen Pruefungen, schreibt ein maschinenlesbares
+# Ergebnis nach docs/.guard/results.json und je Check ein Log daneben. Das
+# Script trifft keine Urteile ueber Architektur oder Fachlichkeit — das macht
+# anschliessend der code-quality-Skill auf Basis dieser Ergebnisse.
+#
+# Es aendert niemals Projektcode. Einzige Schreibziele: docs/.guard/**
+#
+# Exit-Codes:
+#   0  Policy erfuellt
+#   1  Policy verletzt (Blocker/High ueber Schwelle)
+#   2  Nutzungsfehler oder kein erkennbares Projekt
+#   3  Unerwartete Nebenwirkung im Worktree
+#   4  Umgebung liess sich nicht starten (nur mit --boot)
+#
+set -uo pipefail
+
+VERSION="1.4.1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------- Optionen ---
+
+PROJECT_DIR="$PWD"
+BASE_REF=""
+RUN_EXPENSIVE=0
+QUIET=0
+LIST_ONLY=0
+INSTALL_MAKE=0
+CHECK_TIMEOUT=600
+# Teure Checks (Mutation-Testing, E2E, Coverage, Asset-Build) laufen naturgemaess
+# laenger. Sie fahren nur mit --full mit, dann darf es auch dauern -- ein Abbruch
+# nach zehn Minuten liefert bei Infection nur eine Teilmessung, die nichts aussagt.
+EXPENSIVE_TIMEOUT=3600
+USE_COLOR=1
+ONLY_CHECKS=""
+BOOT_STACK=0
+BOOT_TIMEOUT=180
+# Eigene Grenze fuer `docker compose up -d`. Ohne sie frisst ein haengender
+# Start die gesamte Zeit des Laufs und meldet am Ende irrefuehrend, die
+# Umgebung liesse sich nicht starten -- nach einer Viertelstunde Warten.
+BOOT_UP_TIMEOUT=300
+# Merkt sich, ob dieser Lauf den Stack selbst hochgefahren hat. Nur dann wird er
+# am Ende wieder heruntergefahren -- eine Umgebung, die vorher schon lief, gehoert
+# jemand anderem und bleibt unangetastet.
+BOOTED_BY_US=0
+
+usage() {
+    cat <<'USAGE'
+code-guard — deterministische Qualitaets-Gates
+
+Verwendung: code-guard [OPTIONEN]
+
+  --project DIR    Projektverzeichnis (Vorgabe: aktuelles Verzeichnis)
+  --base REF       Vergleichsbasis fuer den Diff (Vorgabe: automatisch)
+  --full           teure Checks mitfahren (coverage, infection, e2e, build)
+  --boot           Docker-Stack vor dem Lauf starten und danach wieder stoppen
+                   (nur wenn er nicht ohnehin schon laeuft)
+  --boot-timeout N Sekunden auf den php-Container warten (Vorgabe: 180)
+  --boot-up-timeout N
+                   Sekunden fuer 'docker compose up -d' selbst (Vorgabe: 300)
+  --only IDS       nur diese Checks, kommagetrennt (z.B. phpstan,phpcs)
+  --list           nur das Inventar zeigen, nichts ausfuehren
+  --install-make   'make guard' in das Makefile des Projekts eintragen
+  --timeout N      Sekunden je Check (Vorgabe: 600)
+  --expensive-timeout N
+                   Sekunden je teurem Check (Vorgabe: 3600)
+  --quiet          nur das Verdikt ausgeben
+  --no-color       ohne ANSI-Farben
+  -h, --help       diese Hilfe
+
+Ergebnis: docs/.guard/results.json und docs/.guard/logs/<check>.log
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project)  PROJECT_DIR="${2:-}"; shift 2 ;;
+        --base)     BASE_REF="${2:-}"; shift 2 ;;
+        --full)     RUN_EXPENSIVE=1; shift ;;
+        --boot)     BOOT_STACK=1; shift ;;
+        --boot-timeout) BOOT_TIMEOUT="${2:-180}"; shift 2 ;;
+        --boot-up-timeout) BOOT_UP_TIMEOUT="${2:-300}"; shift 2 ;;
+        --only)     ONLY_CHECKS="${2:-}"; shift 2 ;;
+        --list)     LIST_ONLY=1; shift ;;
+        --install-make) INSTALL_MAKE=1; shift ;;
+        --timeout)  CHECK_TIMEOUT="${2:-600}"; shift 2 ;;
+        --expensive-timeout) EXPENSIVE_TIMEOUT="${2:-3600}"; shift 2 ;;
+        --quiet)    QUIET=1; shift ;;
+        --no-color) USE_COLOR=0; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+[ -t 1 ] || USE_COLOR=0
+
+if [ "$USE_COLOR" -eq 1 ]; then
+    C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+    C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+else
+    C_RESET=""; C_DIM=""; C_BOLD=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_BLUE=""
+fi
+
+command -v jq >/dev/null 2>&1 || { echo "code-guard braucht jq." >&2; exit 2; }
+
+cd "$PROJECT_DIR" 2>/dev/null || { echo "Verzeichnis nicht gefunden: $PROJECT_DIR" >&2; exit 2; }
+PROJECT_DIR="$PWD"
+PROJECT_NAME="$(basename "$PROJECT_DIR")"
+
+GUARD_DIR="$PROJECT_DIR/docs/.guard"
+LOG_DIR="$GUARD_DIR/logs"
+RESULTS_JSON="$GUARD_DIR/results.json"
+
+# ------------------------------------------------------------- Projekttyp ---
+
+HAS_MAKEFILE=0; [ -f Makefile ] && HAS_MAKEFILE=1
+HAS_COMPOSER=0; [ -f composer.json ] && HAS_COMPOSER=1
+HAS_NPM=0;      [ -f package.json ] && HAS_NPM=1
+
+if [ $HAS_MAKEFILE -eq 0 ] && [ $HAS_COMPOSER -eq 0 ] && [ $HAS_NPM -eq 0 ]; then
+    echo "Kein erkennbares Projekt in $PROJECT_DIR (weder Makefile noch composer.json noch package.json)." >&2
+    exit 2
+fi
+
+# Vorhandene Makefile-Targets einsammeln. Bewusst per grep statt `make -qp`:
+# das waere langsamer und fuehrt bei Projekten mit Include-Ketten zu Rauschen.
+MAKE_TARGETS=""
+if [ $HAS_MAKEFILE -eq 1 ]; then
+    MAKE_TARGETS="$(grep -oE '^[a-zA-Z][a-zA-Z0-9_.-]*:' Makefile 2>/dev/null | tr -d ':' | sort -u | tr '\n' ' ')"
+fi
+
+has_target() {
+    case " $MAKE_TARGETS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+has_npm_script() {
+    [ $HAS_NPM -eq 1 ] || return 1
+    jq -e --arg s "$1" '.scripts | has($s)' package.json >/dev/null 2>&1
+}
+
+# Werkzeuge laufen dort, wo das Projekt lebt: bevorzugt im Container. Die
+# Host-Versionen weichen praktisch immer ab, und der Unterschied ist nicht
+# kosmetisch — steht auf dem Host eine aeltere PHP-Version als im Container,
+# bricht schon der Composer-Autoloader am platform_check ab, und der Check ist
+# rot, ohne je etwas geprueft zu haben. Der Container ist die Laufzeit, die auch
+# in der CI und in Produktion gilt; der Host ist nur der Fallback fuer Projekte
+# ohne Docker oder mit gestoppter Umgebung.
+#
+# Von sich aus startet ein Guard-Lauf keine Container — er darf die Umgebung
+# nicht veraendern. Die eine Ausnahme ist --boot: dann faehrt er den Stack
+# ausdruecklich hoch und anschliessend wieder herunter. Das ist fuer den
+# unbeaufsichtigten Turnus gedacht, wo sonst reihenweise Projekte auf dem Host
+# gemessen wuerden und rot waeren, ohne je geprueft worden zu sein.
+
+HAS_COMPOSE=0
+if [ -f docker-compose.yml ] || [ -f compose.yaml ] || [ -f docker-compose.yaml ]; then
+    HAS_COMPOSE=1
+fi
+
+# Lokale URL der laufenden Instanz fuer den Check "web-hardening". Vorrang hat
+# GUARD_WEB_URL, sonst DOMAIN_NAME aus .env.local bzw. .env — so tragen es die
+# Projekte fuer den lokalen Reverse-Proxy ein (z. B. DOMAIN_NAME=test.de).
+WEB_URL="${GUARD_WEB_URL:-}"
+if [ -z "$WEB_URL" ]; then
+    for envfile in .env.local .env; do
+        [ -f "$envfile" ] || continue
+        dn="$(grep -E '^DOMAIN_NAME=' "$envfile" | tail -1 | cut -d= -f2- | tr -d "\"' \r")"
+        if [ -n "$dn" ]; then WEB_URL="https://$dn"; break; fi
+    done
+fi
+
+PHP_CONTAINER=""
+resolve_php_container() {
+    [ $HAS_COMPOSE -eq 1 ] || return
+    local running
+    running="$(docker compose ps --services --filter status=running 2>/dev/null)"
+    printf '%s\n' "$running" | grep -qx 'php' && PHP_CONTAINER="php"
+}
+resolve_php_container
+
+# Faehrt den Stack hoch und wartet, bis der php-Container wirklich Kommandos
+# annimmt. `docker compose up -d` kehrt zurueck, sobald die Container erzeugt
+# sind — nicht, sobald PHP darin bereit ist. Ohne das Warten misst der erste
+# Check in einen anlaufenden Container hinein und wird zufaellig rot.
+boot_stack() {
+    [ "$BOOT_STACK" -eq 1 ] || return 0
+    if [ $HAS_COMPOSE -eq 0 ]; then
+        [ "$QUIET" -eq 1 ] || echo "${C_DIM}--boot: kein docker-compose in diesem Projekt, uebersprungen.${C_RESET}"
+        return 0
+    fi
+    if [ -n "$PHP_CONTAINER" ]; then
+        [ "$QUIET" -eq 1 ] || echo "${C_DIM}--boot: Stack laeuft bereits, bleibt unangetastet.${C_RESET}"
+        return 0
+    fi
+
+    [ "$QUIET" -eq 1 ] || echo "${C_BLUE}Starte Docker-Stack …${C_RESET}"
+    local up_log; up_log="$(mktemp)"
+    timeout "$BOOT_UP_TIMEOUT" docker compose up -d >"$up_log" 2>&1
+    local up_code=$?
+    if [ "$up_code" -eq 124 ]; then
+        echo "--boot: 'docker compose up -d' lief in den Timeout (${BOOT_UP_TIMEOUT}s)." >&2
+        sed 's/^/    /' "$up_log" | tail -5 >&2
+        rm -f "$up_log"
+        # Was halb hochgekommen ist, gehoert uns -- und muss wieder weg.
+        BOOTED_BY_US=1
+        return 1
+    fi
+    if [ "$up_code" -ne 0 ]; then
+        echo "--boot: 'docker compose up -d' ist fehlgeschlagen (Exit $up_code)." >&2
+        sed 's/^/    /' "$up_log" | tail -5 >&2
+        rm -f "$up_log"
+        BOOTED_BY_US=1
+        return 1
+    fi
+    rm -f "$up_log"
+    # Ab hier sind wir verantwortlich, auch wenn das Warten scheitert.
+    BOOTED_BY_US=1
+
+    local waited=0
+    while [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
+        resolve_php_container
+        if [ -n "$PHP_CONTAINER" ] && docker compose exec -T php true >/dev/null 2>&1; then
+            [ "$QUIET" -eq 1 ] || echo "${C_DIM}Stack bereit nach ${waited}s.${C_RESET}"
+            return 0
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+
+    echo "--boot: php-Container war nach ${BOOT_TIMEOUT}s nicht bereit." >&2
+    return 1
+}
+
+# Faehrt nur herunter, was dieser Lauf selbst hochgefahren hat.
+shutdown_stack() {
+    [ "$BOOTED_BY_US" -eq 1 ] || return 0
+    BOOTED_BY_US=0
+    [ "$QUIET" -eq 1 ] || echo "${C_DIM}Fahre Docker-Stack wieder herunter …${C_RESET}"
+    docker compose down >/dev/null 2>&1 || true
+}
+
+# Ein einziger Aufraeumer fuer alles. Er haengt frueh am EXIT, damit ein Abbruch
+# zwischen Boot und Ende keinen laufenden Stack zuruecklaesst; die temporaeren
+# Dateien traegt er nach, sobald es sie gibt.
+cleanup() {
+    shutdown_stack
+    rm -f "${RESULTS_TMP:-}" "${CHANGED_LIST:-}" "${SIDE_EFFECT_LIST:-}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if ! boot_stack; then
+    exit 4
+fi
+
+# Ist das Programm im laufenden Container vorhanden? Ein Fehlschlag ist kein
+# Fehler, sondern heisst nur: auf dem Host weitersuchen.
+container_has() {
+    [ -n "$PHP_CONTAINER" ] || return 1
+    docker compose exec -T "$PHP_CONTAINER" sh -c "command -v $1" >/dev/null 2>&1
+}
+
+COMPOSER_BIN=""
+COMPOSER_WHERE=""
+resolve_composer() {
+    [ $HAS_COMPOSER -eq 1 ] || return
+    if container_has composer; then
+        COMPOSER_BIN="docker compose exec -T $PHP_CONTAINER composer"
+        COMPOSER_WHERE="Container $PHP_CONTAINER"; return
+    fi
+    if command -v composer >/dev/null 2>&1; then
+        COMPOSER_BIN="composer"; COMPOSER_WHERE="Host"; return
+    fi
+}
+resolve_composer
+
+# Bei npm wandert nur der lesende Audit in den Container: er wertet allein
+# package-lock.json plus Registry aus, braucht kein node_modules und schreibt
+# nichts. Die `npm run`-Checks bleiben bewusst auf dem Host — node_modules wird
+# dort installiert und passt zur Host-Node-Version (native Module!), und der
+# php-Container laeuft in der Regel als root, sodass ein Build im Container
+# root-Dateien in den gemounteten Baum legen wuerde.
+NPM_AUDIT_BIN=""
+NPM_WHERE=""
+resolve_npm() {
+    [ $HAS_NPM -eq 1 ] || return
+    if container_has npm; then
+        NPM_AUDIT_BIN="docker compose exec -T $PHP_CONTAINER npm"
+        NPM_WHERE="Container $PHP_CONTAINER"; return
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        NPM_AUDIT_BIN="npm"; NPM_WHERE="Host"; return
+    fi
+}
+resolve_npm
+
+# ----------------------------------------------------------------- Git-Lage ---
+
+IS_GIT=0
+GIT_BRANCH=""; GIT_COMMIT=""; BASELINE=""
+if git rev-parse --git-dir >/dev/null 2>&1; then
+    IS_GIT=1
+    GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null)"
+
+    if [ -z "$BASE_REF" ]; then
+        for cand in origin/HEAD origin/main origin/master main master; do
+            if git rev-parse --verify --quiet "$cand" >/dev/null 2>&1; then BASE_REF="$cand"; break; fi
+        done
+    fi
+    # Worktree-Zustand vor dem Lauf, ohne unsere eigenen Artefakte.
+    # -uall, sonst verschwindet eine neu angelegte Datei hinter der
+    # Sammelzeile ihres neuen Verzeichnisses -- und ein Check, der genau dort
+    # etwas ablegt, bliebe als Seiteneffekt unentdeckt.
+    BASELINE="$(git status --porcelain -uall 2>/dev/null | grep -v 'docs/\.guard' | sort)"
+fi
+
+# Dateilisten landen in temporaeren Dateien, nie in Variablen: in einem grossen
+# Repo sprengen sie sonst die Argumentliste von jq.
+CHANGED_LIST="$(mktemp)"
+SIDE_EFFECT_LIST="$(mktemp)"
+MAX_LISTED_FILES=500
+
+if [ $IS_GIT -eq 1 ]; then
+    {
+        [ -n "$BASE_REF" ] && git diff --name-only "$BASE_REF"...HEAD 2>/dev/null
+        git diff --name-only HEAD 2>/dev/null
+        git ls-files --others --exclude-standard . 2>/dev/null
+    } | grep -v 'docs/\.guard' | sort -u | head -n "$MAX_LISTED_FILES" > "$CHANGED_LIST"
+fi
+CHANGED_COUNT=$(grep -c . "$CHANGED_LIST" 2>/dev/null || echo 0)
+
+# ------------------------------------------------------------- Check-Tabelle --
+#
+# Feldreihenfolge: id|label|bereich|kosten|kommando|voraussetzung
+# Voraussetzung:  target:NAME  npm:SCRIPT  bin:NAME  file:PFAD
+#
+# Reihenfolge = Ausfuehrungsreihenfolge: billig und aussagekraeftig zuerst,
+# teuer zuletzt. So steht bei einem Abbruch schon das Wesentliche im Log.
+
+CHECK_DEFS=(
+  "composer-validate|Composer-Metadaten|dependencies|cheap|$COMPOSER_BIN validate --no-check-publish --no-interaction|composer,file:composer.json"
+  "composer-audit|Composer-Sicherheit|security|cheap|$COMPOSER_BIN audit --locked --abandoned=report --no-interaction|composer,file:composer.lock"
+  "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
+  "phpcs|Coding-Standard|style|normal|make phpcs|target:phpcs"
+  "phpstan|Statische Analyse|static|normal|make phpstan|target:phpstan"
+  "deptrac|Architekturregeln|architecture|normal|make deptrac|target:deptrac"
+  "lint|Projekt-Linter|style|normal|make lint|target:lint"
+  "npm-lint|Frontend-Linter|frontend|normal|npm run lint|npm:lint"
+  "npm-typecheck|Frontend-Typen|frontend|normal|npm run typecheck|npm:typecheck"
+  "npm-test|Frontend-Tests|frontend|normal|npm run test|npm:test"
+  "test|Tests|tests|normal|make test|target:test"
+  "coverage|Coverage|tests|expensive|make coverage|target:coverage"
+  "infection|Mutation-Testing|tests|expensive|make infection|target:infection"
+  "e2e|End-to-End|tests|expensive|make e2e|target:e2e"
+  "npm-build|Asset-Build|frontend|expensive|npm run build|npm:build"
+  "web-hardening|Web-Haertung|security|normal|$SCRIPT_DIR/check-web-hardening $WEB_URL|web-url"
+)
+
+# Beratende Checks: Ein Befund wird WARN statt FAIL und blockiert nicht.
+#
+# web-hardening (Security-Header, Versionspreisgabe, robots.txt, noindex in der
+# Sitemap, seit 1.4.1 auch Kompression und Browser-Cache der Assets) kam am
+# 25.09.2026 dazu, als fast kein Projekt die Header hatte. Scharf
+# geschaltet haette er ueber Nacht jeden Guard rot gemacht. Die Header kommen
+# zentral per Reverse-Proxy; sobald die ueberall ausgerollt sind,
+# den Check hier herausnehmen — dann blockiert er wie jeder andere.
+ADVISORY_CHECKS=" web-hardening "
+
+# `make coverage-check` haelt eine Mindestschwelle ein, `make coverage` misst nur.
+# Wo die Ratsche existiert, wird sie gefahren -- eine Messung ohne Schwelle kann
+# nicht rot werden und ist damit kein Gate.
+if has_target coverage-check; then
+    for i in "${!CHECK_DEFS[@]}"; do
+        case "${CHECK_DEFS[$i]}" in
+            coverage\|*)
+                CHECK_DEFS[$i]="coverage|Coverage (Ratsche)|tests|expensive|make coverage-check|target:coverage-check"
+                ;;
+        esac
+    done
+fi
+
+# Hat das Projekt ein eigenes Build-Ziel, faehrt der Guard dieses statt `npm run
+# build`. Das Projekt weiss besser, wo gebaut gehoert: In den PHP-Projekten mit
+# Docker baut `make build-assets` im Container, und `public/build/` gehoert dort
+# www-data -- ein `npm run build` vom Host scheitert dann mit EACCES auf der
+# manifest.json, ohne dass am Code etwas falsch waere. Umgekehrt haengen solche
+# Ziele oft noch Schritte an, die ein nacktes `npm run build` unterschlaegt
+# (bei Sulu etwa `sulu:admin:update-build`).
+#
+# Der Host bleibt der Normalfall: Wo kein solches Ziel existiert, aendert sich
+# nichts -- node_modules passt dort zur Host-Node-Version (native Module!), und
+# ein Build im root-Container wuerde root-Dateien in den gemounteten Baum legen.
+#
+# Ausdruecklich NUR `build-assets`. Das naheliegende `assets` waere ein
+# Fehlgriff: In den meisten Projekten steht dahinter
+# `bin/console assets:install public`, also das Verteilen von Bundle-Assets --
+# nicht der Frontend-Build. Der Guard wuerde dann gruen melden, ohne je etwas
+# gebaut zu haben, und das ist schlechter als ein Check, der gar nicht laeuft.
+if has_target build-assets; then
+    for i in "${!CHECK_DEFS[@]}"; do
+        case "${CHECK_DEFS[$i]}" in
+            npm-build\|*)
+                CHECK_DEFS[$i]="npm-build|Asset-Build|frontend|expensive|make build-assets|target:build-assets"
+                ;;
+        esac
+    done
+fi
+
+# `make phpunit` ist in einigen Projekten das Testziel statt `make test`.
+if ! has_target test && has_target phpunit; then
+    CHECK_DEFS=("${CHECK_DEFS[@]/test|Tests|tests|normal|make test|target:test/test|Tests|tests|normal|make phpunit|target:phpunit}")
+fi
+
+requirement_met() {
+    local reqs="$1" req
+    IFS=',' read -ra REQ_ARR <<< "$reqs"
+    for req in "${REQ_ARR[@]}"; do
+        case "$req" in
+            target:*) has_target "${req#target:}" || return 1 ;;
+            npm:*)    has_npm_script "${req#npm:}" || return 1 ;;
+            bin:*)    command -v "${req#bin:}" >/dev/null 2>&1 || return 1 ;;
+            file:*)   [ -f "${req#file:}" ] || return 1 ;;
+            composer) [ -n "$COMPOSER_BIN" ] || return 1 ;;
+            npm-audit-bin) [ -n "$NPM_AUDIT_BIN" ] || return 1 ;;
+            web-url)  [ -n "$WEB_URL" ] || return 1 ;;
+        esac
+    done
+    return 0
+}
+
+requirement_missing_reason() {
+    local reqs="$1" req
+    IFS=',' read -ra REQ_ARR <<< "$reqs"
+    for req in "${REQ_ARR[@]}"; do
+        case "$req" in
+            target:*) has_target "${req#target:}" || { echo "make-Target '${req#target:}' fehlt"; return; } ;;
+            npm:*)    has_npm_script "${req#npm:}" || { echo "npm-Script '${req#npm:}' fehlt"; return; } ;;
+            bin:*)    command -v "${req#bin:}" >/dev/null 2>&1 || { echo "Programm '${req#bin:}' nicht im PATH"; return; } ;;
+            file:*)   [ -f "${req#file:}" ] || { echo "Datei '${req#file:}' fehlt"; return; } ;;
+            composer) [ -n "$COMPOSER_BIN" ] || { echo "composer weder im laufenden php-Container noch im PATH"; return; } ;;
+            npm-audit-bin) [ -n "$NPM_AUDIT_BIN" ] || { echo "npm weder im laufenden php-Container noch im PATH"; return; } ;;
+            web-url)  [ -n "$WEB_URL" ] || { echo "keine lokale URL (DOMAIN_NAME in .env oder GUARD_WEB_URL)"; return; } ;;
+        esac
+    done
+    echo "unbekannt"
+}
+
+# ----------------------------------------------------------------- Installer --
+#
+# Traegt ein duennes Target ins Projekt-Makefile ein, das auf das zentrale
+# Script zeigt. Der Pfad ist ueber GUARD ueberschreibbar, damit derselbe Aufruf
+# auch in der CI funktioniert, wo das Script woanders liegt.
+
+if [ "$INSTALL_MAKE" -eq 1 ]; then
+    if [ ! -f Makefile ]; then
+        echo "Kein Makefile in $PROJECT_DIR — nichts einzutragen." >&2
+        exit 2
+    fi
+    if grep -qE '^guard:' Makefile; then
+        echo "${C_DIM}'make guard' ist in $PROJECT_NAME bereits eingetragen — nichts zu tun.${C_RESET}"
+        exit 0
+    fi
+    # Endet das Makefile ohne Zeilenumbruch, verbraucht der erste \n nur das
+    # fehlende Zeilenende — dann fehlt die Leerzeile vor unserem Block, und git
+    # zeigt die letzte fremde Zeile als geaendert. Deshalb vorher pruefen.
+    if [ -n "$(tail -c 1 Makefile)" ]; then
+        printf '\n' >> Makefile
+    fi
+    {
+        printf '\n'
+        printf '# --- Code Guard (zentrales Script, siehe ~/.claude/skills/code-quality/) ---\n'
+        printf 'GUARD ?= $(HOME)/.claude/skills/code-quality/bin/code-guard\n'
+        printf '\n'
+        printf 'guard:\n'
+        printf '\t@test -x "$(GUARD)" || { echo "code-guard nicht gefunden: $(GUARD)"; exit 1; }\n'
+        printf '\t@"$(GUARD)" $(GUARD_ARGS)\n'
+        printf '\n'
+        printf 'guard-full:\n'
+        printf '\t@test -x "$(GUARD)" || { echo "code-guard nicht gefunden: $(GUARD)"; exit 1; }\n'
+        printf '\t@"$(GUARD)" --full $(GUARD_ARGS)\n'
+        printf '\n'
+        printf '.PHONY: guard guard-full\n'
+    } >> Makefile
+    echo "${C_GREEN}'make guard' und 'make guard-full' in $PROJECT_NAME/Makefile eingetragen.${C_RESET}"
+    exit 0
+fi
+
+# ------------------------------------------------------------------ Inventar --
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+    echo "${C_BOLD}Inventar — $PROJECT_NAME${C_RESET}"
+    echo "${C_DIM}$PROJECT_DIR${C_RESET}"
+    echo
+    for def in "${CHECK_DEFS[@]}"; do
+        IFS='|' read -r id label area cost cmd reqs <<< "$def"
+        if requirement_met "$reqs"; then
+            marker="${C_GREEN}vorhanden${C_RESET}"
+            [ "$cost" = "expensive" ] && marker="${C_GREEN}vorhanden${C_RESET} ${C_DIM}(nur mit --full)${C_RESET}"
+        else
+            marker="${C_DIM}fehlt — $(requirement_missing_reason "$reqs")${C_RESET}"
+        fi
+        printf '  %-18s %-22s %s\n' "$id" "$label" "$marker"
+    done
+    exit 0
+fi
+
+# --------------------------------------------------------------- Ausfuehrung --
+
+mkdir -p "$LOG_DIR" || { echo "Kann $LOG_DIR nicht anlegen." >&2; exit 2; }
+# Der Ausgabeordner versteckt sich selbst vor Git. So verschmutzt ein Guard-Lauf
+# keinen fremden Worktree und die Projekt-.gitignore bleibt unberuehrt.
+printf '*\n' > "$GUARD_DIR/.gitignore"
+rm -f "$LOG_DIR"/*.log 2>/dev/null
+
+# Kein eigener trap mehr: cleanup() haengt bereits am EXIT und raeumt diese
+# Datei mit ab. Ein zweiter trap wuerde den ersten ersetzen und einen per
+# --boot gestarteten Stack laufen lassen.
+RESULTS_TMP="$(mktemp)"
+
+STARTED_AT="$(date -Iseconds)"
+RUN_START=$(date +%s)
+
+[ "$QUIET" -eq 1 ] || {
+    echo "${C_BOLD}code-guard $VERSION${C_RESET} — $PROJECT_NAME"
+    [ $IS_GIT -eq 1 ] && echo "${C_DIM}Branch $GIT_BRANCH @ $GIT_COMMIT · Basis ${BASE_REF:-keine} · $CHANGED_COUNT geaenderte Datei(en)${C_RESET}"
+    # Wo die Werkzeuge laufen, entscheidet mit, was sie sehen — das gehoert sichtbar
+    # in den Kopf und nicht in eine Fussnote.
+    WHERE_LINE=""
+    [ -n "$COMPOSER_WHERE" ] && WHERE_LINE="composer: $COMPOSER_WHERE"
+    [ -n "$NPM_WHERE" ] && WHERE_LINE="${WHERE_LINE:+$WHERE_LINE · }npm audit: $NPM_WHERE"
+    [ -n "$WHERE_LINE" ] && echo "${C_DIM}$WHERE_LINE${C_RESET}"
+    echo
+}
+
+# Ein Check liefert genau eine JSON-Zeile in $RESULTS_TMP.
+emit() {
+    jq -nc \
+        --arg id "$1" --arg label "$2" --arg area "$3" --arg status "$4" \
+        --arg command "$5" --arg log "$6" --arg note "$7" \
+        --argjson exit_code "$8" --argjson duration "$9" \
+        '{id:$id,label:$label,area:$area,status:$status,command:$command,
+          exit_code:$exit_code,duration_s:$duration,log:$log,note:$note}' \
+        >> "$RESULTS_TMP"
+}
+
+# Verdichtet ein Fehlerlog auf die Zeilen, die etwas aussagen.
+summarize_log() {
+    local f="$1" lines total
+    total=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+    lines="$(tr -d '\000' < "$f" \
+        | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        | grep -vE '^[[:space:]]*[-+|=_*]+[[:space:]]*$' \
+        | grep -vE '^[[:space:]]*\|' \
+        | grep -vE 'dubious ownership|correct ownership|safe\.directory|add an exception for this directory|git config --global --add|^fatal: detected' \
+        | grep -vE 'To address (all|these) issues|npm audit fix|Run .npm audit. for details|^[[:space:]]*run:' \
+        | grep -vE '^[[:space:]]*$' \
+        | sed 's/[[:space:]]\+/ /g' \
+        | tail -n 3 | tr '\n' ' ' | cut -c1-300)"
+    if [ -z "${lines// /}" ]; then
+        lines="$(tr -d '\000' < "$f" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+            | grep -vE '^[[:space:]]*$' | head -n 2 | tr '\n' ' ' | cut -c1-200)"
+    fi
+    printf '%s(%s Zeilen im Log)' "$lines" "${total:-?}"
+}
+
+print_row() {
+    local status="$1" label="$2" detail="$3" color
+    case "$status" in
+        PASS)    color="$C_GREEN" ;;
+        FAIL)    color="$C_RED" ;;
+        TIMEOUT) color="$C_RED" ;;
+        MISSING|SKIPPED) color="$C_DIM" ;;
+        *)       color="$C_YELLOW" ;;
+    esac
+    [ "$QUIET" -eq 1 ] || printf '  %s%-8s%s %-22s %s\n' "$color" "$status" "$C_RESET" "$label" "${C_DIM}${detail}${C_RESET}"
+}
+
+for def in "${CHECK_DEFS[@]}"; do
+    IFS='|' read -r id label area cost cmd reqs <<< "$def"
+
+    if [ -n "$ONLY_CHECKS" ] && [[ ",$ONLY_CHECKS," != *",$id,"* ]]; then
+        continue
+    fi
+
+    if ! requirement_met "$reqs"; then
+        emit "$id" "$label" "$area" "MISSING" "$cmd" "" "$(requirement_missing_reason "$reqs")" 0 0
+        print_row "MISSING" "$label" "$(requirement_missing_reason "$reqs")"
+        continue
+    fi
+
+    if [ "$cost" = "expensive" ] && [ "$RUN_EXPENSIVE" -eq 0 ]; then
+        emit "$id" "$label" "$area" "SKIPPED" "$cmd" "" "teurer Check, nur mit --full" 0 0
+        print_row "SKIPPED" "$label" "nur mit --full"
+        continue
+    fi
+
+    log_file="$LOG_DIR/$id.log"
+    check_start=$(date +%s)
+    # Teure Checks bekommen mehr Luft als die schnellen Gates.
+    if [ "$cost" = "expensive" ]; then
+        this_timeout="$EXPENSIVE_TIMEOUT"
+    else
+        this_timeout="$CHECK_TIMEOUT"
+    fi
+    # stdin von /dev/null: kein Check darf auf eine Eingabe warten und haengen.
+    timeout --signal=TERM --kill-after=30 "$this_timeout" \
+        bash -c "$cmd" > "$log_file" 2>&1 < /dev/null
+    code=$?
+    duration=$(( $(date +%s) - check_start ))
+
+    if [ $code -eq 124 ] || [ $code -eq 137 ]; then
+        status="TIMEOUT"; note="nach ${this_timeout}s abgebrochen"
+    elif [ $code -eq 0 ]; then
+        status="PASS"; note=""
+        # PHPUnit laeuft ohne Coverage-Treiber anstandslos durch und meldet Exit 0 --
+        # gemessen hat es dabei nichts. Als PASS gezaehlt waere das ein Gate, das
+        # gar nicht rot werden kann. Deshalb gilt es als nicht vorhanden.
+        if [ "$id" = "coverage" ] && grep -q 'No code coverage driver available' "$log_file" 2>/dev/null; then
+            status="MISSING"
+            note="kein Coverage-Treiber aktiv (xdebug/pcov) — es wurde nichts gemessen"
+        fi
+    elif [ $code -eq 77 ]; then
+        # Der Check konnte nicht messen (etwa: lokale Instanz laeuft nicht). Das
+        # ist eine Luecke, kein Verstoss.
+        status="MISSING"; note="$(summarize_log "$log_file")"
+    else
+        status="FAIL"; note="$(summarize_log "$log_file")"
+        if [[ "$ADVISORY_CHECKS" == *" $id "* ]]; then
+            status="WARN"
+            note="$(grep -c '^BEFUND' "$log_file" 2>/dev/null || echo '?') Befund(e), beratend — siehe docs/.guard/logs/$id.log"
+        fi
+    fi
+
+    emit "$id" "$label" "$area" "$status" "$cmd" "docs/.guard/logs/$id.log" "$note" "$code" "$duration"
+    print_row "$status" "$label" "${duration}s${note:+ · $note}"
+done
+
+RUN_DURATION=$(( $(date +%s) - RUN_START ))
+
+# -------------------------------------------------------------- Seiteneffekt --
+
+SIDE_EFFECT=false
+if [ $IS_GIT -eq 1 ]; then
+    AFTER="$(git status --porcelain -uall 2>/dev/null | grep -v 'docs/\.guard' | sort)"
+    if [ "$AFTER" != "$BASELINE" ]; then
+        SIDE_EFFECT=true
+        # BEIDE Richtungen protokollieren.
+        #
+        # comm -13 zeigt, was neu dazugekommen ist — ein Check, der eine Datei
+        # ablegt. comm -23 zeigt, was VERSCHWUNDEN ist, und das ist der
+        # haeufigere Fall: Ein Check regeneriert eine Datei (etwa
+        # config/reference.php beim Cache-Warmup), sie entspricht danach wieder
+        # dem committeten Stand und faellt damit aus `git status` heraus.
+        #
+        # Frueher lief nur comm -13. Genau bei diesem Fall blieb die Liste leer,
+        # der Report zeigte `files: []` — ein Alarm ohne jeden Anhaltspunkt.
+        # Und weil ein zweiter Lauf nichts mehr zu regenerieren findet, war der
+        # Ausloeser danach nicht mehr zu ermitteln.
+        {
+            comm -13 <(printf '%s\n' "$BASELINE") <(printf '%s\n' "$AFTER") 2>/dev/null \
+                | sed 's/^/neu:          /'
+            comm -23 <(printf '%s\n' "$BASELINE") <(printf '%s\n' "$AFTER") 2>/dev/null \
+                | sed 's/^/verschwunden: /'
+        } | head -n "$MAX_LISTED_FILES" > "$SIDE_EFFECT_LIST"
+    fi
+fi
+
+# ------------------------------------------------------------------ Verdikt ---
+#
+# Das Script urteilt nur ueber das, was es selbst gemessen hat. MISSING und
+# SKIPPED werden nie zu PASS verrechnet — sie sind Befunde, keine Erfolge.
+
+n_pass=$(grep -c '"status":"PASS"' "$RESULTS_TMP" || true)
+n_fail=$(grep -cE '"status":"(FAIL|TIMEOUT)"' "$RESULTS_TMP" || true)
+n_missing=$(grep -c '"status":"MISSING"' "$RESULTS_TMP" || true)
+n_skipped=$(grep -c '"status":"SKIPPED"' "$RESULTS_TMP" || true)
+n_warn=$(grep -c '"status":"WARN"' "$RESULTS_TMP" || true)
+
+if [ "$SIDE_EFFECT" = true ]; then
+    VERDICT="UNSAFE"
+elif [ "$n_fail" -gt 0 ]; then
+    VERDICT="FAIL"
+elif [ $((n_pass + n_warn)) -eq 0 ]; then
+    # Ein WARN hat gemessen — nur wenn gar nichts gelaufen ist, ist der Lauf leer.
+    VERDICT="INCOMPLETE"
+elif [ "$n_missing" -gt 0 ]; then
+    VERDICT="PASS_WITH_GAPS"
+else
+    VERDICT="PASS"
+fi
+
+jq -n \
+    --arg schema "1" --arg version "$VERSION" \
+    --arg project "$PROJECT_NAME" --arg path "$PROJECT_DIR" \
+    --arg generated_at "$STARTED_AT" --arg verdict "$VERDICT" \
+    --arg branch "$GIT_BRANCH" --arg commit "$GIT_COMMIT" --arg base_ref "$BASE_REF" \
+    --argjson duration "$RUN_DURATION" \
+    --argjson expensive "$([ $RUN_EXPENSIVE -eq 1 ] && echo true || echo false)" \
+    --argjson side_effect "$SIDE_EFFECT" \
+    --rawfile side_effect_files "$SIDE_EFFECT_LIST" \
+    --rawfile changed_files "$CHANGED_LIST" \
+    --argjson counts "$(jq -n --argjson p "$n_pass" --argjson f "$n_fail" --argjson m "$n_missing" --argjson s "$n_skipped" --argjson w "$n_warn" \
+        '{PASS:$p,FAIL:$f,MISSING:$m,SKIPPED:$s,WARN:$w}')" \
+    --slurpfile checks <(jq -s '.' "$RESULTS_TMP") \
+    '{schema:($schema|tonumber), guard_version:$version, project:$project, path:$path,
+      generated_at:$generated_at, duration_s:$duration, expensive_checks_run:$expensive,
+      git:{branch:$branch, commit:$commit, base_ref:$base_ref,
+           changed_files:($changed_files | split("\n") | map(select(length>0)))},
+      side_effect:{detected:$side_effect,
+                   files:($side_effect_files | split("\n") | map(select(length>0)))},
+      counts:$counts, checks:$checks[0], verdict:$verdict}' \
+    > "$RESULTS_JSON"
+
+# ----------------------------------------------------------------- Ausgabe ----
+
+if [ "$QUIET" -eq 0 ]; then
+    echo
+    case "$VERDICT" in
+        PASS)           echo "${C_GREEN}${C_BOLD}VERDIKT: PASS${C_RESET} — $n_pass Checks gruen$([ "$n_warn" -gt 0 ] && echo ", $n_warn mit Warnung")" ;;
+        PASS_WITH_GAPS) echo "${C_YELLOW}${C_BOLD}VERDIKT: PASS MIT LUECKEN${C_RESET} — $n_pass gruen, $n_missing Check(s) gar nicht vorhanden" ;;
+        FAIL)           echo "${C_RED}${C_BOLD}VERDIKT: FAIL${C_RESET} — $n_fail von $((n_pass + n_fail)) ausgefuehrten Checks rot" ;;
+        INCOMPLETE)     echo "${C_YELLOW}${C_BOLD}VERDIKT: UNVOLLSTAENDIG${C_RESET} — kein einziger Check konnte laufen" ;;
+        UNSAFE)         echo "${C_RED}${C_BOLD}VERDIKT: UNSAFE SIDE EFFECT${C_RESET} — der Lauf hat den Worktree veraendert:"
+                        sed 's/^/    /' "$SIDE_EFFECT_LIST" ;;
+    esac
+    [ "$n_warn" -gt 0 ] && echo "${C_YELLOW}$n_warn beratende(r) Check(s) mit Befunden (WARN) — blockiert nicht, gehoert aber in den Report.${C_RESET}"
+    [ "$n_skipped" -gt 0 ] && echo "${C_DIM}$n_skipped teure Check(s) uebersprungen — mit --full mitfahren.${C_RESET}"
+    echo "${C_DIM}Ergebnis: $RESULTS_JSON${C_RESET}"
+else
+    echo "$VERDICT"
+fi
+
+case "$VERDICT" in
+    UNSAFE)                     exit 3 ;;
+    FAIL|INCOMPLETE)            exit 1 ;;
+    PASS|PASS_WITH_GAPS)        exit 0 ;;
+esac

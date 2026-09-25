@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# check-web-hardening — Web-Härtung einer lokal laufenden Instanz prüfen.
+#
+# Aufgerufen vom Code Guard (Check "web-hardening"), lässt sich aber auch allein
+# fahren:   check-web-hardening https://test.de
+#
+# Geprüft wird, was ein Besucher bekommt — also Antwort von App PLUS Traefik.
+# Deshalb gegen die lokale Instanz hinter dem lokalen Reverse-Proxy, der dieselbe
+# globale Header-Middleware setzen sollte wie die Server. Anlass war ein
+# SEO-Audit, der fehlende Header und Kompression aufgedeckt hat.
+#
+# Prüfpunkte:
+#   1. Security-Header: HSTS, X-Content-Type-Options nosniff, Referrer-Policy
+#   2. Keine Versionspreisgabe: kein X-Powered-By, keine Versionsnummer im Server-Header
+#   3. robots.txt vorhanden und sperrt keinen Bot komplett aus (Hausstandard: alles lesbar)
+#   4. sitemap.xml (falls vorhanden): keine URL mit noindex, keine URL ohne 200
+#   5. Auslieferung: HTML/CSS/JS komprimiert, gehashte Build-Dateien lange cachebar
+#   X-Frame-Options/CSP und Permissions-Policy sind Opt-in pro Projekt und werden
+#   nur als Hinweis gezeigt, nie als Befund.
+#
+# Nur lesende GET-Anfragen, ausschließlich gegen die übergebene lokale URL.
+#
+# Exit-Codes:
+#    0  alles in Ordnung
+#    1  Befunde
+#   77  nicht messbar (Instanz nicht erreichbar oder liefert keine App-Seite)
+
+set -uo pipefail
+
+BASE="${1:-}"
+BASE="${BASE%/}"
+[ -n "$BASE" ] || { echo "Verwendung: check-web-hardening <https://lokale-url>" >&2; exit 2; }
+
+MAX_SITEMAP_URLS="${MAX_SITEMAP_URLS:-150}"
+CURL=(curl -sk --max-time 15)
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+FINDINGS=0
+finding() { echo "BEFUND   $*"; FINDINGS=$((FINDINGS + 1)); }
+ok()      { echo "ok       $*"; }
+hint()    { echo "Hinweis  $*"; }
+
+# ---------------------------------------------------------------- Startseite --
+
+code=$("${CURL[@]}" -L -D "$TMP/h" -o "$TMP/body" -w '%{http_code}' "$BASE/")
+if [ "$code" != "200" ]; then
+    # Auch ein Catch-all des lokalen Reverse-Proxys antwortet — mit einem
+    # Statuscode, der nach App aussieht. Ohne 200 auf / messen wir nicht die App.
+    echo "Startseite $BASE/ liefert HTTP $code — lokale Instanz läuft nicht oder ist nicht die App."
+    exit 77
+fi
+
+header() { grep -i "^$1:" "$TMP/h" | tail -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//'; }
+
+hsts="$(header Strict-Transport-Security)"
+if [ -n "$hsts" ]; then ok "Strict-Transport-Security: $hsts"; else finding "Strict-Transport-Security fehlt"; fi
+
+xcto="$(header X-Content-Type-Options)"
+if [ "${xcto,,}" = "nosniff" ]; then ok "X-Content-Type-Options: nosniff"; else finding "X-Content-Type-Options: nosniff fehlt${xcto:+ (ist: $xcto)}"; fi
+
+refpol="$(header Referrer-Policy)"
+if [ -n "$refpol" ]; then ok "Referrer-Policy: $refpol"; else finding "Referrer-Policy fehlt"; fi
+
+powered="$(header X-Powered-By)"
+if [ -n "$powered" ]; then finding "X-Powered-By verrät die Technik: $powered (expose_php = Off bzw. Header entfernen)"; else ok "kein X-Powered-By"; fi
+
+server="$(header Server)"
+if [[ "$server" =~ [0-9]+\.[0-9]+ ]]; then finding "Server-Header nennt eine Version: $server (nginx: server_tokens off)"; else ok "Server-Header ohne Version${server:+ ($server)}"; fi
+
+# Symfony setzt im Debug-Modus auf JEDER Antwort "X-Robots-Tag: noindex"
+# (framework.disallow_search_engine_index). Steht der Header schon auf der
+# Startseite, ist das Umgebungsschutz und kein Seitenbefund — dann zählt für die
+# Sitemap-Prüfung nur das <meta name="robots"> der einzelnen Seite.
+ENV_NOINDEX=0
+if [[ "$(header X-Robots-Tag)" == *noindex* ]]; then
+    ENV_NOINDEX=1
+    hint "X-Robots-Tag: noindex auf der Startseite — als Umgebungsschutz gewertet (Symfony-Debug), Sitemap prüft nur Meta-Robots"
+fi
+
+xfo="$(header X-Frame-Options)"; csp="$(header Content-Security-Policy)"
+if [ -n "$xfo" ] || [[ "$csp" == *frame-ancestors* ]]; then ok "Clickjacking-Schutz vorhanden"; else hint "kein X-Frame-Options/frame-ancestors — Opt-in: security-headers-strict@docker, sofern die Seite nicht eingebettet wird"; fi
+[ -n "$(header Permissions-Policy)" ] || hint "keine Permissions-Policy — Opt-in wie oben"
+
+# --------------------------------------------------------------- robots.txt --
+
+code=$("${CURL[@]}" -o "$TMP/robots" -w '%{http_code}' "$BASE/robots.txt")
+if [ "$code" != "200" ]; then
+    finding "robots.txt fehlt (HTTP $code)"
+else
+    # Hausstandard (Alexander, 25.09.2026): Jeder darf alles lesen — Suchmaschinen,
+    # KI-Suchen und KI-Trainings-Crawler. Befund ist deshalb JEDE Gruppe, die die
+    # ganze Seite sperrt, egal fuer welchen Bot (frueher z. B. "CCBot / Disallow: /").
+    # Teilsperren wie "Disallow: /admin" bleiben erlaubt.
+    #
+    # Aufeinanderfolgende User-agent-Zeilen bilden eine Gruppe; die folgenden Regeln
+    # gelten fuer alle Agents der Gruppe.
+    blocked=$(awk '
+        # Kein IGNORECASE: Das System-awk ist oft mawk und kennt es nicht -- die
+        # Pruefung sah dann nur kleingeschriebenes "user-agent:". Deshalb tolower().
+        BEGIN { in_rules=0; n=0 }
+        {
+            line=$0; sub(/\r$/, "", line); sub(/#.*/, "", line); lc=tolower(line)
+            if (lc ~ /^[[:space:]]*user-agent:/) {
+                if (in_rules) { n=0; in_rules=0 }
+                ua=line; sub(/^[^:]*:[[:space:]]*/, "", ua); gsub(/[[:space:]]/, "", ua)
+                agents[++n]=ua; next
+            }
+            if (lc ~ /^[[:space:]]*(allow|disallow|crawl-delay):/) in_rules=1
+            if (lc ~ /^[[:space:]]*disallow:[[:space:]]*\/[[:space:]]*$/) for (i=1; i<=n; i++) print agents[i]
+        }
+    ' "$TMP/robots" | sort -u | paste -sd, -)
+    if [ -n "$blocked" ]; then
+        finding "robots.txt sperrt die ganze Seite fuer: $blocked — Hausstandard ist 'alles darf gelesen werden'"
+    else
+        ok "robots.txt vorhanden, kein Bot komplett ausgesperrt"
+    fi
+fi
+
+# -------------------------------------------------------------- sitemap.xml --
+
+code=$("${CURL[@]}" -o "$TMP/sitemap" -w '%{http_code}' "$BASE/sitemap.xml")
+if [ "$code" != "200" ]; then
+    hint "keine sitemap.xml (HTTP $code) — Sitemap-Prüfung übersprungen"
+else
+    # Sitemap-Index: Unter-Sitemaps werden nicht verfolgt, das bleibt ein Hinweis.
+    if grep -q '<sitemapindex' "$TMP/sitemap"; then
+        hint "sitemap.xml ist ein Sitemap-Index — Unter-Sitemaps werden nicht geprüft"
+    else
+        grep -o '<loc>[^<]*</loc>' "$TMP/sitemap" | sed -E 's#</?loc>##g; s/&amp;/\&/g' > "$TMP/locs"
+        total=$(wc -l < "$TMP/locs" | tr -d ' ')
+        checked=0; bad=0
+        while IFS= read -r loc; do
+            [ "$checked" -ge "$MAX_SITEMAP_URLS" ] && break
+            checked=$((checked + 1))
+            # Die Sitemap kann den Produktions-Host nennen — gemessen wird lokal.
+            path="$(printf '%s' "$loc" | sed -E 's#^https?://[^/]+##')"
+            [ -n "$path" ] || path="/"
+            c=$("${CURL[@]}" -D "$TMP/ph" -o "$TMP/page" -w '%{http_code}' "$BASE$path")
+            if [ "$c" != "200" ]; then
+                finding "Sitemap-URL $path liefert HTTP $c statt 200"; bad=$((bad + 1)); continue
+            fi
+            if grep -qiE '<meta[^>]+name="robots"[^>]+content="[^"]*noindex' "$TMP/page" \
+               || { [ "$ENV_NOINDEX" -eq 0 ] && grep -qiE '^x-robots-tag:.*noindex' "$TMP/ph"; }; then
+                finding "Sitemap-URL $path trägt noindex — gehört nicht in die Sitemap"; bad=$((bad + 1))
+            fi
+        done < "$TMP/locs"
+        [ "$bad" -eq 0 ] && ok "sitemap.xml: $checked von $total URLs geprüft, alle 200 und indexierbar"
+        [ "$total" -gt "$checked" ] && hint "sitemap.xml hat $total URLs, geprüft wurden die ersten $checked (MAX_SITEMAP_URLS)"
+    fi
+fi
+
+# ------------------------------------------- Auslieferung: Kompression, Cache --
+#
+# Anlass: Eine Produktiv-App lieferte CSS und JS der Login-Seite mit
+# 2,1 MB aus statt ~310 KB – nginx ohne gzip, Build-Dateien ohne Cache-Control.
+# Weder Traefik lokal noch auf den Servern komprimiert (keine compress-Middleware),
+# gemessen wird also genau das, was die App bzw. ihr nginx liefert.
+#
+#   - HTML, CSS, JS ab 1 KB müssen komprimiert kommen (gzip oder br).
+#   - CSS/JS mit Inhalts-Hash im Namen (Webpack Encore, Vite, AssetMapper) müssen
+#     lange cachebar sein: max-age >= 30 Tage oder immutable. Ohne Hash wäre ein
+#     langer Cache falsch; dort gibt es nur einen Hinweis, wenn gar nichts gesetzt ist.
+
+ENC=(-H 'Accept-Encoding: gzip, br')
+MIN_BYTES=1024
+MIN_MAX_AGE=2592000
+host_of() { printf '%s' "$1" | sed -E 's#^https?://([^/:]+).*#\1#'; }
+BASE_HOST="$(host_of "$BASE")"
+
+"${CURL[@]}" "${ENC[@]}" -L -D "$TMP/hz" -o /dev/null "$BASE/"
+html_enc="$(grep -i '^content-encoding:' "$TMP/hz" | tail -1 | cut -d: -f2- | tr -d '\r ')"
+html_size=$(wc -c < "$TMP/body" | tr -d ' ')
+if [ "$html_size" -ge "$MIN_BYTES" ] && [ -z "$html_enc" ]; then
+    finding "HTML der Startseite kommt unkomprimiert ($((html_size / 1024)) KB) — nginx: gzip on"
+elif [ -n "$html_enc" ]; then
+    ok "HTML komprimiert ($html_enc)"
+fi
+
+grep -oiE '(src|href)="[^"]+\.(css|js)(\?[^"]*)?"' "$TMP/body" \
+    | sed -E 's/^(src|href)="//I; s/"$//; s/&amp;/\&/g' | sort -u | head -20 > "$TMP/assets"
+
+n_assets=0; unc_names=(); unc_bytes=0; nocache_names=(); nohdr_names=()
+while IFS= read -r a; do
+    case "$a" in
+        http://*|https://*) [ "$(host_of "$a")" = "$BASE_HOST" ] || continue; url="$a" ;;
+        //*) [ "$(host_of "https:$a")" = "$BASE_HOST" ] || continue; url="https:$a" ;;
+        /*)  url="$BASE$a" ;;
+        *)   url="$BASE/$a" ;;
+    esac
+    read -r c size < <("${CURL[@]}" "${ENC[@]}" -D "$TMP/ah" -o /dev/null -w '%{http_code} %{size_download}' "$url")
+    [ "$c" = "200" ] || continue
+    n_assets=$((n_assets + 1))
+    name="${url##*/}"; name="${name%%\?*}"
+    aenc="$(grep -i '^content-encoding:' "$TMP/ah" | tail -1 | cut -d: -f2- | tr -d '\r ')"
+    if [ -z "$aenc" ] && [ "$size" -ge "$MIN_BYTES" ]; then
+        unc_names+=("$name"); unc_bytes=$((unc_bytes + size))
+    fi
+    cc="$(grep -i '^cache-control:' "$TMP/ah" | tail -1 | cut -d: -f2- | tr -d '\r' | tr 'A-Z' 'a-z')"
+    maxage="$(printf '%s' "$cc" | grep -oE 'max-age=[0-9]+' | cut -d= -f2)"
+    if [[ "$name" =~ [.-][0-9a-f]{8,}\.(css|js)$ ]] || [[ "$url" =~ \?(v=)?[0-9a-f]{6,} ]]; then
+        if [[ "$cc" != *immutable* ]] && { [ -z "$maxage" ] || [ "$maxage" -lt "$MIN_MAX_AGE" ]; }; then
+            nocache_names+=("$name")
+        fi
+    elif [ -z "$cc" ] && ! grep -qi '^expires:' "$TMP/ah"; then
+        nohdr_names+=("$name")
+    fi
+done < "$TMP/assets"
+
+list3() {
+    local out="" x i=0
+    for x in "$@"; do i=$((i + 1)); [ "$i" -le 3 ] && out="${out:+$out, }$x"; done
+    [ $# -gt 3 ] && out="$out … (+$(($# - 3)))"
+    printf '%s' "$out"
+}
+if [ "$n_assets" -eq 0 ]; then
+    hint "keine eigenen CSS/JS-Dateien auf der Startseite gefunden — Kompression/Cache der Assets nicht geprüft"
+else
+    if [ ${#unc_names[@]} -gt 0 ]; then
+        finding "${#unc_names[@]} von $n_assets CSS/JS-Dateien unkomprimiert ($((unc_bytes / 1024)) KB): $(list3 "${unc_names[@]}") — nginx: gzip on + gzip_types"
+    else
+        ok "CSS/JS komprimiert ($n_assets Dateien geprüft)"
+    fi
+    if [ ${#nocache_names[@]} -gt 0 ]; then
+        finding "${#nocache_names[@]} gehashte Build-Dateien ohne langen Browser-Cache: $(list3 "${nocache_names[@]}") — Cache-Control: public, max-age=31536000, immutable"
+    else
+        ok "gehashte Build-Dateien lange cachebar"
+    fi
+    [ ${#nohdr_names[@]} -gt 0 ] && hint "${#nohdr_names[@]} Dateien ohne Hash im Namen und ohne Cache-Control: $(list3 "${nohdr_names[@]}")"
+fi
+
+echo
+if [ "$FINDINGS" -gt 0 ]; then
+    echo "$FINDINGS Befund(e)."
+    exit 1
+fi
+echo "Keine Befunde."
+exit 0
