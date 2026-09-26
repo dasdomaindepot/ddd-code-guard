@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>Registrierung — Beispiel-Service</title>
+</head>
+<body>
+  <h1>Mitglied werden</h1>
+  <p>Tragen Sie sich ein.</p>
+  <form method="post" action="/registrieren">
+    <label>Ihre E-Mail <input type="email" name="email"></label>
+    <label>Passwort <input type="password" name="password1"></label>
+    <label>Passwort bestätigen <input type="password" name="password2"></label>
+    <altcha-widget challengeurl="/altcha"></altcha-widget>
+    <button type="submit">Registrieren</button>
+  </form>
+</body>
+</html>

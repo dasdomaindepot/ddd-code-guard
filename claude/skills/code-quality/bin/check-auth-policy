@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""check-auth-policy — Anmelde- und Passwortrichtlinie eines Symfony-Projekts prüfen.
+
+Aufgerufen vom Code Guard (Check "auth-policy"), lässt sich aber auch allein fahren:
+    check-auth-policy <projektverzeichnis>      # Standard: aktuelles Verzeichnis
+
+Geprüft werden nur Dateien; es wird nichts gestartet oder aufgerufen.
+
+Teil 1: Sperre nach Fehlversuchen (BSI ORP.4.A13). Jede Firewall unter
+security.firewalls mit Passwort-Login (form_login, json_login, http_basic oder ein
+Custom-Authenticator mit PasswordCredentials) muss eine temporäre Sperre nach
+Fehlversuchen haben (login_throttling oder eigener RateLimiter). OIDC/SSO wird
+als kein lokaler Passwort-Login erkannt und durch einen Hinweis ersetzt.
+
+Teil 2: Passwortregeln. Alle *.php unter src/ (außer src/DataFixtures/):
+    - Mindestlänge aus Symfony Length()-Constraints (kleinste gewinnt), aufgelöst
+      aus Zahl, self::NAME, static::NAME oder Klasse::NAME.
+    - Höchstlänge (Hinweis, wenn unter dem Hausstandard).
+    - Abgleich mit geleakten Passwörtern (NotCompromisedPassword).
+
+Die Grenzwerte stammen aus .ai/guard-policy.yml des Projekts oder, falls nicht
+vorhanden, aus der zentralen guard-policy.yml eine Ebene über dem Script.
+
+Exit-Codes:
+    0  keine Befunde
+    1  Befunde
+    2  Nutzungsfehler (mehr als ein Argument, Verzeichnis existiert nicht)
+   77  nicht messbar (PyYAML fehlt oder config/packages/security.yaml fehlt)
+"""
+
+import glob
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("PyYAML fehlt — nicht messbar.")
+    sys.exit(77)
+
+CENTRAL_POLICY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "guard-policy.yml")
+
+# Tags wie !php/const oder !tagged_iterator in Symfony-YAML sind für uns
+# irrelevant; wir ersetzen sie durch None, damit safe_load nicht abstürzt.
+class _Loader(yaml.SafeLoader):
+    pass
+
+
+def _any_tag(loader, suffix, node):
+    return None
+
+
+_Loader.add_multi_constructor("!", _any_tag)
+
+
+findings = 0
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+# --- Policy ------------------------------------------------------------
+
+def _read_auth(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.load(f, Loader=_Loader)
+    except (OSError, yaml.YAMLError):
+        return {}
+    auth = data.get("auth") if isinstance(data, dict) else None
+    return auth if isinstance(auth, dict) else {}
+
+
+def _merge_policy(project_path: str) -> dict:
+    """Zentrale Werte, einzeln überschrieben von .ai/guard-policy.yml des Projekts."""
+    auth = _read_auth(CENTRAL_POLICY)
+    auth.update(_read_auth(os.path.join(project_path, ".ai", "guard-policy.yml")))
+    return auth
+
+
+def _policy_int(auth: dict, key: str, fallback: int) -> int:
+    if key in auth and isinstance(auth[key], int):
+        return auth[key]
+    return fallback
+
+
+# --- YAML der Projekte -------------------------------------------------
+
+def load_top_level_yaml(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.load(f, Loader=_Loader)
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+# --- Dateien unter src/ ------------------------------------------------
+
+def php_files_under_src(project_path: str):
+    src = os.path.join(project_path, "src")
+    result = []
+    if not os.path.isdir(src):
+        return result
+    for root, dirs, files in os.walk(src):
+        rel_root = os.path.relpath(root, project_path)
+        if "DataFixtures" in rel_root.split(os.sep):
+            continue
+        for name in files:
+            if name.endswith(".php"):
+                result.append(os.path.join(root, name))
+    return result
+
+
+def find_src_file(project_path: str, short_name: str):
+    pattern = os.path.join(project_path, "src", "**", short_name + ".php")
+    matches = sorted(glob.glob(pattern, recursive=True))
+    return matches[0] if matches else None
+
+
+def relative(project_path: str, path: str) -> str:
+    return os.path.relpath(path, project_path)
+
+
+# --- Teil 1: Sperre nach Fehlversuchen ---------------------------------
+
+def _firewall_auth_types(fw: dict):
+    has_form_login = "form_login" in fw
+    has_json_login = "json_login" in fw
+    has_http_basic = "http_basic" in fw
+    return has_form_login, has_json_login, has_http_basic
+
+
+def _custom_auth_classes(fw: dict):
+    value = fw.get("custom_authenticator")
+    if value is None:
+        value = fw.get("custom_authenticators")
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [c for c in value if isinstance(c, str)]
+    return []
+
+
+def _short_class_name(fqcn: str) -> str:
+    return fqcn.split("\\")[-1]
+
+
+def _file_has_credentials(project_path: str, short_name: str, needle: str):
+    path = find_src_file(project_path, short_name)
+    if not path:
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            return needle in f.read()
+    except OSError:
+        return False
+
+
+def _throttling_for_password_firewall(name: str, fw: dict, project_path: str):
+    if "login_throttling" in fw:
+        lt = fw["login_throttling"]
+        if lt is None:
+            max_attempts = 5
+        elif isinstance(lt, dict):
+            ma = lt.get("max_attempts", 5)
+            max_attempts = ma if isinstance(ma, int) else 5
+        else:
+            max_attempts = 5
+        if max_attempts > LOGIN_MAX_ATTEMPTS:
+            finding(
+                f"Firewall {name}: login_throttling erlaubt {max_attempts} "
+                f"Fehlversuche, höchstens {LOGIN_MAX_ATTEMPTS} (guard-policy.yml)"
+            )
+        else:
+            ok(
+                f"Firewall {name}: temporäre Sperre nach {max_attempts} "
+                f"Fehlversuchen (login_throttling)"
+            )
+        return
+    # Kein login_throttling: eigener RateLimiter in einem Custom-Authenticator?
+    for short in {_short_class_name(c) for c in _custom_auth_classes(fw)}:
+        path = find_src_file(project_path, short)
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            except OSError:
+                content = ""
+            if "RateLimiterFactory" in content or "->consume(" in content:
+                ok(f"Firewall {name}: eigene Sperre per RateLimiter in {short}")
+                return
+    finding(
+        f"Firewall {name}: Passwort-Login ohne temporäre Sperre nach "
+        f"Fehlversuchen — login_throttling setzen (BSI ORP.4.A13)"
+    )
+
+
+def part1_firewalls(sec: dict, project_path: str) -> None:
+    firewalls = sec.get("firewalls") if isinstance(sec, dict) else None
+    if not isinstance(firewalls, dict) or not firewalls:
+        ok("keine Anmeldung mit Passwort gefunden")
+        return
+
+    password_firewalls = []
+    saw_password_login = False
+    saw_oidc = False
+
+    for name, fw in firewalls.items():
+        if not isinstance(fw, dict):
+            continue
+        if name.startswith("when@"):
+            continue
+        if fw.get("security") is False:
+            continue
+        has_form_login, has_json_login, has_http_basic = _firewall_auth_types(fw)
+        if has_form_login or has_json_login or has_http_basic:
+            password_firewalls.append((name, fw, []))
+            saw_password_login = True
+            continue
+        classes = _custom_auth_classes(fw)
+        if not classes:
+            continue
+        for fqcn in classes:
+            short = _short_class_name(fqcn)
+            if find_src_file(project_path, short) is None:
+                hint(f"Firewall {name}: {short}.php nicht unter src/ gefunden — nicht prüfbar")
+                continue
+            if _file_has_credentials(project_path, short, "PasswordCredentials"):
+                password_firewalls.append((name, fw, [short]))
+                saw_password_login = True
+            else:
+                hint(
+                    f"Firewall {name}: Anmeldung ohne Passwort in der App "
+                    f"(SSO/OIDC) — Sperre nach Fehlversuchen beim Identity Provider "
+                    f"einschalten (Keycloak: Brute Force Detection)"
+                )
+                saw_oidc = True
+
+    if saw_password_login:
+        for name, fw, _shorts in password_firewalls:
+            _throttling_for_password_firewall(name, fw, project_path)
+    elif not saw_oidc:
+        ok("keine Anmeldung mit Passwort gefunden")
+
+
+# --- Teil 2: Passwortregeln --------------------------------------------
+
+CONST_RE = re.compile(r"\bconst\s+(?:\??[\w\\|]+\s+)?(\w+)\s*=\s*(\d+)")
+NUMBER_RE = re.compile(r"^-?\d+$")
+MIN_KV_RE = re.compile(r"""['\"]?min['\"]?\s*(?:=>|:)\s*([^,})\]\n]+)""")
+MAX_KV_RE = re.compile(r"""['\"]?max['\"]?\s*(?:=>|:)\s*([^,})\]\n]+)""")
+
+
+def _split_call(text: str, open_index: int) -> str:
+    """Vom Index der öffnenden Klammer bis zur passenden schließenden Klammer."""
+    depth = 0
+    for i in range(open_index, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index:i + 1]
+    return text[open_index:]
+
+
+def _resolve_number(expr: str, project_path: str, own_text: str):
+    expr = expr.strip()
+    if NUMBER_RE.match(expr):
+        return int(expr)
+    m = re.match(r"^(self|static)::(\w+)$", expr)
+    if m:
+        name = m.group(2)
+        for cm in CONST_RE.finditer(own_text):
+            if cm.group(1) == name:
+                return int(cm.group(2))
+        return None
+    m = re.match(r"^(?:[^:]+)::(\w+)$", expr)
+    if m:
+        left = expr.rsplit("::", 1)[0]
+        name = m.group(1)
+        short = left.split("\\")[-1]
+        target = find_src_file(project_path, short)
+        if target:
+            try:
+                with open(target, encoding="utf-8") as f:
+                    t = f.read()
+            except OSError:
+                t = ""
+            for cm in CONST_RE.finditer(t):
+                if cm.group(1) == name:
+                    return int(cm.group(2))
+        return None
+    return None
+
+
+# Handgeschriebene Prüfung: strlen($newPassword) < 8 bzw. mb_strlen(...) <= 7
+STRLEN_RE = re.compile(r"\b(?:mb_)?strlen\(\s*\$(\w*passw\w*)\s*\)\s*(<=?)\s*([\w\\]+(?:::\w+)?)", re.I)
+ADD_RE = re.compile(r"""->add\(\s*['"](\w+)['"]""")
+PROP_RE = re.compile(r"\b(?:private|protected|public)\b[^$;(]*\$(\w+)")
+
+
+def _belongs_to_other_field(lines: list[str], idx: int) -> bool:
+    """Gehört die Length in Zeile idx sichtbar zu einem Feld ohne Passwort im Namen?
+
+    Zwei häufige Fälle: ein FormBuilder-Feld (`->add('username', …)` vor der
+    Length) und ein Attribut über einer Eigenschaft (`#[Assert\\Length] private $name`).
+    Sonst entscheidet allein das Fenster um die Zeile.
+    """
+    def other(name: str) -> bool:
+        return not re.search(r"passw", name, re.I)
+
+    if lines[idx].lstrip().startswith("#["):
+        for line in lines[idx + 1:idx + 7]:
+            m = PROP_RE.search(line)
+            if m:
+                return other(m.group(1))
+    for line in reversed(lines[max(0, idx - 15):idx + 1]):
+        m = ADD_RE.search(line)
+        if m:
+            return other(m.group(1))
+    return False
+
+
+def part2_password_rules(sec: dict, project_path: str) -> None:
+    files = php_files_under_src(project_path)
+
+    hash_file = None
+    leak_present = False
+    # pro Dateiname: zeilenweiser Zugriff nötig
+    file_lines: dict[str, list[str]] = {}
+    file_text: dict[str, str] = {}
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        file_text[path] = text
+        file_lines[path] = text.splitlines()
+        if "hashPassword(" in text:
+            if hash_file is None:
+                hash_file = path
+        if "NotCompromisedPassword" in text:
+            leak_present = True
+
+    if hash_file is None:
+        ok("keine Passwortvergabe gefunden")
+        return
+
+    rel_hash = relative(project_path, hash_file)
+
+    mins = []  # (wert, pfad, zeile)
+    maxes = []  # (wert, pfad, zeile)
+
+    for path in files:
+        text = file_text[path]
+        lines = file_lines[path]
+        joined = "\n".join(lines)
+        fname_passw = "passw" in os.path.basename(path).lower()
+        offsets = []
+        pos = 0
+        for line in lines:
+            offsets.append(pos)
+            pos += len(line) + 1
+        for mm in re.finditer(r"Length\(", joined):
+            off = mm.start()
+            idx = 0
+            for o in offsets:
+                if o > off:
+                    break
+                idx += 1
+            idx -= 1  # Index der Zeile, in der Length( steht (0-basiert)
+            line_no = idx + 1
+            start = max(0, idx - 15)
+            window = "\n".join(lines[start:idx + 16]).lower()
+            if not (fname_passw or "passw" in window):
+                continue
+            if _belongs_to_other_field(lines, idx):
+                continue
+            call_text = _split_call(joined, off)
+            min_m = MIN_KV_RE.search(call_text)
+            max_m = MAX_KV_RE.search(call_text)
+            rel = relative(project_path, path)
+            if min_m is not None:
+                resolved = _resolve_number(min_m.group(1), project_path, text)
+                if resolved is None:
+                    hint(f"{rel}:{line_no}: Mindestlänge nicht auflösbar ({min_m.group(1).strip()})")
+                else:
+                    mins.append((resolved, path, line_no))
+            if max_m is not None and NUMBER_RE.match(max_m.group(1).strip()):
+                maxes.append((int(max_m.group(1).strip()), path, line_no))
+        for sm in STRLEN_RE.finditer(joined):
+            value = _resolve_number(sm.group(3), project_path, text)
+            line_no = joined.count("\n", 0, sm.start()) + 1
+            if value is None:
+                hint(f"{relative(project_path, path)}:{line_no}: Mindestlänge nicht auflösbar ({sm.group(3)})")
+                continue
+            mins.append((value + 1 if sm.group(2) == "<=" else value, path, line_no))
+
+    if not mins:
+        finding(
+            f"Passwörter werden vergeben (hashPassword in {rel_hash}), aber "
+            f"keine Mindestlänge gefunden — Length(min: {PASSWORD_MIN_LENGTH}) setzen"
+        )
+        return
+
+    smallest = min(m[0] for m in mins)
+    smallest_path = next(m[1] for m in mins if m[0] == smallest)
+    smallest_line = next(m[2] for m in mins if m[1] == smallest_path and m[0] == smallest)
+    rel_min = relative(project_path, smallest_path)
+
+    if smallest < PASSWORD_MIN_LENGTH:
+        finding(
+            f"Passwort-Mindestlänge {smallest} in {rel_min}:{smallest_line} — "
+            f"Hausstandard sind mindestens {PASSWORD_MIN_LENGTH} Zeichen (guard-policy.yml)"
+        )
+    else:
+        ok(f"Passwort-Mindestlänge {smallest} Zeichen")
+        if smallest < PASSWORD_MIN_LENGTH_RECOMMENDED:
+            hint(
+                f"Passwort-Mindestlänge {smallest} — NIST SP 800-63B-4 verlangt "
+                f"{PASSWORD_MIN_LENGTH_RECOMMENDED} Zeichen, wenn das Passwort der einzige Faktor ist"
+            )
+
+    for value, path, line_no in maxes:
+        if value < PASSWORD_MAX_LENGTH_AT_LEAST:
+            rel = relative(project_path, path)
+            hint(
+                f"{rel}:{line_no}: Passwort-Höchstlänge {value} — "
+                f"mindestens {PASSWORD_MAX_LENGTH_AT_LEAST} Zeichen zulassen (NIST, BSI ORP.4.A23)"
+            )
+
+    if leak_present:
+        ok("Abgleich mit geleakten Passwörtern (NotCompromisedPassword)")
+    else:
+        hint("kein Abgleich mit geleakten Passwörtern — NotCompromisedPassword einbauen (BSI ORP.4.A8)")
+
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        print("Verwendung: check-auth-policy [projektverzeichnis]", file=sys.stderr)
+        return 2
+
+    project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    if not os.path.isdir(project_path):
+        print(f"{project_path}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    security_path = os.path.join(project_path, "config", "packages", "security.yaml")
+    if not os.path.isfile(security_path):
+        print("config/packages/security.yaml fehlt — nicht messbar.")
+        return 77
+
+    doc = load_top_level_yaml(security_path)
+    sec = doc.get("security") if isinstance(doc, dict) else None
+    if not isinstance(sec, dict):
+        print("config/packages/security.yaml nicht lesbar oder ohne security-Schlüssel — nicht messbar.")
+        return 77
+
+    global LOGIN_MAX_ATTEMPTS, PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_RECOMMENDED, PASSWORD_MAX_LENGTH_AT_LEAST
+    auth = _merge_policy(project_path)
+    LOGIN_MAX_ATTEMPTS = _policy_int(auth, "login_max_attempts", 10)
+    PASSWORD_MIN_LENGTH = _policy_int(auth, "password_min_length", 12)
+    PASSWORD_MIN_LENGTH_RECOMMENDED = _policy_int(auth, "password_min_length_recommended", 15)
+    PASSWORD_MAX_LENGTH_AT_LEAST = _policy_int(auth, "password_max_length_at_least", 64)
+
+    part1_firewalls(sec, project_path)
+    part2_password_rules(sec, project_path)
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

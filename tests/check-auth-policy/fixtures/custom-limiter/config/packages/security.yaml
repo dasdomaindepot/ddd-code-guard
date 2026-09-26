@@ -1,0 +1,6 @@
+security:
+    firewalls:
+        main:
+            lazy: true
+            custom_authenticator: App\Security\LoginAuthenticator
+            security: true

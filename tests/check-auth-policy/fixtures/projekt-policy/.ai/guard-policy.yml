@@ -1,0 +1,5 @@
+# Projekt-spezifische Policy.
+auth:
+    password_min_length: 10
+    password_min_length_recommended: 15
+    password_max_length_at_least: 64

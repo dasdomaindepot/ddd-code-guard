@@ -1,0 +1,10 @@
+security:
+    firewalls:
+        main:
+            lazy: true
+            provider: app_user_provider
+            form_login:
+                login_parameter: _username
+                password_parameter: _password
+                provider_factory: !php/const App\Foo::BAR
+            security: true

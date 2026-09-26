@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -344,6 +344,7 @@ CHECK_DEFS=(
   "composer-validate|Composer-Metadaten|dependencies|cheap|$COMPOSER_BIN validate --no-check-publish --no-interaction|composer,file:composer.json"
   "composer-audit|Composer-Sicherheit|security|cheap|$COMPOSER_BIN audit --locked --abandoned=report --no-interaction|composer,file:composer.lock"
   "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
+  "auth-policy|Login und Passwoerter|security|cheap|$SCRIPT_DIR/check-auth-policy .|file:config/packages/security.yaml,bin:python3"
   "phpcs|Coding-Standard|style|normal|make phpcs|target:phpcs"
   "phpstan|Statische Analyse|static|normal|make phpstan|target:phpstan"
   "deptrac|Architekturregeln|architecture|normal|make deptrac|target:deptrac"
@@ -359,6 +360,7 @@ CHECK_DEFS=(
   "web-hardening|Web-Haertung|security|normal|$SCRIPT_DIR/check-web-hardening $WEB_URL|web-url"
   "legal|Rechtstexte|legal|normal|$SCRIPT_DIR/check-legal $WEB_URL|web-url,bin:python3"
   "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL|web-url,bin:python3"
+  "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
 )
 
 # Beratende Checks: Ein Befund wird WARN statt FAIL und blockiert nicht.
@@ -377,6 +379,12 @@ CHECK_DEFS=(
 # alt-Texte, Links/Buttons ohne Namen, Formularfelder ohne Label, doppelte ids)
 # steht bewusst NICHT hier: Das sind Grundregeln seit zwanzig Jahren, dazu
 # Pflicht nach BFSG seit 28.06.2025. Sie blockieren vom ersten Tag an.
+#
+# Ebenso blockierend seit 1.7.0 (26.09.2026): auth-policy (Sperre nach
+# Fehlversuchen, Passwort-Mindestlaenge aus guard-policy.yml) und
+# form-protection (Honeypot oder Captcha an oeffentlichen Formularen).
+# Empfehlungen darueber hinaus (NIST 15 Zeichen, Leak-Abgleich, Zusatzschutz
+# gegen Spam) geben die Scripts nur als Hinweis aus -- sie aendern den Exit nicht.
 ADVISORY_CHECKS=" web-hardening legal "
 
 # `make coverage-check` haelt eine Mindestschwelle ein, `make coverage` misst nur.

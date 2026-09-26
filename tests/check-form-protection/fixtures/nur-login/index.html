@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>Beispiel-Intranet — Anmelden</title>
+</head>
+<body>
+  <h1>Beispiel-Intranet</h1>
+  <p>Bitte melden Sie sich an, um fortzufahren.</p>
+  <form method="post" action="/login">
+    <label>Benutzername <input type="text" name="_username"></label>
+    <label>Passwort <input type="password" name="_password"></label>
+    <label><input type="checkbox" name="_remember_user"> angemeldet bleiben</label>
+    <button type="submit">Anmelden</button>
+  </form>
+  <form method="get" action="/suche">
+    <input type="text" name="q" placeholder="Suche">
+    <button type="submit">Suchen</button>
+  </form>
+</body>
+</html>

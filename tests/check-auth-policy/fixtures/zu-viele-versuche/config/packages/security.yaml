@@ -1,0 +1,11 @@
+security:
+    firewalls:
+        main:
+            lazy: true
+            provider: app_user_provider
+            form_login:
+                login_parameter: _username
+            login_throttling:
+                max_attempts: 50
+                interval: 15 minutes
+            security: true

@@ -44,3 +44,38 @@ severity:
 
 # Wenn eine Achse gar nicht geprueft werden konnte, zaehlt sie nicht als gruen.
 unpruefbar_ist_nicht_gruen: true
+
+# Anmeldung und Passwörter — Hausstandard vom 26.09.2026, gelesen von
+# bin/check-auth-policy. Grundlage: BSI IT-Grundschutz ORP.4 (Edition 2023) und
+# NIST SP 800-63B-4 (26.08.2025). Das BSI nennt Betreibern keine feste Länge
+# (ORP.4.A22: „je nach Einsatzzweck und Schutzbedarf"), deshalb steht die Zahl hier.
+auth:
+  # Unter dieser Mindestlänge ist es ein harter Fehler.
+  password_min_length: 12
+  # Darunter nur ein Hinweis: NIST verlangt 15 Zeichen, wenn das Passwort der
+  # einzige Faktor ist (mit Zweitfaktor genügen 8).
+  password_min_length_recommended: 15
+  # Wer eine Obergrenze setzt, muss mindestens so viel erlauben (NIST: ≥ 64;
+  # BSI ORP.4.A23: die volle Länge muss geprüft werden). Darunter: Hinweis.
+  password_max_length_at_least: 64
+  # Abgleich mit geleakten Passwörtern (Symfony: NotCompromisedPassword).
+  # BSI ORP.4.A8 verbietet Passwörter aus gängigen Listen. Fehlt er: Hinweis.
+  password_leak_check: hint
+  # Zeichenklassen-Zwang ist bewusst NICHT verlangt — NIST verbietet ihn, er
+  # erzeugt „Sommer2026!".
+  #
+  # Temporäre Sperre nach Fehlversuchen (BSI ORP.4.A13). Pflicht für jede
+  # Anmeldung mit Passwort; Symfony: login_throttling in der Firewall.
+  login_throttling: required
+  # Höchstens so viele Fehlversuche pro Intervall (Symfony-Standard: 5).
+  login_max_attempts: 10
+
+# Öffentliche Formulare (Kontakt, Registrierung, Newsletter) — gelesen von
+# bin/check-form-protection.
+forms:
+  # Mindestens ein Honeypot-Feld oder ein Captcha (ALTCHA, Friendly Captcha,
+  # hCaptcha, reCAPTCHA, Turnstile). Fehlt beides: harter Fehler.
+  spam_protection: required
+  # Zusätzlicher Schutz (Zeitsperre, ALTCHA, inhaltliche Spam-Erkennung,
+  # selbst gehostetes Sprachmodell) ist eine Empfehlung, kein Muss.
+  additional_protection: hint

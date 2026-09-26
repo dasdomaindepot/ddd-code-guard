@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""check-form-protection — öffentlich erreichbare Formular-Seiten einer lokal laufenden Instanz
+auf den Schutz gegen Spam-Bots prüfen.
+
+Aufgerufen vom Code Guard (Check "form-protection"), lässt sich aber auch allein fahren:
+    check-form-protection https://projekt.local
+
+Geprüft werden die Startseite plus die Pfade aus sitemap.xml (Host wird auf die lokale
+Instanz umgeschrieben) und zusätzlich feste Kontakt-/Registrierungs-/Newsletter-Pfade.
+Jede dieser Seiten wird als serverseitig gerendertes HTML angenommen: Was im Quelltext
+steht, sieht ein serverseitig gerenderter Besucher. Clientseitig gerenderte Seiten ohne
+sichtbaren Inhalt im <body> sind nicht messbar und werden übergangen.
+
+Geprüft wird nur <form> mit method="post" (Groß/Klein egal; fehlt method, ist es GET und
+wird übersprungen). Pro Formular wird gezählt:
+    pw   = Anzahl <input type="password">
+    ta   = Anzahl <textarea>
+    mail = Anzahl <input type="email"> oder <input> mit „mail“ im name
+    visible = Felder, die kein hidden/submit/button/reset/image/checkbox-radio sind und
+              kein Honeypot darstellen.
+Eingeordnet:
+    - pw == 1 und ta == 0 und visible <= 2  → Login: nicht geprüft (anderer Check)
+    - pw >= 1 (sonst)                        → Registrierung: geprüft
+    - pw == 0 und (ta >= 1 oder mail >= 1)   → Kontakt/Newsletter: geprüft
+    - sonst                                  → nicht geprüft
+
+Schutzfaktoren:
+    - Honeypot: ein <input> (Typ fehlt, text, email, url, tel, search), das in einem
+      unsichtbaren Element liegt (aria-hidden, hidden, style mit display:none/
+      visibility:hidden oder negativer Position), selbst unsichtbar ist, oder
+      tabindex="-1" plus autocomplete="off" hat, oder in name/id/class „honeypot“ trägt.
+    - Captcha: irgendwo auf der Seite ein <altcha-widget>, ein Element mit der class
+      g-recaptcha/h-captcha/cf-turnstile/frc-captcha, oder ein <script src> mit
+      altcha/recaptcha/hcaptcha/turnstile/friendlycaptcha im src.
+    - Zeitsperre: ein <input type="hidden"> mit dem name ts/timestamp/time/form_time/
+      rendered_at (als eigenes Wort oder in eckigen Klammern).
+
+Ausgabe je geprüftes Formular: Befund wenn weder Honeypot noch Captcha; Hinweis wenn nur
+Honeypot (keine Captcha, keine Zeitsperre); ok mit den gefundenen Schutzarten sonst. Gab es
+einen „nur mit Honeypot“-Hinweis, wird am Ende ein Hinweisblock zu zusätzlichem Schutz
+ausgegeben.
+
+Nur lesende GET-Anfragen, ausschließlich gegen die übergebene URL.
+
+Exit-Codes:
+     0  keine Befunde
+     1  Befunde
+     2  Nutzungsfehler
+    77  nicht messbar (Startseite kein HTTP 200 oder keine serverseitig gerenderte Seite)
+"""
+
+import os
+import re
+import ssl
+import sys
+from html.parser import HTMLParser
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 15
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+VOID_ELEMENTS = {"img", "input", "br", "meta", "link", "hr", "source", "area", "wbr"}
+IGNORE_TAGS = {"style", "noscript"}
+
+# Feste Pfade, die zusätzlich zur Startseite und sitemap.xml geprüft werden.
+FIXED_PATHS = [
+    "/kontakt", "/contact", "/register", "/registrieren",
+    "/registrierung", "/signup", "/newsletter",
+]
+# Feldtypen, die nie als „sichtbares“ Eingabefeld zählen.
+NON_VISIBLE_TYPES = {"hidden", "submit", "button", "reset", "image", "checkbox", "radio"}
+# Feldtypen, die als Honeypot infrage kommen.
+HONEYPOT_TYPES = {"", "text", "email", "url", "tel", "search"}
+CAPTCHA_CLASSES = ("g-recaptcha", "h-captcha", "cf-turnstile", "frc-captcha")
+CAPTCHA_SCRIPT_KEYS = ("altcha", "recaptcha", "hcaptcha", "turnstile", "friendlycaptcha")
+TIME_LOCK_RE = re.compile(r"(?:^|[\[_])(ts|timestamp|time|form_time|rendered_at)(?:\]|$)")
+
+findings = 0
+HONEYPOT_HINT = False
+FORM_FOUND = False
+MAX_PAGES = 50
+try:
+    MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
+except (TypeError, ValueError):
+    MAX_PAGES = 50
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+def fetch(url: str) -> tuple[int, str, str]:
+    """(Status, Content-Type, Body). Folgt Weiterleitungen."""
+    req = urllib.request.Request(url, headers={"User-Agent": "code-guard-form-protection"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
+            ct = r.headers.get("Content-Type", "")
+            return r.status, ct, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, "", ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0, "", ""
+
+
+def _first(attrs, name):
+    for k, v in attrs:
+        if k == name:
+            return v
+    return None
+
+
+def _style_hides(style: str) -> bool:
+    s = re.sub(r"\s+", "", style or "").lower()
+    if "display:none" in s or "visibility:hidden" in s:
+        return True
+    # Aus dem Bild geschoben: jede negative Position, nicht nur -9999px.
+    return re.search(r"(?:^|;)(?:left|top|right):-\d", s) is not None
+
+
+def _provides_hiding(attrs) -> bool:
+    for k, v in attrs:
+        if k == "hidden":
+            return True
+        if (v or "").strip().lower() == "true" and k == "aria-hidden":
+            return True
+        if k == "style" and _style_hides(v or ""):
+            return True
+    return False
+
+
+class FormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        # Ignorierter Bereich (style): Tag und Verschachtelungstiefe.
+        self.ignore_tag: str | None = None
+        self.ignore_depth = 0
+        # Offene Elemente (Tag, verhilft-unsichtbar) für die Honeypot-Ahnenerkennung.
+        self.stack: list[dict] = []
+        self.hidden_depth = 0
+        # Aktuelles Formular oder None.
+        self.form: dict | None = None
+        # Captcha-Hinweise über die ganze Seite verteilt.
+        self.has_altcha_widget = False
+        self.has_captcha_class = False
+        self.has_captcha_script = False
+        # Gesammelte, finalisierte Formulare.
+        self.forms: list[dict] = []
+        self.body_text = ""
+
+    # -- Start-Tags ------------------------------------------------------
+
+    def handle_starttag(self, tag, attrs):
+        self._on_start(tag, attrs, False)
+
+    def handle_startendtag(self, tag, attrs):
+        self._on_start(tag, attrs, True)
+
+    def _on_start(self, tag, attrs, self_closed) -> None:
+        if self.ignore_tag is not None:
+            if tag == self.ignore_tag:
+                self.ignore_depth += 1
+            return
+        if tag == "script":
+            src = _first(attrs, "src") or ""
+            low = src.lower()
+            if any(k in low for k in CAPTCHA_SCRIPT_KEYS):
+                self.has_captcha_script = True
+            self.ignore_tag = "script"
+            self.ignore_depth = 1
+            return
+        if tag in IGNORE_TAGS:
+            self.ignore_tag = tag
+            self.ignore_depth = 1
+            return
+        if tag in VOID_ELEMENTS or self_closed:
+            if tag == "input":
+                self._on_input(attrs)
+            return
+        hides = _provides_hiding(attrs)
+        self.stack.append({"tag": tag, "hides": hides})
+        if hides:
+            self.hidden_depth += 1
+        if tag == "form":
+            self.form = {
+                "action": _first(attrs, "action"),
+                "id": _first(attrs, "id"),
+                "method": (_first(attrs, "method") or "").lower(),
+                "pw": 0, "ta": 0, "mail": 0, "visible": 0,
+                "honeypot": False, "timeslock": False,
+            }
+            return
+        if tag == "altcha-widget":
+            self.has_altcha_widget = True
+        cls = _first(attrs, "class") or ""
+        if any(tok in cls.split() for tok in CAPTCHA_CLASSES):
+            self.has_captcha_class = True
+        if self.form is not None and tag in ("textarea", "select"):
+            if tag == "textarea":
+                self.form["ta"] += 1
+            self.form["visible"] += 1
+
+    def _on_input(self, attrs) -> None:
+        if self.form is None:
+            return
+        f = self.form
+        t = (_first(attrs, "type") or "").lower()
+        name = _first(attrs, "name") or ""
+        if t == "password":
+            f["pw"] += 1
+        if t == "hidden" and TIME_LOCK_RE.search(name):
+            f["timeslock"] = True
+        if t in NON_VISIBLE_TYPES:
+            return
+        # Nur sichtbare Felder: ein verstecktes "email_token" macht kein Kontaktformular.
+        if t == "email" or "mail" in name.lower():
+            f["mail"] += 1
+        if self._is_honeypot(attrs):
+            f["honeypot"] = True
+        else:
+            f["visible"] += 1
+
+    def _is_honeypot(self, attrs) -> bool:
+        t = (_first(attrs, "type") or "").lower()
+        if t not in HONEYPOT_TYPES:
+            return False
+        for k in ("name", "id", "class"):
+            if "honeypot" in (_first(attrs, k) or "").lower():
+                return True
+        if (_first(attrs, "tabindex") or "").strip() == "-1" and \
+                (_first(attrs, "autocomplete") or "").strip().lower() == "off":
+            return True
+        if self.hidden_depth > 0:
+            return True
+        return _provides_hiding(attrs)
+
+    # -- Daten -----------------------------------------------------------
+
+    def handle_data(self, data) -> None:
+        if self.ignore_tag is not None:
+            return
+        self.body_text += data
+
+    # -- End-Tags --------------------------------------------------------
+
+    def handle_endtag(self, tag) -> None:
+        if self.ignore_tag is not None:
+            if tag == self.ignore_tag:
+                self.ignore_depth -= 1
+                if self.ignore_depth == 0:
+                    self.ignore_tag = None
+            return
+        if tag in VOID_ELEMENTS:
+            return
+        if (tag == "form" and self.form is not None and self.stack
+                and self.stack[-1]["tag"] == "form"):
+            self._finalize_form(self.stack.pop())
+            return
+        if not any(e["tag"] == tag for e in self.stack):
+            return
+        while self.stack[-1]["tag"] != tag:
+            e = self.stack.pop()
+            if e["hides"]:
+                self.hidden_depth -= 1
+        e = self.stack.pop()
+        if e["hides"]:
+            self.hidden_depth -= 1
+        if e["tag"] == "form":
+            self._finalize_form(e)
+
+    def _finalize_form(self, e: dict) -> None:
+        if self.form is None:
+            return
+        self.forms.append(self.form)
+        self.form = None
+
+    def visible(self) -> bool:
+        return bool(self.body_text.strip())
+
+
+REGISTER_RE = re.compile(r"regist|signup|sign-up|konto-erstellen|account/new", re.I)
+
+
+def _classify(f: dict, path: str) -> tuple[bool, str]:
+    """(geprüft, Art)."""
+    pw, ta, mail, vis = f["pw"], f["ta"], f["mail"], f["visible"]
+    # Registrierung mit nur E-Mail und einem Passwort sieht aus wie ein Login —
+    # Pfad oder action entscheiden dann.
+    if pw >= 1 and REGISTER_RE.search(f"{path} {f['action'] or ''}"):
+        return True, "Registrierung"
+    if pw == 1 and ta == 0 and vis <= 2:
+        return False, "Login"
+    if pw >= 1:
+        return True, "Registrierung"
+    if pw == 0 and (ta >= 1 or mail >= 1):
+        return True, "Kontakt/Newsletter"
+    return False, ""
+
+
+def check_forms(path: str, p: FormParser) -> None:
+    global HONEYPOT_HINT, FORM_FOUND
+    page_captcha = p.has_captcha_script or p.has_captcha_class or p.has_altcha_widget
+    for f in p.forms:
+        if f["method"] != "post":
+            continue
+        checked, kind = _classify(f, path)
+        if not checked:
+            continue
+        FORM_FOUND = True
+        label = f["action"] or f["id"] or "(ohne action)"
+        has_hp = f["honeypot"]
+        has_ts = f["timeslock"]
+        has_cap = page_captcha
+        if not has_hp and not has_cap:
+            finding(f"{path}: Formular {label} ({kind}) ohne Honeypot oder Captcha")
+            continue
+        arten = []
+        if has_hp:
+            arten.append("Honeypot")
+        if has_cap:
+            arten.append("Captcha")
+        if has_ts:
+            arten.append("Zeitsperre")
+        if has_hp and not has_cap and not has_ts:
+            HONEYPOT_HINT = True
+            hint(f"{path}: Formular {label} nur mit Honeypot geschützt — zusätzlicher Schutz empfohlen")
+        else:
+            ok(f"{path}: Formular {label} geschützt ({', '.join(arten)})")
+
+
+def collect_paths(base: str) -> tuple[list[str], int]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    add("/")
+    # Feste Pfade zuerst: Bei großen Sitemaps würde MAX_PAGES sie sonst abschneiden.
+    for fixed in FIXED_PATHS:
+        add(fixed)
+    status, _, sitemap = fetch(base + "/sitemap.xml")
+    if status == 200:
+        if "sitemapindex" in sitemap.lower():
+            hint("sitemap.xml ist ein Sitemap-Index — Unter-Sitemaps werden nicht verfolgt")
+        else:
+            for loc in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", sitemap):
+                add(urllib.parse.urlparse(loc.strip()).path or "/")
+    total = len(paths)
+    return paths[:MAX_PAGES], total
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Verwendung: check-form-protection <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+
+    # Wie check-legal: Ohne 200 auf / antwortet evtl. nur ein Catch-all des
+    # Reverse-Proxys — dann messen wir nicht die App.
+    status, _, _ = fetch(base + "/")
+    if status != 200:
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
+        return 77
+
+    paths, total = collect_paths(base)
+    if total > len(paths):
+        hint(f"{len(paths)} von {total} Seiten geprüft (MAX_PAGES)")
+
+    any_server_rendered = False
+    for path in paths:
+        status, ct, body = fetch(base + path)
+        if status != 200 or "text/html" not in ct.lower():
+            continue
+        p = FormParser()
+        p.feed(body)
+        if not p.visible():
+            hint(f"{path}: kein serverseitig gerenderter Inhalt (SPA?) — nicht messbar")
+            continue
+        any_server_rendered = True
+        check_forms(path, p)
+
+    if not any_server_rendered:
+        print("Keine serverseitig gerenderte Seite erreichbar — nicht messbar.")
+        return 77
+
+    print()
+    if HONEYPOT_HINT:
+        hint("Zusätzlicher Schutz, ohne Daten an Dritte zu geben:")
+        hint("  - Zeitsperre: signierter Zeitstempel im Formular, zu schnelle Absendungen verwerfen")
+        hint("  - ALTCHA: Proof-of-Work-Captcha, selbst gehostet, ohne Tracking")
+        hint("  - inhaltliche Spam-Erkennung: Punkteregeln für Links, BBCode, fremde Schriftsysteme")
+        hint("  - Bewertung durch ein selbst gehostetes Sprachmodell")
+
+    if not FORM_FOUND:
+        ok("kein öffentliches Kontakt-, Registrierungs- oder Newsletter-Formular gefunden")
+        return 0
+
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

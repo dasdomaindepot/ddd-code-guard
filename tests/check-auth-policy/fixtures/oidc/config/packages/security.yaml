@@ -1,0 +1,7 @@
+security:
+    firewalls:
+        main:
+            lazy: true
+            custom_authenticators:
+                - App\Security\KeycloakAuthenticator
+            security: true

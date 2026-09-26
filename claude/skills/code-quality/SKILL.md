@@ -95,6 +95,31 @@ Check sofort: Das sind Regeln, die seit zwanzig Jahren gelten und seit
 28.06.2025 nach BFSG für viele Seiten Pflicht sind. Einzeln fahrbar:
 `bin/check-web-content https://test.de`.
 
+**Login und Passwörter** (`auth-policy`, seit 26.09.2026, **blockierend**): Liest
+`config/packages/security.yaml` (ohne `when@…`-Blöcke) und `src/`. Jede Firewall mit
+Passwort-Login (`form_login`, `json_login`, `http_basic` oder ein Custom-Authenticator
+mit `PasswordCredentials`) braucht eine temporäre Sperre nach Fehlversuchen —
+`login_throttling` oder einen eigenen RateLimiter (BSI ORP.4.A13), mit höchstens
+`login_max_attempts` Versuchen. Wo die App Passwörter vergibt (`hashPassword(`), muss
+die kleinste Passwort-`Length(min: …)` die Mindestlänge aus `guard-policy.yml`
+erreichen (Hausstandard **12**). Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
+für Passwort als einzigen Faktor), Höchstlänge unter 64, kein
+`NotCompromisedPassword` (BSI ORP.4.A8), Anmeldung per SSO/OIDC (Sperre gehört dann
+in den Identity Provider). Zeichenklassen werden bewusst nicht verlangt. Die Werte
+stehen im Abschnitt `auth:` der `guard-policy.yml`; ein Projekt kann sie in
+`.ai/guard-policy.yml` überschreiben. Einzeln fahrbar: `bin/check-auth-policy .`.
+
+**Formularschutz** (`form-protection`, seit 26.09.2026, **blockierend**): Sucht auf
+der lokalen Instanz (Startseite, Sitemap, `/kontakt`, `/register`, `/registrieren`
+u. a.) öffentliche POST-Formulare — Kontakt, Registrierung, Newsletter; Login-Formulare
+nicht. Jedes braucht mindestens einen Honeypot oder ein Captcha (ALTCHA, Friendly
+Captcha, hCaptcha, reCAPTCHA, Turnstile), sonst Befund. Nur Honeypot ohne Zeitsperre
+oder Captcha ist ein Hinweis mit Vorschlägen für Zusatzschutz ohne Datenweitergabe:
+signierter Zeitstempel, selbst gehostetes ALTCHA, inhaltliche Spam-Erkennung,
+Bewertung durch ein selbst gehostetes Sprachmodell. Ob der Server den
+Honeypot auch auswertet, sieht der Check nicht. Einzeln fahrbar:
+`bin/check-form-protection https://test.de`.
+
 Fehlt eine Prüfung im Projekt, meldet das Script `MISSING`. Das ist ein
 legitimer Befund, kein Grund für einen Umweg. Baue niemals einen eigenen Aufruf,
 um eine fehlende Prüfung doch noch auszuführen, und rufe niemals `vendor/bin/...`

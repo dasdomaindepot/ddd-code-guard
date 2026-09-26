@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>Kontakt — Beispiel-Shop</title>
+</head>
+<body>
+  <h1>Kontakt</h1>
+  <p>Senden Sie uns Ihre Anfrage.</p>
+  <form method="post" action="/kontakt">
+    <label>Ihr Name <input type="text" name="name"></label>
+    <label>Ihre E-Mail <input type="email" name="email"></label>
+    <label>Ihre Nachricht <textarea name="nachricht"></textarea></label>
+    <div aria-hidden="true"><input type="text" name="website" tabindex="-1" autocomplete="off"></div>
+    <button type="submit">Anfrage senden</button>
+  </form>
+</body>
+</html>
