@@ -44,6 +44,7 @@ rather than improvising:
 | `web-content` | HTML basics of the running local instance (home page plus sitemap URLs): `lang`, `<title>`, meta description, canonical, viewport without zoom lock, exactly one `<h1>`, `alt` on every image, no placeholder alt texts, links/buttons with an accessible name, labelled form fields, no duplicate ids (description/canonical skipped on `noindex` pages; `hidden`/`aria-hidden` subtrees ignored) | `bin/check-web-content` (blocking, python3) |
 | `auth-policy` | Login lockout after failed attempts (`login_throttling` or own rate limiter, BSI ORP.4.A13) and password minimum length from `guard-policy.yml` (default 12); hints for < 15 (NIST SP 800-63B-4), max < 64, missing `NotCompromisedPassword`, SSO/OIDC | `bin/check-auth-policy` (blocking, python3 + PyYAML) |
 | `form-protection` | Public POST forms (contact, registration, newsletter) of the running local instance need a honeypot or a captcha; honeypot-only is a hint recommending extra protection | `bin/check-form-protection` (blocking, python3) |
+| `favicon` | Favicons of the running local instance: `/favicon.ico`, `<link rel="icon">`, every linked icon returns 200 with matching type and real size matching `sizes`, 180×180 apple-touch-icon, web manifest with 192×192 and 512×512 PNG icons; hints for missing SVG and maskable icons | `bin/check-favicon` (blocking, python3) |
 
 Expensive checks (coverage, infection, e2e, build) only run with `--full`.
 

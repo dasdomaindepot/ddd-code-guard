@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -361,6 +361,7 @@ CHECK_DEFS=(
   "legal|Rechtstexte|legal|normal|$SCRIPT_DIR/check-legal $WEB_URL|web-url,bin:python3"
   "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL|web-url,bin:python3"
   "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
+  "favicon|Favicons|frontend|normal|$SCRIPT_DIR/check-favicon $WEB_URL|web-url,bin:python3"
 )
 
 # Beratende Checks: Ein Befund wird WARN statt FAIL und blockiert nicht.
@@ -385,6 +386,9 @@ CHECK_DEFS=(
 # form-protection (Honeypot oder Captcha an oeffentlichen Formularen).
 # Empfehlungen darueber hinaus (NIST 15 Zeichen, Leak-Abgleich, Zusatzschutz
 # gegen Spam) geben die Scripts nur als Hinweis aus -- sie aendern den Exit nicht.
+#
+# favicon (seit 1.8.0) blockiert ebenfalls: favicon.ico, <link rel="icon">,
+# apple-touch-icon 180x180, Manifest mit 192/512. SVG- und maskable-Icon: Hinweis.
 ADVISORY_CHECKS=" web-hardening legal "
 
 # `make coverage-check` haelt eine Mindestschwelle ein, `make coverage` misst nur.

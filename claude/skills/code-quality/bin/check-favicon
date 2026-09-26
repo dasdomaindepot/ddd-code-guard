@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""check-favicon — Favicon- und PWA-Icons einer lokal laufenden Instanz prüfen.
+
+Aufgerufen vom Code Guard (Check "favicon"), lässt sich aber auch allein fahren:
+    check-favicon https://projekt.local
+
+Geprüft wird die Startseite (<base>/). Das <head> enthält bei den meisten
+Layouts die Favicon-Links. Es werden nur Dateien desselben Hosts abgerufen;
+externe Hosts werden mit einem Hinweis übersprungen.
+
+Geprüft werden (jeweils ein Befund bei Verstößen):
+   1. /favicon.ico liefert 200 und ist ein ICO- oder PNG-Bild.
+   2. Ein <link rel="icon"> (auch "shortcut icon") vorhanden.
+   3. Jede per <link rel="icon"> oder <link rel="apple-touch-icon"> eingebundene
+      Datei liefert 200, ist ein erkennbares Bild, ihre sizes passen zu ihrer
+      echten Größe und ihr type passt zum erkannten Format.
+   4. Ein <link rel="apple-touch-icon"> als PNG 180×180.
+   5. Ein <link rel="manifest">, das gültiges JSON liefert, und im Manifest ein
+      PNG 192×192 und ein PNG 512×512 (sizes stimmen).
+
+Hinweise (ändern den Exit nicht): SVG-Icon empfohlen, maskable-Icon im Manifest,
+/favicon.ico mit 32×32.
+
+Bildgröße wird an der Byte-Signatur erkannt (PNG, ICO, SVG), nicht am Dateinamen.
+Nur lesende GET-Anfragen, ausschließlich gegen die übergebene URL.
+
+Exit-Codes:
+    0  keine Befunde
+    1  Befunde
+    2  Nutzungsfehler
+   77  nicht messbar (Startseite kein HTTP 200)
+"""
+
+import base64
+import json
+import re
+import ssl
+import struct
+import sys
+from html.parser import HTMLParser
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+TIMEOUT = 15
+
+UA = "code-guard-favicon"
+
+findings = 0
+
+base: str = ""
+base_host: str = ""
+
+_fetch_cache: dict[str, tuple[int, str, bytes]] = {}
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+def fetch_bytes(url: str) -> tuple[int, str, bytes]:
+    """(Status, Content-Type, Body als Bytes). Folgt Weiterleitungen."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
+            ct = r.headers.get("Content-Type", "")
+            return r.status, ct, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, "", b""
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0, "", b""
+
+
+def get_bytes(url: str) -> tuple[int, str, bytes]:
+    if url in _fetch_cache:
+        return _fetch_cache[url]
+    result = fetch_bytes(url)
+    _fetch_cache[url] = result
+    return result
+
+
+def ico_sizes(data: bytes) -> list[tuple[int, int]]:
+    """Größen (Breite, Höhe) aller Einträge einer ICO-Datei."""
+    sizes: list[tuple[int, int]] = []
+    if len(data) < 6 or data[:4] != b"\x00\x00\x01\x00":
+        return sizes
+    count = struct.unpack("<H", data[4:6])[0]
+    for i in range(count):
+        off = 6 + i * 16
+        if off + 16 > len(data):
+            break
+        w = data[off]
+        h = data[off + 1]
+        sizes.append((w or 256, h or 256))
+    return sizes
+
+
+def image_size(data: bytes):
+    """(Typ, breite, höhe) für PNG/ICO/SVG, sonst None."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            w, h = struct.unpack(">II", data[16:24])
+            return ("png", w, h)
+        except struct.error:
+            return None
+    if data[:4] == b"\x00\x00\x01\x00":
+        sizes = ico_sizes(data)
+        if not sizes:
+            return None
+        return ("ico", max(w for w, _ in sizes), max(h for _, h in sizes))
+    head = data[:4096].decode("utf-8", "replace").lower()
+    if "<svg" in head:
+        return ("svg", 0, 0)
+    return None
+
+
+CT_FOR_TYP = {
+    "png": {"image/png"},
+    "svg": {"image/svg+xml"},
+    "ico": {"image/x-icon", "image/vnd.microsoft.icon"},
+}
+
+
+class LinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[dict] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "link":
+            return
+        d: dict[str, str] = {}
+        for k, v in attrs:
+            d.setdefault(k, v)
+        self.links.append({
+            "rel": (d.get("rel") or "").lower().split(),
+            "href": d.get("href"),
+            "sizes": (d.get("sizes") or "").split(),
+            "type": (d.get("type") or "").lower(),
+        })
+
+
+def resolve(link: dict) -> tuple[str | None, bool]:
+    """(URL, extern) — löst href relativ zu base auf und prüft den Host."""
+    href = link.get("href")
+    if not href:
+        return None, False
+    url = urllib.parse.urljoin(base + "/", href)
+    if urllib.parse.urlparse(url).netloc != base_host:
+        return url, True
+    return url, False
+
+
+def data_uri_bytes(href: str) -> bytes | None:
+    """Inhalt einer data:-URI (Inline-Icon), sonst None."""
+    head, sep, payload = href.partition(",")
+    if not sep:
+        return None
+    if head.lower().endswith(";base64"):
+        try:
+            return base64.b64decode(payload)
+        except ValueError:
+            return None
+    return urllib.parse.unquote(payload).encode("utf-8")
+
+
+def check_bundled(link: dict):
+    """Prüfung 3 für eine eingebundene Icon-Datei. Gibt image_size oder None zurück."""
+    href = link.get("href") or ""
+    if href[:5].lower() == "data:":
+        # Inline-Icon im HTML: nichts abzurufen, aber Typ und Größe lassen sich prüfen.
+        data = data_uri_bytes(href)
+        isz = image_size(data) if data else None
+        if isz is None:
+            finding(f"{href[:40]}…: Inline-Icon ist kein Bild (PNG, ICO, SVG)")
+        else:
+            ok(f"Inline-Icon ({isz[0].upper()})")
+        return isz
+    url, extern = resolve(link)
+    if extern:
+        hint(f"{link.get('href')}: externer Host, nicht geprüft")
+        return None
+    if not url:
+        return None
+    status, _, data = get_bytes(url)
+    if status != 200:
+        finding(f"{link.get('href')}: eingebunden, liefert aber HTTP {status}")
+        return None
+    isz = image_size(data)
+    if isz is None:
+        finding(f"{link.get('href')}: eingebunden, ist aber kein Bild (PNG, ICO, SVG)")
+        return None
+    typ, w, h = isz
+    if link.get("type"):
+        if link["type"] not in CT_FOR_TYP[typ]:
+            finding(f'{link.get("href")}: type="{link["type"]}", die Datei ist aber {typ}')
+    if typ == "png":
+        given = [s for s in link["sizes"] if s.lower() != "any"]
+        if given:
+            passt = any(re.match(r"^%dx%d$" % (w, h), s, re.IGNORECASE) for s in given)
+            if not passt:
+                finding(f'{link.get("href")}: sizes="{", ".join(given)}", die Datei ist aber {w}×{h}')
+    return isz
+
+
+def main() -> int:
+    global base, base_host
+    if len(sys.argv) != 2:
+        print("Verwendung: check-favicon <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+    base_host = urllib.parse.urlparse(base).netloc
+
+    status, _, body = get_bytes(base + "/")
+    if status != 200:
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
+        return 77
+
+    parser = LinkParser()
+    parser.feed(body.decode("utf-8", "replace"))
+
+    all_links = parser.links
+    icon_links = [l for l in all_links if "icon" in l["rel"]]
+    at_links = [l for l in all_links if "apple-touch-icon" in l["rel"]]
+    manifest_links = [l for l in all_links if "manifest" in l["rel"]]
+
+    # 1. /favicon.ico — wird vom Browser immer abgefragt.
+    fav_status, _, fav_data = get_bytes(base + "/favicon.ico")
+    if fav_status != 200:
+        finding(f"/favicon.ico fehlt (HTTP {fav_status})")
+    else:
+        isz = image_size(fav_data)
+        if isz is None or isz[0] not in ("ico", "png"):
+            finding("/favicon.ico ist weder ICO noch PNG")
+        else:
+            typ, w, h = isz
+            if typ == "ico":
+                sizes = ico_sizes(fav_data)
+                size_str = ", ".join("%d×%d" % (a, b) for a, b in sizes)
+                ok(f"/favicon.ico (ICO: {size_str})")
+                if not any(a == 32 and b == 32 for a, b in sizes):
+                    hint("/favicon.ico enthält kein 32×32 (enthalten: " + size_str + ")")
+            else:
+                ok(f"/favicon.ico (PNG: {w}×{h})")
+
+    # 2. + 3. icon-Links.
+    if not icon_links:
+        finding('kein <link rel="icon"> auf der Startseite')
+    else:
+        svg_found = False
+        for l in icon_links:
+            isz = check_bundled(l)
+            if isz and isz[0] == "svg":
+                svg_found = True
+        if not svg_found:
+            hint('kein SVG-Icon (<link rel="icon" type="image/svg+xml">) — skaliert scharf und kann Dark Mode')
+
+    # 3. apple-touch-icon als eingebundene Datei …
+    for l in at_links:
+        check_bundled(l)
+    # … und 4. die erwartete Größe 180×180 PNG.
+    if at_links:
+        link = at_links[0]
+        url, extern = resolve(link)
+        if extern:
+            hint(f"{link.get('href')}: externer Host, nicht geprüft")
+        else:
+            status, _, data = get_bytes(url)
+            isz = image_size(data) if status == 200 else None
+            if isz and isz[0] == "png" and isz[1] == 180 and isz[2] == 180:
+                ok("apple-touch-icon 180×180 PNG")
+            elif isz:
+                typ, w, h = isz
+                finding(f"{link.get('href')}: apple-touch-icon ist {w}×{h}, erwartet 180×180 PNG")
+    else:
+        finding('kein <link rel="apple-touch-icon"> (180×180 PNG für iOS)')
+
+    # 5. Web-Manifest.
+    if manifest_links:
+        link = manifest_links[0]
+        url, extern = resolve(link)
+        href = link.get("href")
+        if extern:
+            hint(f"{href}: externer Host, nicht geprüft")
+        else:
+            status, _, data = get_bytes(url)
+            icons = None
+            if status != 200:
+                finding(f"{href}: Manifest nicht abrufbar oder kein gültiges JSON")
+            else:
+                try:
+                    manifest = json.loads(data.decode("utf-8", "replace"))
+                    icons = manifest.get("icons", [])
+                except (ValueError, AttributeError):
+                    finding(f"{href}: Manifest nicht abrufbar oder kein gültiges JSON")
+            if icons is not None:
+                found_192 = False
+                found_512 = False
+                maskable = False
+                for icon in icons:
+                    src = icon.get("src")
+                    if not src:
+                        continue
+                    iurl = urllib.parse.urljoin(url, src)
+                    if urllib.parse.urlparse(iurl).netloc != base_host:
+                        hint(f"{src}: externer Host, nicht geprüft")
+                        continue
+                    istatus, _, idata = get_bytes(iurl)
+                    if istatus != 200:
+                        finding(f"Manifest-Icon {src}: HTTP {istatus}")
+                        continue
+                    isz = image_size(idata)
+                    if isz and isz[0] == "png":
+                        iw, ih = isz[1], isz[2]
+                        if (iw, ih) == (192, 192):
+                            found_192 = True
+                        if (iw, ih) == (512, 512):
+                            found_512 = True
+                        sizes = icon.get("sizes", "")
+                        if sizes:
+                            m = re.match(r"^\s*(\d+)x(\d+)\s*$", sizes, re.IGNORECASE)
+                            if m and (int(m.group(1)), int(m.group(2))) != (iw, ih):
+                                finding(f"Manifest-Icon {src}: sizes=\"{sizes}\", die Datei ist aber {iw}×{ih}")
+                    purpose = (icon.get("purpose") or "").lower()
+                    if "maskable" in purpose:
+                        maskable = True
+                if not found_192:
+                    finding("Manifest: kein Icon 192×192 PNG")
+                if not found_512:
+                    finding("Manifest: kein Icon 512×512 PNG")
+                if not maskable:
+                    hint("kein maskable-Icon im Manifest (512×512, Motiv in der inneren 80 %) — Android schneidet sonst selbst zu")
+                if found_192 and found_512:
+                    ok("Manifest: Icons 192×192 und 512×512 PNG")
+    else:
+        finding('kein <link rel="manifest"> (Web-App-Manifest mit Icons 192×192 und 512×512)')
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

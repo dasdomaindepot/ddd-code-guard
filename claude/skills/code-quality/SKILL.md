@@ -120,6 +120,16 @@ Bewertung durch ein selbst gehostetes Sprachmodell. Ob der Server den
 Honeypot auch auswertet, sieht der Check nicht. Einzeln fahrbar:
 `bin/check-form-protection https://test.de`.
 
+**Favicons** (`favicon`, seit 26.09.2026, **blockierend**): Prüft auf der lokalen
+Instanz den `<head>` der Startseite und lädt jedes eingebundene Icon. Pflicht:
+`/favicon.ico` (ICO oder PNG), mindestens ein `<link rel="icon">`, jede eingebundene
+Datei liefert HTTP 200 und ist ein Bild vom angegebenen `type`, `sizes` stimmt mit der
+echten Bildgröße überein, `apple-touch-icon` als PNG 180×180, ein Web-App-Manifest mit
+PNG-Icons 192×192 und 512×512. Nur Hinweise: kein SVG-Icon, kein maskable-Icon,
+`favicon.ico` ohne 32×32. Grundlage ist der Satz aus fünf Icons plus Manifest, den
+Evil Martians („How to Favicon", Stand 2026) empfiehlt. Einzeln fahrbar:
+`bin/check-favicon https://test.de`.
+
 Fehlt eine Prüfung im Projekt, meldet das Script `MISSING`. Das ist ein
 legitimer Befund, kein Grund für einen Umweg. Baue niemals einen eigenen Aufruf,
 um eine fehlende Prüfung doch noch auszuführen, und rufe niemals `vendor/bin/...`
