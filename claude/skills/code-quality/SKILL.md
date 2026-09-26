@@ -66,6 +66,17 @@ genauso wie auf den Servern. Läuft die
 Instanz nicht, steht der Check auf `MISSING`. Einzeln fahrbar:
 `bin/check-web-hardening https://test.de`.
 
+**Rechtstexte** (`legal`, seit 25.09.2026, beratend): Sucht auf derselben
+lokalen Instanz Impressum, Datenschutzerklärung und AGB und meldet veraltete
+Verweise im ausgelieferten Text — TMG (seit 14.05.2024 DDG, Impressum § 5 DDG),
+„§§ 8 bis 10 DDG" als Haftungsgrundlage (die Nummern sind nicht mitgewandert,
+richtig sind Art. 4–8 DSA über § 7 Abs. 1 DDG), RStV (seit 2020 § 18 Abs. 2
+MStV), Hinweise auf die zum 20.07.2025 eingestellte OS/ODR-Plattform, TTDSG
+(jetzt TDDDG) und „Privacy Shield". Fehlt Impressum oder Datenschutzerklärung,
+ist das ein Befund. Ob alle Geschäftsführer genannt sind, kann kein Script
+wissen — das bleibt ein Hinweis. Keine Rechtsberatung. Einzeln fahrbar:
+`bin/check-legal https://test.de`.
+
 Fehlt eine Prüfung im Projekt, meldet das Script `MISSING`. Das ist ein
 legitimer Befund, kein Grund für einen Umweg. Baue niemals einen eigenen Aufruf,
 um eine fehlende Prüfung doch noch auszuführen, und rufe niemals `vendor/bin/...`
@@ -169,7 +180,7 @@ Baselines und unterdrückte Befunde mit.
 **Das Script kennt nur sechs Status** — `PASS`, `FAIL`, `TIMEOUT`, `MISSING`,
 `SKIPPED` und `WARN`. Es misst Exit-Codes, es liest keine Ausgaben. `WARN`
 vergibt es selbst nur für **beratende Checks** (`ADVISORY_CHECKS` im Script,
-derzeit `web-hardening`): Deren Befund blockiert nicht, gehört aber in den
+derzeit `web-hardening` und `legal`): Deren Befund blockiert nicht, gehört aber in den
 Report. Sonst kann `WARN` und `UNCONFIGURED` nur dein Urteil vergeben, und genau
 dafür bist du da:
 

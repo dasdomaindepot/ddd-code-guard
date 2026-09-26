@@ -40,6 +40,7 @@ rather than improvising:
 | `test`, `coverage`, `infection`, `e2e` | Tests, coverage, mutation testing, end-to-end | `make` targets |
 | `npm-audit`, `npm-lint`, `npm-typecheck`, `npm-test`, `npm-build` | Frontend | `package.json` scripts |
 | `web-hardening` | Security headers, robots.txt, sitemap, compression, cache headers of the running local instance | `bin/check-web-hardening` (advisory) |
+| `legal` | Outdated references in German legal pages (imprint, privacy policy, terms): TMG, RStV, TTDSG, EU ODR platform, Privacy Shield | `bin/check-legal` (advisory, python3) |
 
 Expensive checks (coverage, infection, e2e, build) only run with `--full`.
 
@@ -153,7 +154,8 @@ Report.
 `code-guard` erkennt, was vorhanden ist, und meldet alles andere als `MISSING`,
 statt zu improvisieren. Die Tabelle oben im englischen Teil gilt unverändert:
 Composer, PHPStan, phpcs, Deptrac, Linter, Tests, Coverage, Infection, E2E,
-npm-Skripte und die Web-Härtung der lokal laufenden Instanz. Teure Checks
+npm-Skripte, die Web-Härtung und die Rechtstexte (Impressum, Datenschutz, AGB)
+der lokal laufenden Instanz. Teure Checks
 laufen nur mit `--full`.
 
 ### Annahmen

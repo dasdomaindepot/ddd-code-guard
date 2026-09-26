@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""check-legal — Rechtstexte einer lokal laufenden Instanz auf veraltete Verweise prüfen.
+
+Aufgerufen vom Code Guard (Check "legal"), lässt sich aber auch allein fahren:
+    check-legal https://projekt.local
+
+Gesucht werden Impressum, Datenschutzerklärung und AGB (feste Pfade, sonst ein
+Link auf der Startseite). Geprüft wird der ausgelieferte Text, nicht das Template:
+Was im Kommentar steht, sieht kein Besucher.
+
+Prüfpunkte (Stand der Rechtslage: September 2026):
+  1. Impressum vorhanden.
+  2. Kein TMG / Telemediengesetz — seit 14.05.2024 gilt das Digitale-Dienste-Gesetz,
+     die Impressumspflicht steht in § 5 DDG.
+  3. Keine „§§ 8 bis 10 DDG" als Haftungsgrundlage — die Nummern sind beim Wechsel
+     NICHT mitgewandert. Die Haftungsprivilegien der alten §§ 7–10 TMG stehen in
+     Art. 4 bis 8 der Verordnung (EU) 2022/2065 (DSA), auf die § 7 Abs. 1 DDG verweist.
+  4. Kein RStV / Rundfunkstaatsvertrag — seit 07.11.2020 § 18 Abs. 2 MStV.
+  5. Kein Hinweis auf die EU-Plattform zur Online-Streitbeilegung (OS/ODR) — zum
+     20.07.2025 eingestellt (Verordnung (EU) 2024/3228). Ein fortbestehender
+     Verweis kann als irreführend gelten.
+  6. Datenschutzerklärung vorhanden, kein TTDSG (seit 14.05.2024 TDDDG) und kein
+     „Privacy Shield" als Grundlage (vom EuGH am 16.07.2020 gekippt, Nachfolger ist
+     seit 10.07.2023 das EU-US Data Privacy Framework).
+
+Nicht automatisch prüfbar und deshalb nur ein Hinweis: ob ALLE Vertretungsberechtigten
+genannt sind (§ 5 Abs. 1 Nr. 1 DDG — bei einer GmbH jeder Geschäftsführer).
+
+Keine Rechtsberatung. Der Check findet bekannte Altlasten, er ersetzt keine Prüfung.
+
+Nur lesende GET-Anfragen, ausschließlich gegen die übergebene URL.
+
+Exit-Codes:
+   0  keine Befunde
+   1  Befunde
+   2  Nutzungsfehler
+  77  nicht messbar (Startseite liefert kein HTTP 200)
+"""
+
+import html
+import re
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 15
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+findings = 0
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+def fetch(url: str) -> tuple[int, str, str]:
+    """(Status, finale URL, Body). Folgt Weiterleitungen."""
+    req = urllib.request.Request(url, headers={"User-Agent": "code-guard-legal"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
+            return r.status, r.geturl(), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, url, ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0, url, ""
+
+
+def visible_text(body: str) -> str:
+    """Sichtbarer Text: ohne Skripte, Styles, Kommentare und Tags, Entities aufgelöst.
+
+    Links bleiben als ' [href] ' erhalten, damit ein ODR-Link auch ohne Linktext auffällt.
+    """
+    body = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", body)
+    body = re.sub(r"(?s)<!--.*?-->", " ", body)
+    body = re.sub(r'(?i)<a\b[^>]*href="([^"]*)"', r" [\1] <a", body)
+    body = re.sub(r"(?s)<[^>]+>", " ", body)
+    return re.sub(r"\s+", " ", html.unescape(body))
+
+
+def find_page(base: str, home: str, paths: list[str], words: list[str]) -> tuple[str, str] | None:
+    for p in paths:
+        status, final, body = fetch(base + p)
+        if status == 200 and body:
+            return final, body
+    # Sonst: Link auf der Startseite, dessen Ziel oder Text passt.
+    for href, text in re.findall(r'(?is)<a\b[^>]*href="([^"#]+)"[^>]*>(.*?)</a>', home):
+        hay = (href + " " + re.sub(r"<[^>]+>", "", text)).lower()
+        if any(w in hay for w in words):
+            url = urllib.parse.urljoin(base + "/", href)
+            if urllib.parse.urlparse(url).netloc != urllib.parse.urlparse(base).netloc:
+                continue
+            status, final, body = fetch(url)
+            if status == 200 and body:
+                return final, body
+    return None
+
+
+def check_common(name: str, text: str) -> int:
+    """Veraltete Verweise, die in jedem Rechtstext falsch sind. Gibt die Zahl der Befunde zurück."""
+    before = findings
+    for m in sorted(set(re.findall(r".{0,30}\b(?:TMG|Telemediengesetz)\b.{0,12}", text))):
+        finding(f"{name}: „{m.strip()}\" — das TMG gilt seit 14.05.2024 nicht mehr (DDG; Impressum: § 5 DDG)")
+    if re.search(r"§§?\s*8\s*(?:bis|-|–)\s*10\s*DDG", text):
+        finding(f"{name}: „§§ 8 bis 10 DDG\" als Haftungsgrundlage — die Nummern sind nicht mitgewandert; "
+                "die Haftungsprivilegien stehen in Art. 4 bis 8 DSA (§ 7 Abs. 1 DDG)")
+    if re.search(r"\bRStV\b|Rundfunkstaatsvertrag", text):
+        finding(f"{name}: Verweis auf den RStV — seit 07.11.2020 gilt § 18 Abs. 2 MStV")
+    if re.search(r"ec\.europa\.eu/consumers/odr|Online-Streitbeilegung|OS-Plattform|ODR-Plattform", text, re.I):
+        finding(f"{name}: Hinweis auf die EU-Streitbeilegungsplattform (OS/ODR) — zum 20.07.2025 "
+                "eingestellt (VO (EU) 2024/3228), Hinweis entfernen")
+    if re.search(r"\bTTDSG\b", text):
+        finding(f"{name}: TTDSG — seit 14.05.2024 umbenannt in TDDDG (z. B. § 25 TDDDG)")
+    if re.search(r"Privacy[\s-]Shield", text, re.I) and not re.search(r"Data Privacy Framework", text, re.I):
+        finding(f"{name}: „Privacy Shield\" als Grundlage — seit 16.07.2020 ungültig, "
+                "Nachfolger ist das EU-US Data Privacy Framework")
+    return findings - before
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Verwendung: check-legal <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+
+    status, _, home = fetch(base + "/")
+    if status != 200:
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
+        return 77
+
+    imp = find_page(base, home, ["/impressum", "/imprint", "/impressum.html"], ["impressum", "imprint"])
+    if imp is None:
+        finding("kein Impressum gefunden (/impressum, /imprint oder Link auf der Startseite)")
+    else:
+        url, body = imp
+        text = visible_text(body)
+        if check_common("Impressum", text) == 0:
+            ok(f"Impressum ({urllib.parse.urlparse(url).path}) ohne veraltete Verweise")
+        if re.search(r"\bGmbH\b|\bAG\b|\bUG\b", text):
+            hint("Impressum: Bei juristischen Personen ALLE Vertretungsberechtigten nennen "
+                 "(§ 5 Abs. 1 Nr. 1 DDG) — nicht automatisch prüfbar, gegen das Handelsregister abgleichen")
+
+    ds = find_page(base, home, ["/datenschutz", "/datenschutzerklaerung", "/privacy"],
+                   ["datenschutz", "privacy"])
+    if ds is None:
+        finding("keine Datenschutzerklärung gefunden (/datenschutz, /privacy oder Link auf der Startseite)")
+    else:
+        url, body = ds
+        if check_common("Datenschutz", visible_text(body)) == 0:
+            ok(f"Datenschutzerklärung ({urllib.parse.urlparse(url).path}) ohne veraltete Verweise")
+
+    agb = find_page(base, home, ["/agb"], ["agb"])
+    if agb is not None:
+        url, body = agb
+        if check_common("AGB", visible_text(body)) == 0:
+            ok(f"AGB ({urllib.parse.urlparse(url).path}) ohne veraltete Verweise")
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -357,6 +357,7 @@ CHECK_DEFS=(
   "e2e|End-to-End|tests|expensive|make e2e|target:e2e"
   "npm-build|Asset-Build|frontend|expensive|npm run build|npm:build"
   "web-hardening|Web-Haertung|security|normal|$SCRIPT_DIR/check-web-hardening $WEB_URL|web-url"
+  "legal|Rechtstexte|legal|normal|$SCRIPT_DIR/check-legal $WEB_URL|web-url,bin:python3"
 )
 
 # Beratende Checks: Ein Befund wird WARN statt FAIL und blockiert nicht.
@@ -367,7 +368,11 @@ CHECK_DEFS=(
 # geschaltet haette er ueber Nacht jeden Guard rot gemacht. Die Header kommen
 # zentral per Reverse-Proxy; sobald die ueberall ausgerollt sind,
 # den Check hier herausnehmen — dann blockiert er wie jeder andere.
-ADVISORY_CHECKS=" web-hardening "
+#
+# legal (veraltete Verweise in Impressum, Datenschutz, AGB: TMG, RStV, TTDSG,
+# OS/ODR-Plattform, Privacy Shield) ist beratend aus demselben Grund: Er trifft
+# beim ersten Lauf viele Projekte zugleich.
+ADVISORY_CHECKS=" web-hardening legal "
 
 # `make coverage-check` haelt eine Mindestschwelle ein, `make coverage` misst nur.
 # Wo die Ratsche existiert, wird sie gefahren -- eine Messung ohne Schwelle kann
