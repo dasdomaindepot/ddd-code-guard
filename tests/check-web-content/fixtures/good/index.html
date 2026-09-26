@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Das Home der Beispiel-Manufaktur — Handarbeit aus Beispielstadt.">
+  <title>Willkommen — Beispiel-Manufaktur</title>
+  <link rel="canonical" href="https://www.example.com/">
+</head>
+<body>
+  <h1>Willkommen in der Beispiel-Manufaktur</h1>
+  <p>Entdecke handgemachte Waren aus unserem Haus.</p>
+  <img src="/img/welcome.png" alt="Handarbeitete Waren auf einer Holzwerkbank">
+  <p>
+    <a href="/kontakt">Kontakt aufnehmen</a> |
+    <a href="/katalog">Zum Katalog</a>
+  </p>
+  <button type="button" aria-label="Suche starten"><img src="/img/lupe.png" alt=""></button>
+  <div id="sfwdt123" class="sf-toolbar"><button></button><img src="x.png"></div>
+  <!-- Regression: verschachtelte Toolbar, SVG-Titel im Link, offenes <p> -->
+  <div id="sfwdt456" class="sf-toolbar"><div><button></button></div><img src="y.png"><div><a href="/_profiler"></a></div></div>
+  <a href="/katalog"><svg viewBox="0 0 10 10"><title>Katalog</title><path d="M0 0h10v10H0z"/></svg></a>
+  <p>Offener Absatz mit <a href="/impressum">Impressum</a>
+  <footer>&copy; 2026 Beispiel-Manufaktur</footer>
+</body>
+</html>

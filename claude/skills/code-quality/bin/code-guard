@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -358,6 +358,7 @@ CHECK_DEFS=(
   "npm-build|Asset-Build|frontend|expensive|npm run build|npm:build"
   "web-hardening|Web-Haertung|security|normal|$SCRIPT_DIR/check-web-hardening $WEB_URL|web-url"
   "legal|Rechtstexte|legal|normal|$SCRIPT_DIR/check-legal $WEB_URL|web-url,bin:python3"
+  "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL|web-url,bin:python3"
 )
 
 # Beratende Checks: Ein Befund wird WARN statt FAIL und blockiert nicht.
@@ -372,6 +373,10 @@ CHECK_DEFS=(
 # legal (veraltete Verweise in Impressum, Datenschutz, AGB: TMG, RStV, TTDSG,
 # OS/ODR-Plattform, Privacy Shield) ist beratend aus demselben Grund: Er trifft
 # beim ersten Lauf viele Projekte zugleich.
+# web-content (lang, title, description, canonical, viewport, genau ein h1,
+# alt-Texte, Links/Buttons ohne Namen, Formularfelder ohne Label, doppelte ids)
+# steht bewusst NICHT hier: Das sind Grundregeln seit zwanzig Jahren, dazu
+# Pflicht nach BFSG seit 28.06.2025. Sie blockieren vom ersten Tag an.
 ADVISORY_CHECKS=" web-hardening legal "
 
 # `make coverage-check` haelt eine Mindestschwelle ein, `make coverage` misst nur.

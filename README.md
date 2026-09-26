@@ -41,6 +41,7 @@ rather than improvising:
 | `npm-audit`, `npm-lint`, `npm-typecheck`, `npm-test`, `npm-build` | Frontend | `package.json` scripts |
 | `web-hardening` | Security headers, robots.txt, sitemap, compression, cache headers of the running local instance | `bin/check-web-hardening` (advisory) |
 | `legal` | Outdated references in German legal pages (imprint, privacy policy, terms): TMG, RStV, TTDSG, EU ODR platform, Privacy Shield | `bin/check-legal` (advisory, python3) |
+| `web-content` | HTML basics of the running local instance (home page plus sitemap URLs): `lang`, `<title>`, meta description, canonical, viewport without zoom lock, exactly one `<h1>`, `alt` on every image, no placeholder alt texts, links/buttons with an accessible name, labelled form fields, no duplicate ids (description/canonical skipped on `noindex` pages; `hidden`/`aria-hidden` subtrees ignored) | `bin/check-web-content` (blocking, python3) |
 
 Expensive checks (coverage, infection, e2e, build) only run with `--full`.
 
@@ -51,7 +52,7 @@ This grew out of one agency's project template, so it expects:
 - a `Makefile` with targets such as `phpstan`, `phpcs`, `test`
 - PHP running in a Docker Compose service called `php`
 - optionally a local URL in `DOMAIN_NAME` (`.env.local`/`.env`) or
-  `GUARD_WEB_URL` for the web-hardening check
+  `GUARD_WEB_URL` for the web-hardening, legal and web-content checks
 
 Projects that differ still work — missing checks show up as `MISSING`.
 

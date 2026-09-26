@@ -77,6 +77,24 @@ ist das ein Befund. Ob alle Geschäftsführer genannt sind, kann kein Script
 wissen — das bleibt ein Hinweis. Keine Rechtsberatung. Einzeln fahrbar:
 `bin/check-legal https://test.de`.
 
+**Seiteninhalt** (`web-content`, seit 26.09.2026, **blockierend**): Prüft auf
+derselben lokalen Instanz die Startseite und die URLs aus der `sitemap.xml`
+(höchstens `MAX_PAGES`, Standard 50) auf die HTML-Grundregeln: `<html lang>`,
+nicht leerer `<title>`, `<meta name="description">`, `<link rel="canonical">`,
+`<meta name="viewport">` ohne Zoom-Sperre, genau ein `<h1>`, `alt` an jedem Bild
+(`alt=""` für dekorative Bilder ist erlaubt), kein Dateiname oder Platzhalter als
+Alt-Text, kein Link oder Button ohne zugänglichen Namen, kein Formularfeld ohne
+Label (ein `placeholder` zählt nicht) und keine doppelte `id`. Die Symfony-Toolbar
+und alles mit `hidden` oder `aria-hidden="true"` werden ausgeblendet (ein
+Honeypot-Feld gehört in ein solches Element). Seiten mit
+`<meta name="robots" content="noindex">` brauchen keine Description und kein
+Canonical — der `X-Robots-Tag`-Header zählt dafür nicht, Symfony setzt ihn im
+Debug-Modus überall. Clientseitig gerenderte Seiten (Vue-SPA) sind nicht messbar
+und stehen auf `MISSING`. Anders als `web-hardening` und `legal` blockiert dieser
+Check sofort: Das sind Regeln, die seit zwanzig Jahren gelten und seit
+28.06.2025 nach BFSG für viele Seiten Pflicht sind. Einzeln fahrbar:
+`bin/check-web-content https://test.de`.
+
 Fehlt eine Prüfung im Projekt, meldet das Script `MISSING`. Das ist ein
 legitimer Befund, kein Grund für einen Umweg. Baue niemals einen eigenen Aufruf,
 um eine fehlende Prüfung doch noch auszuführen, und rufe niemals `vendor/bin/...`

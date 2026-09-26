@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""check-web-content — Server-seitig gerenderten Inhalt einer lokal laufenden Instanz auf Grund-
+gerüst und Barrierefreiheit prüfen.
+
+Aufgerufen vom Code Guard (Check "web-content"), lässt sich aber auch allein fahren:
+    check-web-content https://projekt.local
+
+Geprüft wird der ausgelieferte HTML-Inhalt, nicht die gerenderte SPA: Was im
+Quelltext steht, sieht ein serverseitig gerenderter Besucher. Clientseitig
+gerenderte Seiten (Vue/React …) ohne sichtbaren Inhalt im <body> sind nicht
+messbar und werden übergangen.
+
+Geprüft werden die Startseite plus alle URLs aus sitemap.xml (Host wird auf die
+lokale Instanz umgeschrieben). Jede Verletzung ist ein Befund:
+   1. <html> hat ein nicht leeres lang-Attribut.
+   2. <title> vorhanden und nach strip() nicht leer.
+   3. <meta name="description"> vorhanden, content nicht leer.
+   4. <link rel="canonical"> vorhanden, href nicht leer.
+   5. <meta name="viewport"> vorhanden.
+   6. viewport verbietet kein Zoomen (kein user-scalable=no/0, kein maximum-scale < 2).
+      (3. und 4. entfallen bei <meta name="robots" content="noindex">.)
+   7. Genau ein <h1> mit nicht leerem Text.
+   8. Jedes <img> hat ein alt-Attribut (alt="" erlaubt, dekorativ).
+   9. alt ist kein Dateiname oder Platzhalter.
+  10. Jeder <a href> und jeder <button> hat einen zugänglichen Namen.
+  11. jedes Formularfeld hat eine Beschriftung.
+  12. Kein id-Wert kommt mehrfach vor.
+
+Ignoriert werden <script>, <style>, <template>, <noscript> sowie die
+Symfony-Debug-Toolbar (id mit sfwdt/sfToolbar oder class sf-toolbar) — sie wird
+im Dev-Modus injiziert und ist nicht Teil der App — und alles mit hidden oder
+aria-hidden="true" (für Screenreader unsichtbar, z. B. ein Honeypot-Feld). HTML wird mit
+html.parser.HTMLParser geparst, nicht mit Regex.
+
+Nur lesende GET-Anfragen, ausschließlich gegen die übergebene URL.
+
+Exit-Codes:
+    0  keine Befunde
+    1  Befunde
+    2  Nutzungsfehler
+   77  nicht messbar (Startseite kein HTTP 200 oder keine serverseitig gerenderte Seite)
+"""
+
+import os
+import re
+import ssl
+import sys
+from html.parser import HTMLParser
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 15
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+VOID_ELEMENTS = {"img", "input", "br", "meta", "link", "hr", "source", "area", "wbr"}
+IGNORE_TAGS = {"script", "style", "template", "noscript"}
+
+findings = 0
+MAX_PAGES = 50
+try:
+    MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
+except (TypeError, ValueError):
+    MAX_PAGES = 50
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+def fetch(url: str) -> tuple[int, str, str]:
+    """(Status, Content-Type, Body). Folgt Weiterleitungen."""
+    req = urllib.request.Request(url, headers={"User-Agent": "code-guard-web-content"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
+            ct = r.headers.get("Content-Type", "")
+            return r.status, ct, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, "", ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0, "", ""
+
+
+def is_placeholder_alt(alt: str) -> bool:
+    a = alt.strip().lower()
+    if a.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
+        return True
+    return a in {"image", "img", "bild", "foto", "photo", "picture", "grafik"}
+
+
+def zoom_text(content: str) -> str:
+    c = content.lower()
+    if "user-scalable=no" in c:
+        return "(user-scalable=no)"
+    if "user-scalable=0" in c:
+        return "(user-scalable=0)"
+    m = re.search(r"maximum-scale\s*=\s*([0-9.]+)", c)
+    if m and float(m.group(1)) < 2:
+        return f"(maximum-scale={m.group(1)})"
+    return ""
+
+
+class PageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        # Ignorierter Bereich (script/style/Toolbar …): Tag und Verschachtelungstiefe.
+        # Die Toolbar besteht aus vielen verschachtelten <div>; das erste </div>
+        # darf den Bereich nicht beenden.
+        self.ignore_tag: str | None = None
+        self.ignore_depth = 0
+        self.text_stack: list[dict] = []   # pro Element: Tag, Text, Namens-Flaggen
+        self.in_label = 0                  # Tiefe innerhalb eines <label>
+        self.in_body = False
+
+        self.lang: str | None = None
+        self.title_text = ""
+        self.has_title = False
+        self.has_meta_description = False
+        self.meta_description_content: str | None = None
+        self.noindex = False
+        self.has_viewport = False
+        self.viewport_content: str | None = None
+        self.has_canonical = False
+        self.canonical_href: str | None = None
+        self.h1_texts: list[str] = []
+        self.images: list[tuple[str | None, str | None]] = []
+        self.fields: list[dict] = []
+        self.labels_for: set[str] = set()
+        self.ids: list[str] = []
+        self.accessible_missing: list[str] = []
+        self.body_text = ""
+
+    # -- Hilfsfunktionen -------------------------------------------------
+
+    @staticmethod
+    def _first(attrs, name):
+        for k, v in attrs:
+            if k == name:
+                return v
+        return None
+
+    def _collect_ids(self, attrs) -> None:
+        for k, v in attrs:
+            if k == "id" and v:
+                self.ids.append(v)
+
+    def _is_ignored(self, tag: str, attrs) -> bool:
+        """Symfony-Toolbar oder für assistive Technik unsichtbar (hidden, aria-hidden).
+
+        Ein Honeypot-Feld gehört in ein Element mit aria-hidden="true" — dann liest es
+        auch kein Screenreader vor und es braucht kein Label.
+        """
+        aid = self._first(attrs, "id") or ""
+        cls = self._first(attrs, "class") or ""
+        if aid.startswith("sfwdt") or aid.startswith("sfToolbar"):
+            return True
+        if any(k == "hidden" for k, _ in attrs):
+            return True
+        if (self._first(attrs, "aria-hidden") or "").strip().lower() == "true":
+            return True
+        return "sf-toolbar" in cls.split()
+
+    def _record_self(self, tag: str, attrs, entry: dict) -> None:
+        for k in ("aria-label", "aria-labelledby", "title"):
+            v = self._first(attrs, k)
+            if v is not None and v.strip():
+                entry["self_name"] = True
+        if tag == "a":
+            entry["href"] = self._first(attrs, "href")
+        if tag == "svg" and (v := self._first(attrs, "aria-label")) is not None and v.strip():
+            entry["svg_title"] = True
+
+    def _add_field(self, attrs, tag: str) -> None:
+        self.fields.append({
+            "name": self._first(attrs, "name"),
+            "id": self._first(attrs, "id"),
+            "tag": tag,
+            "wrapped": self.in_label > 0,
+            "has_attr_label": any(self._first(attrs, k) for k in
+                                  ("aria-label", "aria-labelledby", "title")),
+        })
+
+    def _accessible(self, entry: dict) -> bool:
+        if entry["self_name"]:
+            return True
+        if "".join(entry["text"]).strip():
+            return True
+        if entry["img_alt"]:
+            return True
+        if entry["svg_title"]:
+            return True
+        return False
+
+    # -- Start-Tags ------------------------------------------------------
+
+    def handle_starttag(self, tag, attrs):
+        self._on_start(tag, attrs, False)
+
+    def handle_startendtag(self, tag, attrs):
+        self._on_start(tag, attrs, True)
+
+    def _on_start(self, tag, attrs, self_closed) -> None:
+        if self.ignore_tag is not None:
+            if tag == self.ignore_tag and not self_closed:
+                self.ignore_depth += 1
+            return
+        if not self_closed and tag not in VOID_ELEMENTS and (tag in IGNORE_TAGS or self._is_ignored(tag, attrs)):
+            self.ignore_tag = tag
+            self.ignore_depth = 1
+            return
+        if tag in VOID_ELEMENTS or self_closed:
+            self._on_void(tag, attrs)
+            return
+        self._collect_ids(attrs)
+        entry = {"tag": tag, "text": [], "img_alt": False, "svg_title": False, "self_name": False, "href": None}
+        self.text_stack.append(entry)
+        self._record_self(tag, attrs, entry)
+        if tag == "body":
+            self.in_body = True
+        elif tag == "html":
+            self.lang = self._first(attrs, "lang")
+        elif tag == "title" and not self.in_body:
+            self.has_title = True
+        elif tag == "label":
+            self.in_label += 1
+            for k, v in attrs:
+                if k == "for" and v is not None:
+                    self.labels_for.add(v)
+        elif tag in ("select", "textarea"):
+            self._add_field(attrs, tag)
+
+    def _on_void(self, tag, attrs) -> None:
+        self._collect_ids(attrs)
+        if tag == "img":
+            src = self._first(attrs, "src")
+            alt = self._first(attrs, "alt")
+            self.images.append((src, alt))
+            if self.text_stack and alt is not None and alt.strip():
+                self.text_stack[-1]["img_alt"] = True
+        elif tag == "input":
+            t = (self._first(attrs, "type") or "").lower()
+            if t not in ("hidden", "submit", "button", "reset", "image"):
+                self._add_field(attrs, "input")
+        elif tag == "meta":
+            name = (self._first(attrs, "name") or "").lower()
+            if name == "description":
+                self.has_meta_description = True
+                self.meta_description_content = self._first(attrs, "content")
+            elif name == "robots":
+                self.noindex = "noindex" in (self._first(attrs, "content") or "").lower()
+            elif name == "viewport":
+                self.has_viewport = True
+                self.viewport_content = self._first(attrs, "content")
+        elif tag == "link":
+            rel = (self._first(attrs, "rel") or "").lower()
+            if "canonical" in rel.split():
+                self.has_canonical = True
+                self.canonical_href = self._first(attrs, "href")
+
+    # -- Daten -----------------------------------------------------------
+
+    def handle_data(self, data) -> None:
+        if self.ignore_tag is not None:
+            return
+        if self.text_stack:
+            self.text_stack[-1]["text"].append(data)
+        if self.in_body:
+            self.body_text += data
+
+    def handle_endtag(self, tag) -> None:
+        if self.ignore_tag is not None:
+            if tag == self.ignore_tag:
+                self.ignore_depth -= 1
+                if self.ignore_depth == 0:
+                    self.ignore_tag = None
+            return
+        if tag in VOID_ELEMENTS:
+            return
+        # HTML erlaubt offene Elemente (<p>, <li> …): bis zum passenden Start-Tag
+        # schließen, sonst gerät die Zuordnung von Text zu Link/Button durcheinander.
+        # Ein End-Tag ohne Start-Tag wird übergangen.
+        if not any(e["tag"] == tag for e in self.text_stack):
+            return
+        while self.text_stack[-1]["tag"] != tag:
+            self._close(self.text_stack.pop())
+        self._close(self.text_stack.pop())
+
+    def _close(self, entry: dict) -> None:
+        tag = entry["tag"]
+        if tag == "body":
+            self.in_body = False
+        elif tag == "label":
+            self.in_label = max(0, self.in_label - 1)
+        elif tag == "title":
+            if not self.in_body:
+                self.title_text = "".join(entry["text"])
+            elif self.text_stack:
+                self.text_stack[-1]["svg_title"] = True
+        elif tag == "h1":
+            self.h1_texts.append("".join(entry["text"]))
+        elif tag == "a":
+            href = entry["href"]
+            if href and not self._accessible(entry):
+                self.accessible_missing.append(href or "<a>")
+        elif tag == "button":
+            if not self._accessible(entry):
+                self.accessible_missing.append("<button>")
+        if self.text_stack:
+            parent = self.text_stack[-1]
+            parent["text"].extend(entry["text"])
+            parent["img_alt"] = parent["img_alt"] or entry["img_alt"]
+            parent["svg_title"] = parent["svg_title"] or entry["svg_title"]
+            parent["self_name"] = parent["self_name"] or entry["self_name"]
+
+    def visible(self) -> bool:
+        return bool(self.body_text.strip())
+
+
+def _examples(items, limit=5) -> str:
+    if len(items) <= limit:
+        return ", ".join(items)
+    return ", ".join(items[:limit]) + ", …"
+
+
+def check_page(path: str, p: PageParser) -> None:
+    # 1. lang
+    if p.lang is None or not p.lang.strip():
+        finding(f"{path}: <html> ohne lang-Attribut")
+    # 2. title
+    if not p.has_title or not p.title_text.strip():
+        finding(f"{path}: <title> fehlt oder ist leer")
+    # 3./4. Nur für indexierbare Seiten: Eine Seite mit <meta name="robots"
+    # content="noindex"> (Login, interne App) braucht weder Description noch
+    # Canonical. Der X-Robots-Tag-Header zählt bewusst nicht — Symfony setzt ihn
+    # im Debug-Modus auf jede Antwort.
+    if p.noindex:
+        pass
+    # 3. description
+    elif not p.has_meta_description or not (p.meta_description_content or "").strip():
+        finding(f'{path}: <meta name="description"> fehlt oder ist leer')
+    # 4. canonical
+    if not p.noindex and (not p.has_canonical or not (p.canonical_href or "").strip()):
+        finding(f'{path}: <link rel="canonical"> fehlt')
+    # 5. viewport
+    if not p.has_viewport:
+        finding(f'{path}: <meta name="viewport"> fehlt')
+    # 6. Zoom
+    elif zoom_text(p.viewport_content or ""):
+        finding(f"{path}: viewport verbietet das Zoomen {zoom_text(p.viewport_content or '')}")
+    # 7. h1
+    if not p.h1_texts:
+        finding(f"{path}: <h1> fehlt")
+    elif len(p.h1_texts) > 1:
+        finding(f"{path}: {len(p.h1_texts)} <h1> statt genau einem")
+    elif not p.h1_texts[0].strip():
+        finding(f"{path}: <h1> ist leer")
+    # 8. img ohne alt
+    no_alt = [src if src else "(kein src)" for src, alt in p.images if alt is None]
+    if no_alt:
+        finding(f"{path}: {len(no_alt)} Bild(er) ohne alt-Attribut: {_examples(no_alt)}")
+    # 9. alt als Platzhalter
+    ph = [alt for src, alt in p.images if alt is not None and is_placeholder_alt(alt)]
+    if ph:
+        finding(f"{path}: {len(ph)} Bild(er) mit Platzhalter als alt-Text: {_examples(ph)}")
+    # 10. zugänglicher Name
+    if p.accessible_missing:
+        finding(f"{path}: {len(p.accessible_missing)} Link(s)/Button(s) ohne zugänglichen Namen: {_examples(p.accessible_missing)}")
+    # 11. Formularfelder ohne Label
+    missing_label = []
+    for f in p.fields:
+        has_label = f["has_attr_label"] or f["wrapped"] or (f["id"] in p.labels_for)
+        if not has_label:
+            missing_label.append(f["name"] if f["name"] else (f["id"] or f["tag"]))
+    if missing_label:
+        finding(f"{path}: {len(missing_label)} Formularfeld(er) ohne Label: {_examples(missing_label)}")
+    # 12. doppelte ids
+    seen_ids: dict[str, int] = {}
+    for i in p.ids:
+        seen_ids[i] = seen_ids.get(i, 0) + 1
+    dups = [k for k, n in seen_ids.items() if n > 1]
+    if dups:
+        finding(f"{path}: doppelte id: {_examples(dups)}")
+
+
+def collect_paths(base: str) -> tuple[list[str], int]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    add("/")
+    status, _, sitemap = fetch(base + "/sitemap.xml")
+    if status == 200:
+        if "sitemapindex" in sitemap.lower():
+            hint("sitemap.xml ist ein Sitemap-Index — Unter-Sitemaps werden nicht verfolgt")
+        else:
+            for loc in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", sitemap):
+                add(urllib.parse.urlparse(loc.strip()).path or "/")
+    total = len(paths)
+    return paths[:MAX_PAGES], total
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Verwendung: check-web-content <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+
+    # Wie check-legal: Ohne 200 auf / antwortet evtl. nur ein Catch-all des
+    # Reverse-Proxys — dann messen wir nicht die App.
+    status, _, _ = fetch(base + "/")
+    if status != 200:
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
+        return 77
+
+    paths, total = collect_paths(base)
+    if total > len(paths):
+        hint(f"{len(paths)} von {total} Seiten geprüft (MAX_PAGES)")
+
+    any_server_rendered = False
+    for path in paths:
+        status, ct, body = fetch(base + path)
+        if status != 200 or "text/html" not in ct.lower():
+            continue
+        p = PageParser()
+        p.feed(body)
+        if not p.visible():
+            hint(f"{path}: kein serverseitig gerenderter Inhalt (SPA?) — nicht messbar")
+            continue
+        any_server_rendered = True
+        before = findings
+        check_page(path, p)
+        if findings == before:
+            ok(f"{path}: Grundgerüst, Überschriften, Bilder, Links und Formulare in Ordnung")
+
+    if not any_server_rendered:
+        print("Keine serverseitig gerenderte Seite erreichbar — nicht messbar.")
+        return 77
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
