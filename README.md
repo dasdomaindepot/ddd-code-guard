@@ -46,6 +46,8 @@ rather than improvising:
 | `form-protection` | Public POST forms (contact, registration, newsletter) of the running local instance need a honeypot or a captcha; honeypot-only is a hint recommending extra protection | `bin/check-form-protection` (blocking, python3) |
 | `favicon` | Favicons of the running local instance: `/favicon.ico`, `<link rel="icon">`, every linked icon returns 200 with matching type and real size matching `sizes`, 180×180 apple-touch-icon, web manifest with 192×192 and 512×512 PNG icons; hints for missing SVG and maskable icons | `bin/check-favicon` (blocking, python3) |
 
+To fix favicon findings, `bin/favicon-generate <logo> [project] [--name …] [--color #rrggbb]` builds the full icon set into `public/` with [RealFaviconGenerator](https://realfavicongenerator.net/) (npm `realfavicon`, runs locally) and prints the `<link>` tags for your layout. It is a helper, not a check: it never overwrites existing files without `--force` and never edits templates.
+
 Expensive checks (coverage, infection, e2e, build) only run with `--full`.
 
 ### Assumptions

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+#
+# favicon-generate — aus einem Logo den vollständigen Favicon-Satz erzeugen.
+#
+# Kein Teil des Code Guard (der prüft nur und legt nie Dateien an), sondern das
+# Werkzeug, auf das dessen Check "favicon" verweist:
+#
+#   favicon-generate logo.svg                       # Projekt = aktuelles Verzeichnis
+#   favicon-generate logo.png ../mein-projekt --name "Mein Projekt" --color "#0b2545"
+#
+# Erzeugt mit RealFaviconGenerator (npm-Paket "realfavicon", läuft vollständig
+# lokal — das Bild verlässt den Rechner nicht):
+#   favicon.ico (16/32/48), favicon.svg, favicon-96x96.png, apple-touch-icon.png
+#   (180×180), web-app-manifest-192x192.png, web-app-manifest-512x512.png
+#   (maskable) und site.webmanifest.
+#
+# Die Dateien landen in <projekt>/public/ (fehlt der Ordner: <projekt>/favicon/).
+# Vorhandene Dateien werden nur mit --force überschrieben. Die <link>-Zeilen für
+# den <head> gibt das Script aus — ins Template schreibt es bewusst nicht.
+#
+# Voraussetzung: node/npx. Beim ersten Lauf lädt npx das Paket aus der npm-Registry.
+#
+# Exit-Codes:
+#    0  erzeugt
+#    1  Fehler bei der Erzeugung, oder Dateien existieren schon (ohne --force)
+#    2  Nutzungsfehler
+
+set -euo pipefail
+
+REALFAVICON="realfavicon@0.9.3"
+
+usage() {
+    cat >&2 <<'EOF'
+Verwendung: favicon-generate <logo.svg|png|jpg> [projektverzeichnis] [Optionen]
+
+Optionen:
+  --name TEXT    App-Name im Manifest (Standard: Name des Projektordners)
+  --color HEX    Hintergrund für Apple- und Manifest-Icons, theme_color (Standard: #ffffff)
+  --out DIR      Zielordner statt <projekt>/public
+  --force        vorhandene Favicon-Dateien überschreiben
+EOF
+    exit 2
+}
+
+IMAGE=""
+PROJECT="."
+NAME=""
+COLOR="#ffffff"
+OUT=""
+FORCE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name)  NAME="${2:-}"; shift 2 ;;
+        --color) COLOR="${2:-}"; shift 2 ;;
+        --out)   OUT="${2:-}"; shift 2 ;;
+        --force) FORCE=1; shift ;;
+        -h|--help) usage ;;
+        -*) echo "Unbekannte Option: $1" >&2; usage ;;
+        *)
+            if [ -z "$IMAGE" ]; then IMAGE="$1"
+            elif [ "$PROJECT" = "." ]; then PROJECT="$1"
+            else usage
+            fi
+            shift ;;
+    esac
+done
+
+[ -n "$IMAGE" ] || usage
+[ -f "$IMAGE" ] || { echo "Bild nicht gefunden: $IMAGE" >&2; exit 2; }
+[ -d "$PROJECT" ] || { echo "Projektverzeichnis nicht gefunden: $PROJECT" >&2; exit 2; }
+[[ "$COLOR" =~ ^#[0-9a-fA-F]{6}$ ]] || { echo "--color erwartet #rrggbb, bekommen: $COLOR" >&2; exit 2; }
+command -v npx >/dev/null 2>&1 || { echo "npx nicht gefunden — Node.js installieren." >&2; exit 1; }
+
+PROJECT="$(cd "$PROJECT" && pwd)"
+IMAGE="$(cd "$(dirname "$IMAGE")" && pwd)/$(basename "$IMAGE")"
+[ -n "$NAME" ] || NAME="$(basename "$PROJECT")"
+if [ -z "$OUT" ]; then
+    if [ -d "$PROJECT/public" ]; then OUT="$PROJECT/public"; else OUT="$PROJECT/favicon"; fi
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Einstellungen wie auf realfavicongenerator.net, ohne Umweg über die Webseite.
+# Desktop-Icons bleiben transparent. Apple- und Manifest-Icons bekommen einen
+# Hintergrund — iOS füllt Transparenz sonst schwarz — und das Motiv auf 70 %,
+# damit es auch als maskable-Icon in der sicheren Zone (innere 80 %) bleibt.
+NAME="$NAME" COLOR="$COLOR" python3 - > "$WORK/settings.json" <<'EOF'
+import json, os
+name, color = os.environ["NAME"], os.environ["COLOR"]
+
+def t(kind, scale):
+    return {"type": kind, "backgroundColor": color, "backgroundRadius": 0,
+            "imageScale": scale, "brightness": 1}
+
+print(json.dumps({
+    "icon": {
+        "desktop": {"regularIconTransformation": t("none", 1), "darkIconType": "none",
+                    "darkIconTransformation": t("none", 1)},
+        "touch": {"transformation": t("background", 0.7), "appTitle": name},
+        "webAppManifest": {"transformation": t("background", 0.7), "name": name,
+                           "shortName": name[:12], "backgroundColor": color,
+                           "themeColor": color},
+    },
+    "path": "/",
+}))
+EOF
+
+echo "Erzeuge Favicons aus $(basename "$IMAGE") …"
+if ! npx --yes "$REALFAVICON" generate "$IMAGE" "$WORK/settings.json" "$WORK/markups.json" "$WORK/out" \
+        > "$WORK/npx.log" 2>&1; then
+    cat "$WORK/npx.log" >&2
+    echo "Erzeugung fehlgeschlagen." >&2
+    exit 1
+fi
+
+mkdir -p "$OUT"
+existing=()
+for f in "$WORK"/out/*; do
+    [ -e "$OUT/$(basename "$f")" ] && existing+=("$(basename "$f")")
+done
+if [ ${#existing[@]} -gt 0 ] && [ $FORCE -eq 0 ]; then
+    echo "Diese Dateien gibt es in $OUT schon: ${existing[*]}" >&2
+    echo "Nichts geschrieben. Mit --force überschreiben." >&2
+    exit 1
+fi
+cp "$WORK"/out/* "$OUT"/
+
+echo
+echo "Geschrieben nach $OUT:"
+for f in "$WORK"/out/*; do echo "  $(basename "$f")"; done
+echo
+echo "In den <head> des Layouts (z. B. templates/base.html.twig) — vorhandene"
+echo "Favicon-Links vorher entfernen:"
+echo
+python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["markups"]))' "$WORK/markups.json"
+echo
+echo "Danach prüfen: code-guard --only favicon"

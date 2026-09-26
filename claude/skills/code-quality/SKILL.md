@@ -130,6 +130,12 @@ PNG-Icons 192×192 und 512×512. Nur Hinweise: kein SVG-Icon, kein maskable-Icon
 Evil Martians („How to Favicon", Stand 2026) empfiehlt. Einzeln fahrbar:
 `bin/check-favicon https://test.de`.
 
+Zum Beheben gibt es `bin/favicon-generate <logo> [projekt] [--name …] [--color #rrggbb]`
+— **kein Check**, sondern ein Werkzeug für den Coding-Agenten: Es erzeugt mit
+RealFaviconGenerator (npm `realfavicon`, läuft lokal) den kompletten Satz nach
+`public/` und gibt die `<link>`-Zeilen für das Layout aus. Vorhandene Dateien
+überschreibt es nur mit `--force`, ins Template schreibt es nie.
+
 Fehlt eine Prüfung im Projekt, meldet das Script `MISSING`. Das ist ein
 legitimer Befund, kein Grund für einen Umweg. Baue niemals einen eigenen Aufruf,
 um eine fehlende Prüfung doch noch auszuführen, und rufe niemals `vendor/bin/...`

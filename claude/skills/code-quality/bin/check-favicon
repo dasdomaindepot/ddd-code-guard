@@ -351,6 +351,7 @@ def main() -> int:
 
     print()
     if findings:
+        hint("Beheben: bin/favicon-generate <logo.svg> <projekt> erzeugt alle Dateien und die <link>-Zeilen")
         print(f"{findings} Befund(e).")
         return 1
     print("Keine Befunde.")
