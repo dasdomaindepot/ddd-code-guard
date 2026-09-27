@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# check-browser-audit — Barrierefreiheit und Ladeverhalten im echten Browser.
+#
+# Aufgerufen vom Code Guard (Check "browser-audit", nur mit --full), lässt sich aber
+# auch allein fahren:   check-browser-audit https://test.de
+#
+# Deckt ab, was ohne Browser nicht messbar ist: Farbkontrast, ARIA im gerenderten
+# DOM, per JavaScript erzeugte Inhalte (Vue-SPAs), Fokus-Hinweise — per axe-core
+# gegen WCAG 2.2 Stufe A/AA; dazu Lighthouse (LCP, CLS, TBT, Seitengewicht) auf der
+# Startseite. axe "critical"/"serious" sind Befunde, alles andere und sämtliche
+# Lighthouse-Werte nur Hinweise (lokale Messwerte sind kein Urteil über Produktion).
+#
+# Braucht Node.js ≥ 22.19 und Chrome/Chromium (GUARD_CHROME, sonst google-chrome,
+# chromium, chromium-browser aus dem PATH). Die Node-Pakete (playwright-core,
+# axe-core, lighthouse — ~180 MB) landen beim ersten Lauf versioniert im Cache:
+#   ${XDG_CACHE_HOME:-~/.cache}/code-guard/browser-audit-<version>/
+#
+# Nur lesende Seitenaufrufe, ausschließlich gegen die übergebene URL.
+#
+# Exit-Codes:
+#    0  keine Befunde
+#    1  Befunde
+#    2  Nutzungsfehler
+#   77  nicht messbar (kein Node/Chrome, Installation gescheitert, Instanz nicht erreichbar)
+
+set -uo pipefail
+
+BASE="${1:-}"
+[ -n "$BASE" ] && [ $# -eq 1 ] || { echo "Verwendung: check-browser-audit <https://lokale-url>" >&2; exit 2; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPS_VERSION="1"
+DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/code-guard/browser-audit-$DEPS_VERSION"
+
+command -v node >/dev/null 2>&1 || { echo "node nicht gefunden — nicht messbar."; exit 77; }
+
+CHROME="${GUARD_CHROME:-}"
+if [ -z "$CHROME" ]; then
+    for c in google-chrome chromium chromium-browser; do
+        if command -v "$c" >/dev/null 2>&1; then CHROME="$(command -v "$c")"; break; fi
+    done
+fi
+[ -n "$CHROME" ] || { echo "Chrome/Chromium nicht gefunden (GUARD_CHROME setzen) — nicht messbar."; exit 77; }
+
+# Abhängigkeiten fest versioniert in den Cache. Ein Versionswechsel bekommt einen
+# neuen Ordner (DEPS_VERSION), damit nie ein halb aktualisierter Stand läuft.
+if [ ! -f "$DEPS_DIR/.fertig" ]; then
+    mkdir -p "$DEPS_DIR"
+    cat > "$DEPS_DIR/package.json" <<'EOF'
+{"name":"code-guard-browser-audit","private":true,
+ "dependencies":{"playwright-core":"1.63.0","axe-core":"4.13.0","lighthouse":"13.5.0"}}
+EOF
+    echo "Installiere playwright-core, axe-core, lighthouse nach $DEPS_DIR …"
+    if ! (cd "$DEPS_DIR" && npm install --silent --no-audit --no-fund >/dev/null 2>&1); then
+        echo "npm install fehlgeschlagen — nicht messbar."
+        exit 77
+    fi
+    touch "$DEPS_DIR/.fertig"
+fi
+
+GUARD_BROWSER_DEPS="$DEPS_DIR" GUARD_CHROME="$CHROME" \
+    exec node "$SCRIPT_DIR/lib/browser-audit.mjs" "$BASE"

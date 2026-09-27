@@ -131,6 +131,17 @@ PNG-Icons 192×192 und 512×512. Nur Hinweise: kein SVG-Icon, kein maskable-Icon
 Evil Martians („How to Favicon", Stand 2026) empfiehlt. Einzeln fahrbar:
 `bin/check-favicon https://test.de`.
 
+**Browser-Audit** (`browser-audit`, seit 27.09.2026, nur mit `--full`, **blockierend**):
+Öffnet die lokale Instanz in Chrome (Startseite plus Sitemap, `MAX_PAGES` Standard 10)
+und prüft das gerenderte DOM mit axe-core gegen WCAG 2.2 Stufe A/AA — also auch
+Farbkontrast, ARIA und Inhalte, die erst per JavaScript entstehen (Vue-SPAs, die
+`web-content` nicht messen kann). Verstöße „critical" und „serious" sind Befunde,
+„moderate" und „minor" Hinweise; die Symfony-Toolbar wird ausgenommen. Dazu Lighthouse
+auf der Startseite (LCP, CLS, TBT, Seitengewicht) — **nur Hinweise**, weil lokale
+Messwerte im Dev-Modus nichts über die Produktion sagen. Braucht Node ≥ 22.19 und
+Chrome (`GUARD_CHROME`); die Node-Pakete (~180 MB) landen beim ersten Lauf in
+`~/.cache/code-guard/`. Einzeln fahrbar: `bin/check-browser-audit https://test.de`.
+
 Zum Beheben gibt es `bin/favicon-generate <logo> [projekt] [--name …] [--color #rrggbb]`
 — **kein Check**, sondern ein Werkzeug für den Coding-Agenten: Es erzeugt mit
 RealFaviconGenerator (npm `realfavicon`, läuft lokal) den kompletten Satz nach

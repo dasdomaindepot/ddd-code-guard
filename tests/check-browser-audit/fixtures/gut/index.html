@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="de">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Gut</title></head>
+<body>
+  <a href="#inhalt">Zum Inhalt springen</a>
+  <main id="inhalt">
+    <h1>Alles in Ordnung</h1>
+    <p style="color:#222;background:#fff">Gut lesbarer Text mit ausreichendem Kontrast.</p>
+    <form method="post"><label for="n">Name</label><input id="n" name="name" autocomplete="name"><button type="submit">Senden</button></form>
+  </main>
+  <!-- Regression: Die Symfony-Toolbar zählt nicht, auch wenn sie Verstöße enthält. -->
+  <div id="sfwdt1" class="sf-toolbar"><button></button><span style="color:#eee;background:#fff">schwach</span></div>
+</body>
+</html>
