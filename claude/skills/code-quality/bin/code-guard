@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.12.0"
+VERSION="1.13.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -364,6 +364,7 @@ CHECK_DEFS=(
   "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL|web-url,bin:python3"
   "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
   "favicon|Favicons|frontend|normal|$SCRIPT_DIR/check-favicon $WEB_URL|web-url,bin:python3"
+  "web-resources|Links und Bilder|frontend|normal|$SCRIPT_DIR/check-web-resources $WEB_URL|web-url,bin:python3"
   "browser-audit|Browser-Audit|frontend|expensive|$SCRIPT_DIR/check-browser-audit $WEB_URL|web-url,bin:node"
 )
 
@@ -399,6 +400,9 @@ CHECK_DEFS=(
 #
 # web-exposure (seit 1.10.0) blockiert: ausgelieferte .git/.env/Logs, 5xx oder
 # Stacktrace bei unbekannten Pfaden, Cookie-Flags, http->https, offenes CORS.
+#
+# web-resources (seit 1.13.0) blockiert nur bei kaputten internen Links und Bildern;
+# Bildgroesse/-format, fehlende Masse, SRI und Weiterleitungsketten sind Hinweise.
 #
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.

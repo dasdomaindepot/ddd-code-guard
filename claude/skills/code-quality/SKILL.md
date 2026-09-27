@@ -162,6 +162,15 @@ PNG-Icons 192×192 und 512×512. Nur Hinweise: kein SVG-Icon, kein maskable-Icon
 Evil Martians („How to Favicon", Stand 2026) empfiehlt. Einzeln fahrbar:
 `bin/check-favicon https://test.de`.
 
+**Links und Bilder** (`web-resources`, seit 27.09.2026): Folgt auf der lokalen
+Instanz jedem internen Link und lädt jedes Bild der geprüften Seiten (Startseite plus
+Sitemap, `MAX_RESOURCES` Standard 300). **Befund** ist nur, was kaputt ist: ein interner
+Link oder ein Bild mit 4xx/5xx. **Hinweise:** Bilder ohne `width`/`height` (Layout-Sprünge),
+Bilder über 300 KB (`MAX_IMAGE_KB`), JPEG/PNG über 100 KB ohne WebP/AVIF-Alternative,
+externe Skripte ohne `integrity` oder ohne `async`/`defer`, Links mit mehr als einer
+Weiterleitung. Die Symfony-Toolbar, `/logout` und `/_profiler` werden übergangen.
+Einzeln fahrbar: `bin/check-web-resources https://test.de`.
+
 **Browser-Audit** (`browser-audit`, seit 27.09.2026, nur mit `--full`, **blockierend**):
 Öffnet die lokale Instanz in Chrome (Startseite plus Sitemap, `MAX_PAGES` Standard 10)
 und prüft das gerenderte DOM mit axe-core gegen WCAG 2.2 Stufe A/AA — also auch

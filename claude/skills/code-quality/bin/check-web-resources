@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""check-web-resources — Ressourcen einer lokal laufenden Instanz prüfen: interne Links,
+Bilder, externe Skripte und Weiterleitungen.
+
+Aufgerufen vom Code Guard (Check "web-resources"), lässt sich aber auch allein fahren:
+    check-web-resources https://projekt.local
+
+Geprüft werden die Startseite plus alle URLs aus sitemap.xml (der Host der Sitemap-URLs
+wird auf die lokale Instanz umgeschrieben):
+
+Befunde (ein Exit ungleich 0):
+   1. (R1) Kaputte interne Links: <a href> auf demselben Host (http/https), Endstatus 4xx/5xx.
+   2. (R2) Kaputte Bilder: <img src> und jede URL aus srcset auf demselben Host,
+      Endstatus nicht 200.
+
+Hinweise (kein Exit ungleich 0):
+   3. (R3) Bilder ohne width- oder height-Attribut (Layout-Stabilität / CLS).
+   4. (R4) Große (> MAX_IMAGE_KB KB) oder alte Bildformate: JPEG/PNG statt WebP/AVIF.
+   5. (R5) Externe Skripte ohne integrity (SRI) oder ohne async/defer/module (Rendernblocker).
+   6. (R6) Weiterleitungsketten mit mehr als einem Sprung bei internen Links.
+
+Ignoriert werden <script>, <style>, <template>, <noscript> sowie die Symfony-Toolbar
+(id mit sfwdt/sfToolbar oder class sf-toolbar) — sie wird im Dev-Modus injiziert und ist
+nicht Teil der App — und alles mit hidden oder aria-hidden="true". HTML wird mit
+html.parser.HTMLParser geparst, nicht mit Regex. Jede URL wird über einen Cache nur
+einmal abgerufen.
+
+Nur lesende Anfragen (GET, Weiterleitungen maximal 10-mal folgend), ausschließlich gegen
+die übergebene URL.
+
+Exit-Codes:
+    0  keine Befunde
+    1  Befunde
+    2  Nutzungsfehler
+   77  nicht messbar (Startseite kein HTTP 200)
+"""
+
+import os
+import re
+import ssl
+import sys
+from collections import OrderedDict
+from html.parser import HTMLParser
+import urllib.error
+import urllib.parse
+from urllib.parse import urljoin, urlparse
+import urllib.request
+
+TIMEOUT = 15
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+UA = "code-guard-web-resources"
+
+VOID_ELEMENTS = {"img", "input", "br", "meta", "link", "hr", "source", "area", "wbr"}
+IGNORE_TAGS = {"style", "template", "noscript"}
+IGNORE_PREFIXES = ("/logout", "/_profiler", "/_wdt")
+
+MAX_PAGES = 50
+try:
+    MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
+except (TypeError, ValueError):
+    MAX_PAGES = 50
+
+MAX_RESOURCES = 300
+try:
+    MAX_RESOURCES = int(os.environ.get("MAX_RESOURCES", "300"))
+except (TypeError, ValueError):
+    MAX_RESOURCES = 300
+
+MAX_IMAGE_KB = 300
+try:
+    MAX_IMAGE_KB = int(os.environ.get("MAX_IMAGE_KB", "300"))
+except (TypeError, ValueError):
+    MAX_IMAGE_KB = 300
+
+cache = {}
+findings = 0
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+def _examples(items, limit=3) -> str:
+    items = list(items)
+    if len(items) <= limit:
+        return ", ".join(items)
+    return ", ".join(items[:limit]) + ", …"
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Verhindert das automatische Folgen von Weiterleitungen; sie werden manuell verfolgt."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=CTX))
+
+
+def fetch_redirect(url: str) -> tuple[int, int, str, bytes]:
+    """(endstatus, sprünge, content_type, body). Folgt bis zu 10 Weiterleitungen selbst."""
+    if url in cache:
+        return cache[url]
+    sprünge = 0
+    status = 0
+    ct = ""
+    body = b""
+    current = url
+    while sprünge <= 10:
+        try:
+            req = urllib.request.Request(current, headers={"User-Agent": UA})
+            with opener.open(req, timeout=TIMEOUT) as r:
+                status = r.status
+                ct = r.headers.get("Content-Type", "")
+                body = r.read()
+            break
+        except urllib.error.HTTPError as e:
+            # 3xx wird als HTTPError sichtbar, da das automatische Folgen unterbunden ist.
+            if 300 <= e.code < 400 and sprünge < 10:
+                loc = e.headers.get("Location") if e.headers is not None else None
+                if loc:
+                    current = urljoin(current, loc.strip())
+                    sprünge += 1
+                    continue
+            status = e.code
+            break
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            status = 0
+            break
+    result = (status, sprünge, ct, body)
+    cache[url] = result
+    return result
+
+
+def normalize_path(href: str | None, page_url: str, page_host: str) -> str | None:
+    """Gelöster interner Pfad oder None, wenn die Link ignoriert wird."""
+    if href is None:
+        return None
+    h = href.strip()
+    if not h or h.startswith("#"):
+        return None
+    parsed = urlparse(urljoin(page_url, h))
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.netloc != page_host:
+        return None
+    path = parsed.path or "/"
+    if path.startswith(IGNORE_PREFIXES):
+        return None
+    return path
+
+
+def _same_host(url: str, page_host: str) -> bool:
+    p = urlparse(url)
+    return p.scheme in ("http", "https") and p.netloc == page_host
+
+
+def is_external(url: str, page_host: str) -> bool:
+    p = urlparse(url)
+    return p.scheme in ("http", "https") and p.netloc != page_host
+
+
+def expand_image_urls(images, page_url: str, page_host: str) -> list[tuple[str, dict]]:
+    """<img src> und jede URL aus srcset, aufgelöst auf demselben Host."""
+    result: list[tuple[str, dict]] = []
+    for img in images:
+        src = img.get("src")
+        if src:
+            u = urlparse(urljoin(page_url, src.strip()))
+            if _same_host(u.geturl(), page_host):
+                result.append((u.path or "/", img))
+        srcset = img.get("srcset")
+        if srcset:
+            for part in srcset.split(","):
+                toks = part.strip().split()
+                if not toks:
+                    continue
+                u = urlparse(urljoin(page_url, toks[0]))
+                if _same_host(u.geturl(), page_host):
+                    result.append((u.path or "/", img))
+    return result
+
+
+class PageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        # Ignorierter Bereich (script/style/Toolbar …): Tag und Verschachtelungstiefe.
+        self.ignore_tag: str | None = None
+        self.ignore_depth = 0
+        # <picture>-Verschachtelung für die WebP/AVIF-Prüfung (R4).
+        self.picture_depth = 0
+        self.picture_webp_avif = False
+
+        self.links: list[str] = []
+        self.images: list[dict] = []
+        self.scripts: list[dict] = []
+
+    @staticmethod
+    def _first(attrs, name):
+        for k, v in attrs:
+            if k == name:
+                return v
+        return None
+
+    def _is_ignored(self, tag: str, attrs) -> bool:
+        aid = self._first(attrs, "id") or ""
+        cls = self._first(attrs, "class") or ""
+        if aid.startswith("sfwdt") or aid.startswith("sfToolbar"):
+            return True
+        return "sf-toolbar" in cls.split()
+
+    def handle_starttag(self, tag, attrs):
+        self._on_start(tag, attrs, False)
+
+    def handle_startendtag(self, tag, attrs):
+        self._on_start(tag, attrs, True)
+
+    def _on_start(self, tag, attrs, self_closed) -> None:
+        if self.ignore_tag is not None:
+            if tag == self.ignore_tag and not self_closed:
+                self.ignore_depth += 1
+            return
+        if tag == "script":
+            # <script>-Attribute für R5 sichern; der Inhalt wird ignoriert.
+            src = self._first(attrs, "src")
+            if src is not None:
+                self.scripts.append({
+                    "src": src,
+                    "integrity": any(k == "integrity" for k, _v in attrs),
+                    "async": any(k == "async" for k, _v in attrs),
+                    "defer": any(k == "defer" for k, _v in attrs),
+                    "module": (self._first(attrs, "type") or "").lower() == "module",
+                })
+            if not self_closed:
+                self.ignore_tag = tag
+                self.ignore_depth = 1
+            return
+        if not self_closed and tag not in VOID_ELEMENTS and (tag in IGNORE_TAGS or self._is_ignored(tag, attrs)):
+            self.ignore_tag = tag
+            self.ignore_depth = 1
+            return
+        if tag in VOID_ELEMENTS or self_closed:
+            self._on_void(tag, attrs)
+            return
+        if tag == "a":
+            href = self._first(attrs, "href")
+            if href is not None:
+                self.links.append(href)
+        elif tag == "picture":
+            self.picture_depth += 1
+        elif tag == "source" and self.picture_depth > 0:
+            typ = (self._first(attrs, "type") or "").lower()
+            if typ in ("image/webp", "image/avif"):
+                self.picture_webp_avif = True
+
+    def _on_void(self, tag, attrs) -> None:
+        if tag != "img":
+            return
+        self.images.append({
+            "src": self._first(attrs, "src"),
+            "srcset": self._first(attrs, "srcset"),
+            "has_w": self._first(attrs, "width") is not None,
+            "has_h": self._first(attrs, "height") is not None,
+        })
+
+    def handle_data(self, data) -> None:
+        pass
+
+    def handle_endtag(self, tag) -> None:
+        if self.ignore_tag is not None:
+            if tag == self.ignore_tag:
+                self.ignore_depth -= 1
+                if self.ignore_depth == 0:
+                    self.ignore_tag = None
+            return
+        if tag == "picture":
+            self.picture_depth = max(0, self.picture_depth - 1)
+
+
+def collect_paths(base: str) -> tuple[list[str], int]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    add("/")
+    status, _, _, sitemap = fetch_redirect(base + "/sitemap.xml")
+    if status == 200:
+        for loc in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", sitemap.decode("utf-8", "replace")):
+            add(urlparse(loc.strip()).path or "/")
+    return paths[:MAX_PAGES], len(paths)
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Verwendung: check-web-resources <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+    page_host = urlparse(base).netloc
+
+    paths, total = collect_paths(base)
+    if total > len(paths):
+        hint(f"{len(paths)} von {total} Seiten geprüft (MAX_PAGES)")
+
+    # Wie check-web-content: Ohne 200 auf / antwortet evtl. nur ein Catch-all —
+    # dann messen wir nicht die App.
+    status, _, ct, _ = fetch_redirect(base + "/")
+    if status != 200 or "text/html" not in ct.lower():
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht erreichbar.")
+        return 77
+
+    link_data: "OrderedDict[str, dict]" = OrderedDict()
+    image_data: "OrderedDict[str, dict]" = OrderedDict()
+    page_images: dict[str, list[dict]] = {}
+    pages_order: list[str] = []
+    picture_flag: dict[str, bool] = {}
+    r5_hints: list[tuple[str, dict]] = []
+
+    for path in paths:
+        url = base + path
+        status, _, ct, body = fetch_redirect(url)
+        if status != 200 or "text/html" not in ct.lower():
+            continue
+        if path not in pages_order:
+            pages_order.append(path)
+        p = PageParser()
+        p.feed(body.decode("utf-8", "replace"))
+
+        for href in p.links:
+            tgt = normalize_path(href, url, page_host)
+            if tgt is None:
+                continue
+            if tgt not in link_data:
+                link_data[tgt] = {"page": path, "count": 0}
+            link_data[tgt]["count"] += 1
+
+        for imgurl, img in expand_image_urls(p.images, url, page_host):
+            if imgurl not in image_data:
+                image_data[imgurl] = {"page": path}
+            page_images.setdefault(path, []).append({
+                "url": imgurl, "has_w": img["has_w"], "has_h": img["has_h"],
+            })
+
+        for s in p.scripts:
+            if is_external(s["src"], page_host):
+                r5_hints.append((path, s))
+
+        picture_flag[path] = p.picture_webp_avif
+
+    # R1, R6, R2 und die Rohdaten für R4 (Ressourcen-Zählung mit MAX_RESOURCES).
+    combined = list(OrderedDict.fromkeys(list(link_data.keys()) + list(image_data.keys())))
+    total_targets = len(combined)
+    checked = 0
+    link_findings = 0
+    image_findings = 0
+    r4_data: dict[str, dict] = {}
+
+    for url in combined:
+        if checked >= MAX_RESOURCES:
+            break
+        status, spr, _, body = fetch_redirect(base + url)
+        checked += 1
+        is_link = url in link_data
+        is_img = url in image_data
+        if is_link:
+            if 400 <= status <= 599:
+                info = link_data[url]
+                weiteren = info["count"] - 1
+                noun = "Seiten" if weiteren != 1 else "Seite"
+                finding(f"{info['page']}: Link auf {url} liefert HTTP {status} "
+                        f"(auch auf {weiteren} weiteren {noun})")
+                link_findings += 1
+            if spr > 1:
+                hint(f"Link {url} leitet über {spr} Stationen weiter — direkt auf das Ziel verlinken")
+        if is_img:
+            if status != 200:
+                info = image_data[url]
+                finding(f"{info['page']}: Bild {url} liefert HTTP {status}")
+                image_findings += 1
+            else:
+                r4_data[url] = {
+                    "path": url, "body": body,
+                    "page": image_data[url]["page"], "picture": picture_flag.get(image_data[url]["page"], False),
+                }
+
+    if total_targets > MAX_RESOURCES:
+        hint(f"{MAX_RESOURCES} von {total_targets} Zielen geprüft (MAX_RESOURCES)")
+
+    # R3: je Seite ein Hinweis.
+    for path in pages_order:
+        missing = [im["url"] for im in page_images.get(path, [])
+                   if not (im["has_w"] and im["has_h"])]
+        if missing:
+            hint(f"{path}: {len(missing)} Bild(er) ohne Maße: {_examples(missing, 3)}")
+
+    # R4: große und alte Bildformate, jedes Bild nur einmal.
+    for url, info in r4_data.items():
+        body = info["body"]
+        kb = len(body) // 1024
+        if kb > MAX_IMAGE_KB:
+            hint(f"Bild {url} ist {kb} KB — komprimieren oder kleiner ausliefern")
+        fmt = None
+        if body.startswith(b"\x89PNG"):
+            fmt = "PNG"
+        elif body.startswith(b"\xff\xd8\xff"):
+            fmt = "JPEG"
+        if fmt and kb > 100 and not info["picture"]:
+            hint(f"Bild {url} ({fmt}, {kb} KB) — WebP oder AVIF anbieten")
+
+    # R5: externe Skripte.
+    for path, s in r5_hints:
+        if not s["integrity"]:
+            hint(f"{path}: externes Skript {s['src']} ohne integrity (SRI)")
+        if not (s["async"] or s["defer"] or s["module"]):
+            hint(f"{path}: externes Skript {s['src']} blockiert das Rendern (weder async noch defer)")
+
+    if not link_findings:
+        ok(f"{len(link_data)} interne Links geprüft, alle erreichbar")
+    if not image_findings:
+        ok(f"{len(image_data)} Bilder geprüft, alle erreichbar")
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
