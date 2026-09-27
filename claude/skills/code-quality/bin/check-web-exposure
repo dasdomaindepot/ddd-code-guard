@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""check-web-exposure — Web-Exposure-Prüfung einer lokal laufenden Instanz.
+
+Aufgerufen vom Code Guard (Check "web-exposure"), lässt sich aber auch allein fahren:
+    check-web-exposure https://projekt.local
+
+Geprüft werden (jeweils ein Befund bei Verstößen):
+   1. Geheimen Dateien (/.env, /.git/HEAD, ...) werden nicht ausgeliefert (ASVS 13.4.1).
+   2. Unbekannte Pfade liefern 404 statt 5xx oder Stacktrace
+      (Front-End Checklist: stack-trace-exposure).
+   3. Cookies tragen die Flags Secure, HttpOnly, SameSite (ASVS 3.3.1).
+   4. http:// leitet dauerhaft auf https:// um (ASVS 12.2.1).
+   5. CORS ist nicht zu offen konfiguriert (ASVS 3.4.2).
+
+Hinweise (ändern den Exit nicht): vorübergehende Umleitung, Soft-404,
+Debug-Modus.
+
+Es werden nur Dateien desselben Hosts abgerufen. Weiterleitungen werden nicht
+automatisch verfolgt, damit Status und Antwort-Header korrekt ausgewertet
+können. Nur Standardbibliothek. SSL-Zertifikate werden nicht geprüft (lokale
+Instanzen mit mkcert/selbstsignierten Zertifikaten).
+
+Exit-Codes:
+     0  keine Befunde
+     1  Befunde
+     2  Nutzungsfehler
+    77  nicht messbar (nicht erreichbar)
+"""
+
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+TIMEOUT = 15
+UA = "code-guard-web-exposure"
+
+findings = 0
+
+base = ""
+base_host = ""
+is_https = False
+
+SECRET_PATHS = [
+    "/.git/HEAD", "/.git/config", "/.env", "/.env.local", "/.env.prod",
+    "/composer.json", "/composer.lock", "/package.json",
+    "/var/log/dev.log", "/var/log/prod.log",
+    "/config/packages/security.yaml", "/.DS_Store", "/phpinfo.php",
+]
+FALLBACK = "/code-guard-gibt-es-nicht-7f3a"
+
+_STACK_MARKERS = ("Stack trace", "vendor/symfony/", "Traceback (most recent call last)", "Fatal error:")
+_SESSION_MARKERS = ("sess", "session", "auth", "token", "remember")
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, new_url):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
+
+
+def request(url: str, headers: dict | None = None, timeout: int = TIMEOUT):
+    """(status, headers, body). headers ist Liste von (Name, Wert); die Antwort
+    wird nicht verfolgt — 3xx/4xx/5xx landen als HTTPError und werden gelesen."""
+    hdrs = {"User-Agent": UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, list(resp.headers.items()), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, list(e.headers.items()), e.read()
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0, [], b""
+
+
+def headers_get_all(headers: list, name: str) -> list:
+    name_l = name.lower()
+    return [v for (k, v) in headers if k.lower() == name_l]
+
+
+def cookie_name(set_cookie: str) -> str:
+    return set_cookie.split(";", 1)[0].split("=", 1)[0].strip()
+
+
+def is_profiler_cookie(name: str) -> bool:
+    """Symfony-Profiler im Dev-Modus: <firewall>_auth_profile_token, *_deauth_profile_token, sf_redirect."""
+    name_l = name.lower()
+    return name_l.endswith("_profile_token") or name_l.startswith("sf_redirect")
+
+
+def cookie_problems(set_cookie: str, https: bool) -> list[str]:
+    """Probleme als Texte; leise Cookies (Profiler etc.) werden übersprungen."""
+    name = cookie_name(set_cookie)
+    name_l = name.lower()
+    if is_profiler_cookie(name):
+        return []
+    attrs = [a.strip().lower() for a in set_cookie.split(";")[1:]]
+    has_secure = "secure" in attrs
+    has_httponly = "httponly" in attrs
+    same_site = None
+    for a in attrs:
+        if a.startswith("samesite="):
+            same_site = a.split("=", 1)[1].strip()
+    problems: list[str] = []
+    if not has_secure and https:
+        problems.append("ohne Secure")
+    if not has_httponly and any(m in name_l for m in _SESSION_MARKERS):
+        problems.append("ohne HttpOnly")
+    if same_site is None:
+        problems.append("ohne SameSite")
+    elif same_site == "none" and not has_secure:
+        problems.append("SameSite=None ohne Secure")
+    return problems
+
+
+def check_redirect(status: int, location: str) -> tuple[str, str]:
+    """(Art, Text) für die http->https-Prüfung. Art ist ok, hint oder finding."""
+    loc = (location or "").strip()
+    if status in (301, 308):
+        if loc.lower().startswith("https://"):
+            return ("ok", "http:// leitet dauerhaft auf https:// um (%d)" % status)
+        return ("finding", "http:// leitet weiter, aber nicht auf https:// (Location: %s)" % loc)
+    if status in (302, 307):
+        if loc.lower().startswith("https://"):
+            return ("hint", "http:// leitet nur vorübergehend um (%d) — 301 oder 308 verwenden" % status)
+        return ("finding", "http:// leitet weiter, aber nicht auf https:// (Location: %s)" % loc)
+    if status == 200:
+        return ("finding", "http:// wird ohne Umleitung ausgeliefert (HTTP 200)")
+    if status == 0:
+        return ("hint", "http:// nicht erreichbar — Umleitung nicht prüfbar")
+    return ("hint", "http:// liefert HTTP %d — Umleitung nicht prüfbar" % status)
+
+
+def check_secrets() -> None:
+    _, _, spa_body = request(base + FALLBACK)
+    matched = False
+    leaked = 0
+    for path in SECRET_PATHS:
+        status, _, body = request(base + path)
+        if status == 200 and len(body) > 0:
+            if spa_body == body:
+                matched = True
+                continue
+            leaked += 1
+            finding("%s wird ausgeliefert (HTTP %d, %d Bytes) — gehört nicht ins Webroot" % (path, status, len(body)))
+    if leaked == 0:
+        ok("keine geheimen Dateien erreichbar (%d Pfade geprüft)" % len(SECRET_PATHS))
+    if matched:
+        hint("SPA-Fallback erkannt (unbekannter Pfad liefert 200 mit gleichem Inhalt)")
+
+
+def check_unknown_path() -> None:
+    status, headers, body = request(base + FALLBACK)
+    text = body.decode("utf-8", "replace")
+    stack = any(m in text for m in _STACK_MARKERS)
+    has_xdebug = any(k.lower() == "x-debug-token" for k, _ in headers)
+    if status in (404, 410):
+        ok("unbekannter Pfad liefert 404")
+    elif 500 <= status <= 599:
+        finding("unbekannter Pfad liefert HTTP %d statt 404 — Fehlerhandling prüfen" % status)
+    elif status == 200:
+        hint("unbekannter Pfad liefert HTTP 200 (SPA-Fallback oder Soft-404?) — für Suchmaschinen sollte es 404 sein")
+    elif 300 <= status <= 399:
+        hint("unbekannter Pfad leitet weiter (HTTP %d) statt 404" % status)
+    if stack and not has_xdebug:
+        finding("Fehlerseite zeigt einen Stacktrace")
+    elif has_xdebug:
+        hint("App läuft im Debug-Modus (X-Debug-Token) — Stacktrace-Prüfung übersprungen")
+
+
+def check_cookies() -> None:
+    status, headers, _ = request(base + "/")
+    if 300 <= status <= 399:
+        locs = headers_get_all(headers, "location")
+        if locs:
+            target = urllib.parse.urljoin(base + "/", locs[0])
+            if urllib.parse.urlparse(target).netloc == base_host:
+                _, h2, _ = request(target)
+                headers = headers + h2
+    set_cookies = [c for c in headers_get_all(headers, "Set-Cookie") if not is_profiler_cookie(cookie_name(c))]
+    if not set_cookies:
+        ok("die Startseite setzt keine Cookies")
+        return
+    clean = 0
+    for sc in set_cookies:
+        name = cookie_name(sc)
+        problems = cookie_problems(sc, is_https)
+        for problem in problems:
+            finding("Cookie %s %s" % (name, problem))
+        if not problems:
+            clean += 1
+    if clean == len(set_cookies):
+        ok("Cookies mit Secure, HttpOnly und SameSite (%d geprüft)" % clean)
+
+
+def check_redirect_https() -> None:
+    if not is_https:
+        hint("Basis-URL ist http:// — HTTPS-Prüfungen übersprungen")
+        return
+    http_url = "http://" + base[len("https://"):]
+    status, headers, _ = request(http_url, timeout=10)
+    locs = headers_get_all(headers, "location")
+    kind, msg = check_redirect(status, locs[0] if locs else "")
+    if kind == "ok":
+        ok(msg)
+    elif kind == "finding":
+        finding(msg)
+    else:
+        hint(msg)
+
+
+def check_cors() -> None:
+    status, headers, _ = request(base + "/", headers={"Origin": "https://example.com"})
+    acao = headers_get_all(headers, "Access-Control-Allow-Origin")
+    acao = acao[0] if acao else None
+    aacc = headers_get_all(headers, "Access-Control-Allow-Credentials")
+    aacc = aacc[0].lower() if aacc else None
+    if acao is None:
+        ok("CORS nicht zu offen")
+        return
+    if acao == "*" and aacc == "true":
+        finding("CORS erlaubt jede Herkunft mit Zugangsdaten")
+    elif acao == "https://example.com" and aacc == "true":
+        finding("CORS spiegelt beliebige Herkunft mit Zugangsdaten zurück")
+    else:
+        ok("CORS nicht zu offen")
+
+
+def main() -> int:
+    global base, base_host, is_https
+    if len(sys.argv) != 2:
+        print("Verwendung: check-web-exposure <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    base_host = parsed.netloc
+    is_https = parsed.scheme.lower() == "https"
+
+    # Weiterleitung (Login) und 401/403 sind normale Startseiten. Keine Verbindung
+    # oder 5xx heißt: Die App läuft nicht richtig — dann misst hier nichts etwas.
+    status, _, _ = request(base + "/")
+    if status == 0 or status >= 500:
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
+        return 77
+
+    check_secrets()
+    check_unknown_path()
+    check_cookies()
+    check_redirect_https()
+    check_cors()
+
+    print()
+    if findings:
+        print("%d Befund(e)." % findings)
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

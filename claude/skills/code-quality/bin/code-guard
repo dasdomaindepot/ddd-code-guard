@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.9.0"
+VERSION="1.10.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -359,6 +359,7 @@ CHECK_DEFS=(
   "npm-build|Asset-Build|frontend|expensive|npm run build|npm:build"
   "web-hardening|Web-Haertung|security|normal|$SCRIPT_DIR/check-web-hardening $WEB_URL|web-url"
   "legal|Rechtstexte|legal|normal|$SCRIPT_DIR/check-legal $WEB_URL|web-url,bin:python3"
+  "web-exposure|Angriffsflaeche|security|normal|$SCRIPT_DIR/check-web-exposure $WEB_URL|web-url,bin:python3"
   "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL|web-url,bin:python3"
   "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
   "favicon|Favicons|frontend|normal|$SCRIPT_DIR/check-favicon $WEB_URL|web-url,bin:python3"
@@ -390,6 +391,9 @@ CHECK_DEFS=(
 #
 # favicon (seit 1.8.0) blockiert ebenfalls: favicon.ico, <link rel="icon">,
 # apple-touch-icon 180x180, Manifest mit 192/512. SVG- und maskable-Icon: Hinweis.
+#
+# web-exposure (seit 1.10.0) blockiert: ausgelieferte .git/.env/Logs, 5xx oder
+# Stacktrace bei unbekannten Pfaden, Cookie-Flags, http->https, offenes CORS.
 #
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.

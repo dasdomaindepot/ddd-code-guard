@@ -66,6 +66,17 @@ genauso wie auf den Servern. Läuft die
 Instanz nicht, steht der Check auf `MISSING`. Einzeln fahrbar:
 `bin/check-web-hardening https://test.de`.
 
+**Angriffsfläche** (`web-exposure`, seit 27.09.2026, **blockierend**): Ergänzt
+`web-hardening` um Befunde, die sofort blockieren. Auf der lokalen Instanz dürfen
+`/.git/HEAD`, `/.env`, `/.env.local`, `/composer.lock`, `/var/log/*.log` und ähnliche
+Dateien nicht mit 200 kommen (ASVS 13.4.1; ein SPA-Fallback mit identischem Inhalt zählt
+nicht). Ein unbekannter Pfad liefert 404 statt 5xx und zeigt keinen Stacktrace — im
+Debug-Modus (`X-Debug-Token`) wird Letzteres übersprungen. Session-Cookies tragen
+`Secure`, `HttpOnly` und `SameSite` (ASVS 3.3.1; Profiler-Cookies des Dev-Modus
+ausgenommen). `http://` leitet dauerhaft auf `https://` um (ASVS 12.2.1). CORS spiegelt
+keine beliebige Herkunft mit Zugangsdaten (ASVS 3.4.2). Liefert die Startseite 5xx,
+misst der Check nicht (`MISSING`). Einzeln fahrbar: `bin/check-web-exposure https://test.de`.
+
 **Rechtstexte** (`legal`, seit 25.09.2026, beratend): Sucht auf derselben
 lokalen Instanz Impressum, Datenschutzerklärung und AGB und meldet veraltete
 Verweise im ausgelieferten Text — TMG (seit 14.05.2024 DDG, Impressum § 5 DDG),
