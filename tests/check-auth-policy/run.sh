@@ -116,6 +116,11 @@ expect 1 "ohne temporäre Sperre"
 run_script "$HERE/fixtures/no-security-yaml"
 expect 77 "nicht messbar"
 
+# --- Passwort ändern ohne altes Passwort; das Reset-Formular zählt nicht
+run_script "$HERE/fixtures/ohne-altes-passwort"
+expect 0 "src/Form/ChangePasswordType.php: Passwort ändern ohne Abfrage"
+expect_not 0 "ChangePasswordFormType.php"
+
 # --- strlen: handgeschriebene Mindestlänge wird erkannt
 run_script "$HERE/fixtures/strlen"
 expect 1 "Mindestlänge 8" "PasswordResetApiController.php:12"

@@ -104,7 +104,8 @@ mit `PasswordCredentials`) braucht eine temporäre Sperre nach Fehlversuchen —
 die kleinste Passwort-`Length(min: …)` die Mindestlänge aus `guard-policy.yml`
 erreichen (Hausstandard **12**). Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
 für Passwort als einzigen Faktor), Höchstlänge unter 64, kein
-`NotCompromisedPassword` (BSI ORP.4.A8), Anmeldung per SSO/OIDC (Sperre gehört dann
+`NotCompromisedPassword` (BSI ORP.4.A8), ein Formular zum Passwortändern ohne Abfrage des
+bisherigen Passworts (ASVS 6.2.3; Erstpasswort- und Token-Wege sehen gleich aus), Anmeldung per SSO/OIDC (Sperre gehört dann
 in den Identity Provider). Zeichenklassen werden bewusst nicht verlangt. Die Werte
 stehen im Abschnitt `auth:` der `guard-policy.yml`; ein Projekt kann sie in
 `.ai/guard-policy.yml` überschreiben. Einzeln fahrbar: `bin/check-auth-policy .`.

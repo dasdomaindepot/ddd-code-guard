@@ -451,6 +451,40 @@ def part2_password_rules(sec: dict, project_path: str) -> None:
     else:
         hint("kein Abgleich mit geleakten Passwörtern — NotCompromisedPassword einbauen (BSI ORP.4.A8)")
 
+    part2b_current_password(project_path, files, file_text)
+
+
+CHANGE_PW_RE = re.compile(r"(change|update|edit|new)\w*p(ass|w)", re.I)
+CURRENT_PW_RE = re.compile(r"UserPassword\b|isPasswordValid\(|current_?password|old_?password|altes_?passwort", re.I)
+
+
+def part2b_current_password(project_path: str, files: list[str], file_text: dict[str, str]) -> None:
+    """Passwort ändern verlangt das bisherige Passwort (ASVS 6.2.3) — nur Hinweis.
+
+    Kandidaten sind Dateien wie ChangePasswordType.php oder NewPWFormType.php. Wird eine
+    davon von einer Reset-Datei benutzt (ResetPasswordController …), gehört sie zum
+    Zurücksetzen per E-Mail-Token — dort ersetzt der Token das alte Passwort.
+    """
+    reset_texts = [t for p, t in file_text.items() if "reset" in os.path.basename(p).lower()]
+    checked = 0
+    for path in files:
+        name = os.path.splitext(os.path.basename(path))[0]
+        low = name.lower()
+        if not CHANGE_PW_RE.search(name) or "reset" in low or "forgot" in low or "request" in low:
+            continue
+        if any(re.search(r"\b" + re.escape(name) + r"\b", t) for t in reset_texts):
+            continue
+        checked += 1
+        if not CURRENT_PW_RE.search(file_text[path]):
+            # Nur Hinweis: Erstpasswort- und Token-Wege sehen genauso aus (im Probelauf
+            # beide Treffer), am Dateinamen allein nicht sicher zu unterscheiden.
+            hint(
+                f"{relative(project_path, path)}: Passwort ändern ohne Abfrage des bisherigen "
+                f"Passworts? Für angemeldete Nutzer UserPassword-Constraint ergänzen (ASVS 6.2.3)"
+            )
+    if checked:
+        ok(f"Passwortänderung geprüft ({checked} Stelle(n))")
+
 
 def main() -> int:
     if len(sys.argv) > 2:
