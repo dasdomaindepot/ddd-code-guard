@@ -66,6 +66,19 @@ genauso wie auf den Servern. Läuft die
 Instanz nicht, steht der Check auf `MISSING`. Einzeln fahrbar:
 `bin/check-web-hardening https://test.de`.
 
+**Statische Regeln** (`app-static`, seit 27.09.2026, **blockierend**): Liest
+Konfiguration und Quellen, ohne laufende Instanz. Befunde: `framework.session`
+mit `cookie_secure: false` oder `cookie_samesite: none` (ASVS 3.3.1), abgeschaltetes CSRF
+(`csrf_protection: false`, `enable_csrf: false` am `form_login`), `FileType` ohne
+`File`/`Image`-Constraint mit `maxSize` bzw. ohne `mimeTypes` (ASVS 5.2.1/5.2.2), und ein
+`COPY .` im Dockerfile ohne `.dockerignore`, die `.git` und `.env.local` ausschließt
+(ASVS 13.4.1 — sonst liegt der ganze Git-Verlauf im Produktions-Image). Nur Hinweise,
+weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw` in Twig,
+`md5`/`sha1`/`rand` für Sicherheitszwecke, `eval`/`exec`/`shell_exec` und `unserialize`
+ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
+`prefers-reduced-motion`, `tsconfig.json` ohne `strict`. Einzeln fahrbar:
+`bin/check-app-static .`.
+
 **Angriffsfläche** (`web-exposure`, seit 27.09.2026, **blockierend**): Ergänzt
 `web-hardening` um Befunde, die sofort blockieren. Auf der lokalen Instanz dürfen
 `/.git/HEAD`, `/.env`, `/.env.local`, `/composer.lock`, `/var/log/*.log` und ähnliche

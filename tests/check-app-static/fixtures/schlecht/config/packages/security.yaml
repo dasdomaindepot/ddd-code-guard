@@ -1,0 +1,11 @@
+security:
+    firewalls:
+        main:
+            lazy: true
+            form_login:
+                enable_csrf: false
+            security: true
+        when@test:
+            main:
+                form_login:
+                    enable_csrf: false

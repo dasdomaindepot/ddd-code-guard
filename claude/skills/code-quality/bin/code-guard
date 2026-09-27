@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.10.0"
+VERSION="1.11.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -345,6 +345,7 @@ CHECK_DEFS=(
   "composer-audit|Composer-Sicherheit|security|cheap|$COMPOSER_BIN audit --locked --abandoned=report --no-interaction|composer,file:composer.lock"
   "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
   "auth-policy|Login und Passwoerter|security|cheap|$SCRIPT_DIR/check-auth-policy .|file:config/packages/security.yaml,bin:python3"
+  "app-static|Statische Regeln|security|cheap|$SCRIPT_DIR/check-app-static .|bin:python3"
   "phpcs|Coding-Standard|style|normal|make phpcs|target:phpcs"
   "phpstan|Statische Analyse|static|normal|make phpstan|target:phpstan"
   "deptrac|Architekturregeln|architecture|normal|make deptrac|target:deptrac"
@@ -391,6 +392,10 @@ CHECK_DEFS=(
 #
 # favicon (seit 1.8.0) blockiert ebenfalls: favicon.ico, <link rel="icon">,
 # apple-touch-icon 180x180, Manifest mit 192/512. SVG- und maskable-Icon: Hinweis.
+#
+# app-static (seit 1.11.0) blockiert: Session-Cookie- und CSRF-Konfiguration,
+# Uploads ohne maxSize/mimeTypes, COPY . ohne .dockerignore fuer .git/.env.local.
+# SQL-Verkettung, |raw, schwache Krypto, eval/exec, CSS-Fokus, TS strict: Hinweise.
 #
 # web-exposure (seit 1.10.0) blockiert: ausgelieferte .git/.env/Logs, 5xx oder
 # Stacktrace bei unbekannten Pfaden, Cookie-Flags, http->https, offenes CORS.

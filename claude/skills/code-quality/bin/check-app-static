@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""check-app-static — Sicherheits-Check einer Web-App (Symfony oder JS/TS-Frontend).
+
+Aufgerufen vom Code Guard (Check "app-static"), lässt sich aber auch allein fahren:
+    check-app-static <projektverzeichnis>      # Standard: aktuelles Verzeichnis
+
+Geprüft werden nur Dateien; es wird nichts gestartet oder aufgerufen.
+
+Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert config/packages/):
+    S1 Session-Cookie-Konfiguration (ASVS 3.3.1)
+    S2 CSRF-Schutz (ASVS 3.5.1)
+    S3 Datei-Uploads mit Größen- und Typbegrenzung (ASVS 5.2.1, 5.2.2)
+    S4 .dockerignore beim ganzen Projekt-COPY (ASVS 13.4.1)
+
+Hinweise (kein Einfluss auf den Exit):
+    H1 Rohes SQL mit eingesetzter Variable (ASVS 1.2.4)
+    H2 |raw in Twig (ASVS 1.2.1)
+    H3 Schwache Kryptografie (ASVS 11.4.1, 11.3.1)
+    H4 Gefährliche Funktionen (ASVS 1.2.5, 1.3.2)
+    H5 Fokus und Bewegung in CSS (WCAG 2.4.7, 2.3.3)
+    H6 TypeScript-Strictness und neue Funktionen im Frontend
+
+Exit-Codes:
+    0  keine Befunde
+    1  Befunde
+    2  Nutzungsfehler (mehr als ein Argument, Verzeichnis existiert nicht)
+   77  nicht messbar (weder composer.json noch package.json vorhanden)
+"""
+
+import fnmatch
+import glob
+import json
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("PyYAML fehlt — nicht messbar.")
+    sys.exit(77)
+
+# Tags wie !php/const oder !tagged_iterator in Symfony-YAML sind für uns
+# irrelevant; wir ersetzen sie durch None, damit safe_load nicht abstürzt.
+class _Loader(yaml.SafeLoader):
+    pass
+
+
+def _any_tag(loader, suffix, node):
+    return None
+
+
+_Loader.add_multi_constructor("!", _any_tag)
+
+findings = 0
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+# --- Hilfsfunktionen ---------------------------------------------------
+
+def load_top_level_yaml(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.load(f, Loader=_Loader)
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _read_text(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def php_files_under_src(project_path: str):
+    src = os.path.join(project_path, "src")
+    result = []
+    if not os.path.isdir(src):
+        return result
+    for root, dirs, files in os.walk(src):
+        rel_root = os.path.relpath(root, project_path)
+        if "DataFixtures" in rel_root.split(os.sep):
+            continue
+        for name in files:
+            if name.endswith(".php"):
+                result.append(os.path.join(root, name))
+    return result
+
+
+def relative(project_path: str, path: str) -> str:
+    return os.path.relpath(path, project_path)
+
+
+def _split_call(text: str, open_index: int) -> str:
+    """Vom Index der öffnenden Klammer bis zur passenden schließenden Klammer."""
+    depth = 0
+    for i in range(open_index, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index:i + 1]
+    return text[open_index:]
+
+
+def _call_has(text: str, name: str, needle: str) -> bool:
+    for m in re.finditer(re.escape(name) + r"\s*\(", text):
+        if needle in _split_call(text, m.end() - 1):
+            return True
+    return False
+
+
+def _walk_skip(root: str, suffixes: tuple) -> list:
+    skip = ("node_modules", "vendor", "public", "var", ".git")
+    result = []
+    if not os.path.isdir(root):
+        return result
+    for r, dirs, files in os.walk(root):
+        rel = os.path.relpath(r, root)
+        parts = [] if rel == "." else rel.split(os.sep)
+        if any(p in skip for p in parts):
+            continue
+        dirs[:] = [d for d in dirs if d not in skip]
+        for f in files:
+            if f.endswith(suffixes):
+                result.append(os.path.join(r, f))
+    return result
+
+
+# --- S1: Session-Cookies -----------------------------------------------
+
+def part_s1_session(project_path: str) -> None:
+    doc = load_top_level_yaml(os.path.join(project_path, "config", "packages", "framework.yaml"))
+    framework = doc.get("framework") if isinstance(doc, dict) else None
+    session = framework.get("session") if isinstance(framework, dict) else None
+    here = []
+    if isinstance(session, dict):
+        if session.get("cookie_secure") is False:
+            here.append("framework.session.cookie_secure: false — auf auto setzen")
+        if "cookie_samesite" in session and session["cookie_samesite"] in (None, "none"):
+            here.append(
+                f"framework.session.cookie_samesite: {session['cookie_samesite']} "
+                f"— auf lax setzen"
+            )
+    if here:
+        for m in here:
+            finding(m)
+    else:
+        ok("Session-Cookies: secure und samesite nach Symfony-Standard")
+
+
+# --- S2: CSRF ----------------------------------------------------------
+
+def part_s2_csrf(project_path: str) -> None:
+    here = []
+    fw = load_top_level_yaml(os.path.join(project_path, "config", "packages", "framework.yaml"))
+    framework = fw.get("framework") if isinstance(fw, dict) else None
+    if isinstance(framework, dict) and framework.get("csrf_protection") is False:
+        here.append("framework.csrf_protection: false — CSRF-Schutz für Formulare aktiv lassen")
+    sec = load_top_level_yaml(os.path.join(project_path, "config", "packages", "security.yaml"))
+    secroot = sec.get("security") if isinstance(sec, dict) else None
+    firewalls = secroot.get("firewalls") if isinstance(secroot, dict) else None
+    if isinstance(firewalls, dict):
+        for name, f in firewalls.items():
+            if not isinstance(f, dict) or name.startswith("when@") or f.get("security") is False:
+                continue
+            fl = f.get("form_login")
+            if isinstance(fl, dict) and fl.get("enable_csrf") is False:
+                here.append(f"Firewall {name}: form_login mit enable_csrf: false")
+    if here:
+        for m in here:
+            finding(m)
+    else:
+        ok("CSRF-Schutz aktiv (csrf_protection und form_login)")
+
+
+# --- S3: Datei-Uploads -------------------------------------------------
+
+def part_s3_uploads(project_path: str) -> None:
+    here = []
+    count = 0
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        line_no = None
+        for i, line in enumerate(text.splitlines(), 1):
+            if "FileType::class" in line:
+                line_no = i
+                break
+        if line_no is None:
+            continue
+        count += 1
+        has_file = _call_has(text, "File", "maxSize")
+        has_image = _call_has(text, "Image", "maxSize")
+        if not (has_file or has_image):
+            here.append(
+                f"{relative(project_path, path)}:{line_no}: FileType "
+                f"ohne File-Constraint mit maxSize"
+            )
+        elif not (has_image and not has_file) and "mimeTypes" not in text:
+            here.append(
+                f"{relative(project_path, path)}:{line_no}: File-Constraint ohne mimeTypes"
+            )
+    if here:
+        for m in here:
+            finding(m)
+    elif count == 1:
+        ok("Datei-Uploads mit Größen- und Typbegrenzung (1 Formular)")
+    else:
+        ok(f"Datei-Uploads mit Größen- und Typbegrenzung ({count} Formulare)")
+
+
+# --- S4: .dockerignore -------------------------------------------------
+
+def _whole_copy_line(path: str):
+    lines = _read_text(path)
+    if lines is None:
+        return None
+    for i, line in enumerate(lines.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) >= 2 and parts[0].upper() == "COPY" and parts[1] in (".", "./"):
+            return i
+    return None
+
+
+def _find_dockerfiles(project_path: str):
+    results = []
+    if not os.path.isdir(project_path):
+        return results
+    for root, dirs, files in os.walk(project_path):
+        rel_root = os.path.relpath(root, project_path)
+        parts = [] if rel_root == "." else rel_root.split(os.sep)
+        if any(p in ("node_modules", "vendor", "public", "var", ".git") for p in parts):
+            continue
+        dirs[:] = [d for d in dirs if d not in ("node_modules", "vendor", "public", "var")]
+        for f in files:
+            if f == "Dockerfile" and len(parts) + 1 <= 3:
+                p = os.path.join(root, f)
+                results.append((p, _whole_copy_line(p)))
+    return results
+
+
+def part_s4_dockerignore(project_path: str) -> None:
+    whole = [(p, ln) for (p, ln) in _find_dockerfiles(project_path) if ln is not None]
+    if not whole:
+        ok("kein Dockerfile mit 'COPY .' — kein .dockerignore nötig")
+        return
+    di = None
+    di_path = os.path.join(project_path, ".dockerignore")
+    if os.path.isfile(di_path):
+        di = [l.strip() for l in _read_text(di_path).splitlines()]
+    need_git = True
+    need_env = True
+    if di is not None:
+        for l in di:
+            if l in (".git", ".git/", "/.git") or fnmatch.fnmatch(l, "**/.git"):
+                need_git = False
+            if l in (".env.local", "/.env.local") or fnmatch.fnmatch(l, ".env*.local") \
+                    or fnmatch.fnmatch(l, ".env.*"):
+                need_env = False
+    here = []
+    p, ln = whole[0]
+    if need_git:
+        here.append(
+            f".dockerignore schließt .git nicht aus — COPY . in "
+            f"{relative(project_path, p)}:{ln} kopiert das Repository ins Image"
+        )
+    if need_env:
+        here.append(
+            f".dockerignore schließt .env.local nicht aus — COPY . in "
+            f"{relative(project_path, p)}:{ln} kopiert das Repository ins Image"
+        )
+    if here:
+        for m in here:
+            finding(m)
+    else:
+        ok(".dockerignore schließt .git und .env.local aus")
+
+
+# --- H1: Rohes SQL -----------------------------------------------------
+
+SQL_RE = re.compile(r'''(executeQuery|executeStatement|->query|->exec|createNativeQuery)\(.*("[^"]*\$\w|['"]\s*\.\s*\$\w)''')
+
+
+def part_h1_sql(project_path: str) -> None:
+    total = 0
+    shown = 0
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        for i, line in enumerate(text.splitlines(), 1):
+            if SQL_RE.search(line):
+                total += 1
+                if shown < 10:
+                    hint(f"{rel}:{i}: SQL mit eingesetzter Variable — Parameter verwenden")
+                    shown += 1
+    if total > 10:
+        hint(f"… und {total - 10} weitere")
+
+
+# --- H2: |raw in Twig --------------------------------------------------
+
+RAW_RE = re.compile(r"\| ?raw\b")
+
+
+def part_h2_raw_twig(project_path: str) -> None:
+    templates = os.path.join(project_path, "templates")
+    if not os.path.isdir(templates):
+        return
+    twigs = glob.glob(os.path.join(templates, "**", "*.twig"), recursive=True)
+    total = 0
+    templ_count = 0
+    hits = []
+    for path in twigs:
+        text = _read_text(path)
+        if text is None:
+            continue
+        templ_count += 1
+        for i, line in enumerate(text.splitlines(), 1):
+            for _ in RAW_RE.finditer(line):
+                total += 1
+                hits.append((relative(project_path, path), i))
+    if total > 0:
+        hint(
+            f"{total}× |raw in {templ_count} Templates — jede Stelle braucht "
+            f"bereinigtes HTML (z. B. html_sanitizer)"
+        )
+        for rel, i in hits[:5]:
+            hint(f"{rel}:{i}: |raw — unsicheres HTML, bereinigtes verwenden (z. B. html_sanitizer)")
+
+
+# --- H3: Schwache Kryptografie -----------------------------------------
+
+def part_h3_crypto(project_path: str) -> None:
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        for i, line in enumerate(text.splitlines(), 1):
+            low = line.lower()
+            m = re.search(r"\b(md5|sha1)\s*\(", low)
+            if m and any(k in low for k in ("token", "password", "passwort", "secret", "hash")):
+                hint(
+                    f"{rel}:{i}: {m.group(1)} für Sicherheitszwecke — "
+                    f"random_bytes/password_hash/hash('sha256') verwenden"
+                )
+                continue
+            m = re.search(r"\b(?:rand|mt_rand)\s*\(", low)
+            if m and any(k in low for k in ("token", "code", "secret", "password")):
+                hint(
+                    f"{rel}:{i}: {m.group(1)} für Sicherheitszwecke — "
+                    f"random_bytes/hash verwenden"
+                )
+                continue
+            if re.search(r"""['"][^'"]*ECB[^'"]*['"]""", line):
+                hint(f"{rel}:{i}: ECB-Modus — mit sicherem Modus (z. B. CTR/GCM) verschlüsseln")
+
+
+# --- H4: Gefährliche Funktionen ----------------------------------------
+
+RAW_FN_RE = re.compile(r"""(?<![\w>:$])(eval|exec|shell_exec|system|passthru|proc_open|popen)\s*\(""")
+
+
+def part_h4_dangerous(project_path: str) -> None:
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        for i, line in enumerate(text.splitlines(), 1):
+            for m in RAW_FN_RE.finditer(line):
+                hint(f"{rel}:{i}: {m.group(1)} — gefährliche Funktion, durch sichere API ersetzen")
+            if "unserialize(" in line and "allowed_classes" not in line:
+                hint(f"{rel}:{i}: unserialize ohne allowed_classes — erlaubte Klassen einschränken")
+
+
+# --- H5: Fokus und Bewegung in CSS -------------------------------------
+
+def part_h5_css_focus(project_path: str) -> None:
+    assets = os.path.join(project_path, "assets")
+    if not os.path.isdir(assets):
+        return
+    has_keyframes = False
+    has_reduced = False
+    for path in _walk_skip(assets, (".css", ".scss")):
+        text = _read_text(path)
+        if text is None:
+            continue
+        # outline:none ist nur ein Problem, wenn kein :focus-visible den Fokus wieder zeigt.
+        if ":focus-visible" not in text:
+            m = re.search(r"outline\s*:\s*(none|0)\b", text)
+            if m:
+                line = text.count("\n", 0, m.start()) + 1
+                hint(f"{relative(project_path, path)}:{line}: outline:none ohne :focus-visible — Tastaturfokus unsichtbar (WCAG 2.4.7)")
+        if "@keyframes" in text or re.search(r"animation\s*:", text):
+            has_keyframes = True
+        if "prefers-reduced-motion" in text:
+            has_reduced = True
+    if has_keyframes and not has_reduced:
+        hint(
+            "Animationen ohne @media (prefers-reduced-motion) — Bewegung für "
+            "empfindliche Nutzer abschaltbar machen"
+        )
+
+
+# --- H6: TypeScript ----------------------------------------------------
+
+def part_h6_typescript(project_path: str) -> None:
+    tsconfig = os.path.join(project_path, "tsconfig.json")
+    if os.path.isfile(tsconfig):
+        raw = _read_text(tsconfig) or ""
+        stripped = "\n".join(l.split("//", 1)[0] for l in raw.splitlines())
+        try:
+            data = json.loads(stripped)
+            strict = isinstance(data, dict) and data.get("strict") is True
+        except json.JSONDecodeError:
+            strict = re.search(r'"strict"\s*:\s*true', raw) is not None
+        if not strict:
+            hint('tsconfig.json: "strict": true fehlt — striktes Typchecking einschalten')
+    assets = os.path.join(project_path, "assets")
+    if not os.path.isdir(assets):
+        return
+    total = 0
+    shown = 0
+    for path in _walk_skip(assets, (".js", ".ts", ".vue")):
+        text = _read_text(path)
+        if text is None:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if re.search(r"\beval\s*\(", line) or "new Function(" in line:
+                total += 1
+                if shown < 5:
+                    hint(f"{relative(project_path, path)}:{i}: eval/new Function — unsichere Code-Ausführung")
+                    shown += 1
+    if total > 5:
+        hint(f"… und {total - 5} weitere")
+
+
+# --- Hauptprogramm -----------------------------------------------------
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        print("Verwendung: check-app-static [projektverzeichnis]", file=sys.stderr)
+        return 2
+
+    project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    if not os.path.isdir(project_path):
+        print(f"{project_path}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    if not (
+        os.path.isfile(os.path.join(project_path, "composer.json"))
+        or os.path.isfile(os.path.join(project_path, "package.json"))
+    ):
+        print("weder composer.json noch package.json — nicht messbar.")
+        return 77
+
+    if os.path.isdir(os.path.join(project_path, "config", "packages")):
+        part_s1_session(project_path)
+        part_s2_csrf(project_path)
+        part_s3_uploads(project_path)
+        part_s4_dockerignore(project_path)
+
+    part_h1_sql(project_path)
+    part_h2_raw_twig(project_path)
+    part_h3_crypto(project_path)
+    part_h4_dangerous(project_path)
+    part_h5_css_focus(project_path)
+    part_h6_typescript(project_path)
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
