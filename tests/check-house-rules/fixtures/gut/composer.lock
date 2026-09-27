@@ -1,0 +1,13 @@
+{
+    "packages": [],
+    "packages-dev": [
+        {
+            "name": "squizlabs/php_codesniffer",
+            "version": "4.0.4"
+        },
+        {
+            "name": "slevomat/coding-standard",
+            "version": "8.14.1"
+        }
+    ]
+}

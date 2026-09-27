@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""check-house-rules — Hausregeln eines Projekts prüfen.
+
+Aufgerufen vom Code Guard (Check "house-rules"), lässt sich aber auch allein fahren:
+    check-house-rules [projektverzeichnis]      # Standard: aktuelles Verzeichnis
+
+Geprüft werden nur Dateien; es wird nichts gestartet oder aufgerufen.
+
+Hausregeln, die aus Betriebserfahrung stammen. Bisher: R1 (phpcs-Regelwerk),
+R2 (.env-Interpolation), R3 (Zeitzone Europe/Berlin), R4 (trusted_proxies
+hinter Traefik + nginx) und R5 (Deploy wartet auf die Prüf-Jobs).
+
+R1: Das phpcs-Regelwerk passt nicht zu phpcs 4 (Version aus composer.lock).
+`exclude-pattern type="relative"` greift dort still nicht, der Ausschluss ist
+wirkungslos. Array-Werte als Komma-String in `<property value="…">` und Verweise
+auf Slevomat-Sniffs ohne installiertes slevomat/coding-standard lassen phpcs mit
+Exit 16 abbrechen, bevor es eine Datei prüft.
+
+R3: Die Zeitzone muss durchgehend Europe/Berlin sein — Container, Cron und PHP.
+`ENV TZ` wirkt nicht auf PHP; ohne `date.timezone` rechnet PHP in UTC. Prüft die
+PHP-Dockerfiles (Wurzel-Dockerfile und Dockerfile* unter docker/) auf `ENV TZ`
+sowie `date.timezone` in den ini-Dateien.
+
+R4: Hinter Traefik und nginx setzt die nginx-Konfiguration `real_ip_header`,
+damit steht in REMOTE_ADDR schon die Besucher-IP. Feste CIDR-Listen oder
+`private_ranges` greifen dann nie; Symfony verwirft stattdessen
+X-Forwarded-Proto und erzeugt `http://`-URLs in Canonical und Sitemap.
+Hausstandard ist `trusted_proxies: '%env(TRUSTED_PROXIES)%'` mit
+`TRUSTED_PROXIES=REMOTE_ADDR`. Prüft in Symfony-Projekten
+(config/packages/framework.yaml) trusted_proxies, den .env-Wert von
+TRUSTED_PROXIES/SYMFONY_TRUSTED_PROXIES, ob irgendwo unter docker/
+`real_ip_header` steht und trusted_headers auf x-forwarded-host/-prefix.
+
+R5: Ein Deploy-Job mit `needs: ["build"]` startet, sobald der Build fertig ist —
+parallel zu Test, PHPStan und phpcs; ein roter Test hält ihn nicht auf. Weil die
+Jobs ihre Stage oft aus einem per `include: project:` eingebundenen Template erben,
+das lokal nicht vorliegt, wertet R5 nur die lokale `.gitlab-ci.yml` aus und
+klassifiziert Jobs an Hand ihres Namens, ihrer Stage und ihres `extends`. Findet
+ein Deploy-Job, der mit `needs` auf einen Job wartet, über die (lokalen) `needs`
+keinen Prüf-Job, ist das ein Befund.
+
+Exit-Codes:
+    0  keine Befunde
+    1  Befunde
+    2  Nutzungsfehler (mehr als ein Argument, Verzeichnis existiert nicht)
+   77  nicht messbar (kein composer.json im Projekt)
+"""
+
+import glob
+import json
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+if yaml is not None:
+    # Tags wie !php/const oder !tagged_iterator in Symfony-YAML sind für uns
+    # irrelevant; wir ersetzen sie durch None, damit safe_load nicht abstürzt.
+    class _R4Loader(yaml.SafeLoader):
+        pass
+
+    def _r4_any_tag(_loader, _suffix, _node):
+        return None
+
+    _R4Loader.add_multi_constructor("!", _r4_any_tag)
+
+findings = 0
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+# --- Hilfsfunktionen ---------------------------------------------------
+
+def _read_text(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        # Binärdateien (etwa DB-Dumps unter docker/) sind für keine Regel relevant.
+        return None
+
+
+def relative(project_path: str, path: str) -> str:
+    return os.path.relpath(path, project_path)
+
+
+def _strip_xml_comments(text: str) -> str:
+    """XML-Kommentare `<!-- ... -->` durch Leerzeichen ersetzen, Zeilen behalten.
+
+    Damit die Zeilennummern der Befunde auch nach dem Entfernen der Kommentare
+    noch stimmen.
+    """
+
+    def _repl(match: "re.Match[str]") -> str:
+        return "".join("\n" if ch == "\n" else " " for ch in match.group(0))
+
+    return re.sub(r"<!--.*?-->", _repl, text, flags=re.DOTALL)
+
+
+def _load_phpcs_info(project_path: str):
+    """Aus composer.lock: phpcs-Version und ob slevomat/coding-standard drauf ist.
+
+    Tupel (version, slevomat_installiert). version ist None, wenn kein Lock oder
+    kein phpcs-Paket vorhanden ist.
+    """
+
+    lock_path = os.path.join(project_path, "composer.lock")
+    try:
+        with open(lock_path, encoding="utf-8") as f:
+            lock = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, False
+    if not isinstance(lock, dict):
+        return None, False
+    names = set()
+    version = None
+    for section in ("packages", "packages-dev"):
+        pkg_list = lock.get(section)
+        if not isinstance(pkg_list, list):
+            continue
+        for pkg in pkg_list:
+            if not isinstance(pkg, dict):
+                continue
+            name = pkg.get("name")
+            if not isinstance(name, str):
+                continue
+            names.add(name.lower())
+            if name == "squizlabs/php_codesniffer" and version is None:
+                version = pkg.get("version")
+    return version, "slevomat/coding-standard" in names
+
+
+def _major_version(version) -> int | None:
+    if not version:
+        return None
+    v = version[1:] if version.startswith("v") else version
+    m = re.match(r"(\d+)", v)
+    return int(m.group(1)) if m else None
+
+
+# --- R1: Das phpcs-Regelwerk passt nicht zu phpcs 4 --------------------
+
+def part_r1_phpcs4(project_path: str) -> None:
+    version, slevomat_installed = _load_phpcs_info(project_path)
+    major = _major_version(version)
+    if version is None or major is None or major < 4:
+        display = version if version else "nicht installiert"
+        ok(f"phpcs {display}: Regel R1 entfällt")
+        return
+
+    config_names = [".phpcs.xml", "phpcs.xml", ".phpcs.xml.dist", "phpcs.xml.dist"]
+    config_path = None
+    for name in config_names:
+        candidate = os.path.join(project_path, name)
+        if os.path.isfile(candidate):
+            config_path = candidate
+            break
+    if config_path is None:
+        ok(f"phpcs {version}: Regelwerk nicht gefunden — Regel R1 entfällt")
+        return
+
+    text = _read_text(config_path)
+    if text is None:
+        ok(f"phpcs {version}: Regelwerk nicht lesbar — Regel R1 entfällt")
+        return
+    text = _strip_xml_comments(text)
+    rel = relative(project_path, config_path)
+    before = findings
+
+    # a) exclude-pattern type="relative" — wirkt unter phpcs 4 nicht
+    for m in re.finditer(r"""<exclude-pattern\b(?:"[^"]*"|'[^']*'|[^>])*>""", text, re.DOTALL):
+        tag = m.group(0)
+        if not re.search(r"""type\s*=\s*['"]relative['"]""", tag):
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        finding(
+            rf'{rel}:{line}: exclude-pattern type="relative" greift unter phpcs 4 '
+            r"nicht, der Ausschluss ist wirkungslos — type weglassen und als Regex am "
+            r"Verzeichnis verankern, z. B. <exclude-pattern>/config/reference\.php</exclude-pattern>"
+        )
+
+    # b) property type="array" mit Komma-String in value (alte Syntax)
+    for m in re.finditer(r"""<property\b(?:"[^"]*"|'[^']*'|[^>])*>""", text, re.DOTALL):
+        tag = m.group(0)
+        if not re.search(r"""type\s*=\s*['"]array['"]""", tag):
+            continue
+        val = re.search(r"""value\s*=\s*['"]([^'"]*)['"]""", tag)
+        if not val or not val.group(1).strip():
+            continue
+        name_m = re.search(r"""name\s*=\s*['"]([^'"]*)['"]""", tag)
+        name = name_m.group(1) if name_m else ""
+        line = text.count("\n", 0, m.start()) + 1
+        finding(
+            rf'{rel}:{line}: property "{name}" übergibt ein Array als Komma-String '
+            '— phpcs 4 bricht damit ab, Werte als <element key="…" value="…"/> angeben'
+        )
+
+    # c) Verweis auf Slevomat-Sniffs, aber Paket nicht installiert
+    if re.search(r"""ref="SlevomatCodingStandard""", text) and not slevomat_installed:
+        finding(
+            f"{rel}: verweist auf SlevomatCodingStandard-Sniffs, aber "
+            "slevomat/coding-standard ist nicht installiert — phpcs 4 bricht mit "
+            "„Referenced sniff … does not exist“ ab"
+        )
+
+    if findings == before:
+        ok(f"phpcs {version}: Regelwerk {rel} passt zu phpcs 4")
+
+
+# --- R2: Kein ungeschütztes $ in .env-Werten ---------------------------
+
+R2_ENV_FILES = (
+    ".env",
+    ".env.dist",
+    ".env.local",
+    ".env.dev",
+    ".env.prod",
+    ".env.stage",
+    ".env.test",
+)
+
+
+def part_r2_env_dollar(project_path: str) -> None:
+    env_files = set(R2_ENV_FILES)
+    env_files.update(os.path.basename(p) for p in glob.glob(os.path.join(project_path, ".env.*.local")))
+    paths = sorted(os.path.join(project_path, name) for name in env_files)
+    paths = [p for p in paths if os.path.isfile(p)]
+    if not paths:
+        ok("keine .env-Dateien: Regel R2 entfällt")
+        return
+
+    before = findings
+    for path in paths:
+        rel = relative(project_path, path)
+        text = _read_text(path)
+        if text is None:
+            continue
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+            if not m:
+                continue
+            key = m.group(1)
+            value = m.group(2).strip()
+            if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+                continue
+            cleaned = value.replace("$$", "")
+            if re.search(r"\$[A-Za-z_]", cleaned):
+                finding(
+                    f"{rel}:{lineno}: {key} enthält $ vor einem Namen — Docker Compose "
+                    r"setzt dort eine Variable ein und kürzt den Wert still; $$ schreiben, "
+                    "den Wert in einfache Anführungszeichen setzen oder ${NAME}, falls eine "
+                    "Referenz gewollt ist"
+                )
+
+    if findings == before:
+        ok(".env-Dateien: kein ungeschütztes $")
+
+
+# --- R3: Zeitzone durchgehend Europe/Berlin ----------------------------
+
+def _is_php_dockerfile(text: str) -> bool:
+    for line in text.splitlines():
+        s = line.strip()
+        up = s.upper()
+        if up.startswith("FROM ") and len(s) > len("FROM"):
+            tokens = [t for t in s.split()[1:] if not t.startswith("--")]
+            if any("php" in t.lower() for t in tokens):
+                return True
+    return False
+
+
+def _dockerfile_tz(text: str):
+    """TZ aus der ersten ENV-Zeile eines Dockerfiles (Anführungszeichen weg).
+
+    Kann `ENV TZ=Wert`, `ENV TZ Wert` oder mehrere Zuweisungen in einer
+    ENV-Zeile. Gibt None zurück, wenn kein TZ vorkommt.
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.upper().startswith("ENV "):
+            continue
+        rest = s[len("ENV "):]
+        m = re.search(r"(?:^|\s)TZ\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s#;]+)", rest)
+        if not m:
+            m = re.search(r"(?:^|\s)TZ\s+(\"[^\"]*\"|'[^']*'|[^\s#;]+)", rest)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("\"", "'"):
+            val = val[1:-1]
+        return val
+    return None
+
+
+def part_r3_timezone(project_path: str) -> None:
+    before = findings
+
+    # Kandidaten: Wurzel-Dockerfile und alle Dockerfile* unter docker/
+    candidates = []
+    root_dockerfile = os.path.join(project_path, "Dockerfile")
+    if os.path.isfile(root_dockerfile):
+        candidates.append(root_dockerfile)
+    docker_dir = os.path.join(project_path, "docker")
+    if os.path.isdir(docker_dir):
+        for dirpath, _dirnames, filenames in os.walk(docker_dir):
+            for name in filenames:
+                if name.startswith("Dockerfile"):
+                    candidates.append(os.path.join(dirpath, name))
+
+    php_dockerfiles = []
+    for path in candidates:
+        text = _read_text(path)
+        if text is None:
+            continue
+        if _is_php_dockerfile(text):
+            php_dockerfiles.append((relative(project_path, path), text))
+
+    if not php_dockerfiles:
+        ok("kein PHP-Dockerfile: Regel R3 entfällt")
+        return
+
+    ref_rel, ref_text = php_dockerfiles[0]
+    ref_tz = _dockerfile_tz(ref_text)
+
+    # TZ je PHP-Dockerfile
+    for rel, text in php_dockerfiles:
+        tz = _dockerfile_tz(text)
+        if tz is None:
+            finding(f"{rel}: ENV TZ fehlt — ENV TZ=Europe/Berlin setzen (Hausstandard)")
+        elif tz != "Europe/Berlin":
+            finding(f"{rel}: ENV TZ={tz} — Hausstandard ist Europe/Berlin")
+
+    # date.timezone: Dockerfile-Texte, *.ini unter docker/ und php.ini im Wurzel
+    search_paths = list(php_dockerfiles)
+    if os.path.isdir(docker_dir):
+        for dirpath, _dirnames, filenames in os.walk(docker_dir):
+            for name in filenames:
+                if name.lower().endswith(".ini"):
+                    search_paths.append((
+                        relative(project_path, os.path.join(dirpath, name)),
+                        _read_text(os.path.join(dirpath, name)) or "",
+                    ))
+    root_ini = os.path.join(project_path, "php.ini")
+    if os.path.isfile(root_ini):
+        search_paths.append(("php.ini", _read_text(root_ini) or ""))
+
+    tz_ok_var = ref_tz == "Europe/Berlin"
+    matched = False
+    for rel, text in search_paths:
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            s = raw.strip()
+            if not s or s.startswith(";") or s.startswith("#"):
+                continue
+            m = re.search(r"date\.timezone\s*=\s*(.+)$", raw)
+            if not m:
+                continue
+            value = m.group(1).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("\"", "'"):
+                value = value[1:-1]
+            else:
+                value = re.split(r"[\"';]", value, maxsplit=1)[0].strip()
+            matched = True
+            if value in ("$TZ", "${TZ}"):
+                resolved = ref_tz if tz_ok_var else None
+            else:
+                resolved = value
+            if resolved != "Europe/Berlin":
+                finding(
+                    f"{rel}:{lineno}: date.timezone = {value} — "
+                    "Hausstandard ist Europe/Berlin"
+                )
+
+    if not matched:
+        finding(
+            f"{ref_rel}: PHP hat keine date.timezone und rechnet in UTC, "
+            "unabhängig von ENV TZ — date.timezone = Europe/Berlin "
+            "in eine php.ini (z. B. docker/php/conf.d/timezone.ini) eintragen"
+        )
+
+    if findings == before:
+        ok("Zeitzone: Container und PHP in Europe/Berlin")
+
+
+# --- R4: trusted_proxies hinter Traefik + nginx ------------------------
+
+def _coerce_trusted_proxies(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return ",".join(str(x) for x in raw)
+    return str(raw)
+
+
+def _coerce_trusted_headers(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    return [str(raw)]
+
+
+def _read_framework_trusted_yaml(path: str):
+    """framework.trusted_proxies und trusted_headers aus YAML (Top-Level framework:).
+
+    Tupel (trusted_proxies_or_None, trusted_headers_list_or_None). `when@…`-Blöcke
+    auf oberster Ebene werden ignoriert, weil sie ein eigener Top-Level-Schlüssel
+    sind und nicht innerhalb von framework: stehen.
+    """
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.load(f, Loader=_R4Loader)
+    except (OSError, yaml.YAMLError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    framework = data.get("framework")
+    if not isinstance(framework, dict):
+        return None, None
+    return (
+        _coerce_trusted_proxies(framework.get("trusted_proxies")),
+        _coerce_trusted_headers(framework.get("trusted_headers")),
+    )
+
+
+def _extract_scalar(text: str):
+    text = re.sub(r"\s*#.*$", "", text).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text or None
+
+
+def _extract_flow_seq(text: str):
+    text = re.sub(r"\s*#.*$", "", text).strip()
+    if text[:1] in ("[", "{"):
+        return re.findall(r"""['"]([^'"]+)['"]""", text)
+    return [text] if text else []
+
+
+def _framework_block_lines(text: str):
+    """Zeilen des Top-Level `framework:`-Blocks (Regex-Fallback).
+
+    Beendet wird beim nächsten Top-Level-Schlüssel (z. B. `when@…`, `secrets:`),
+    damit dessen Werte nicht mitgezählt werden.
+    """
+
+    lines = text.splitlines()
+    base_indent = None
+    block = []
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            if base_indent is not None:
+                block.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        key_m = re.match(r"([^:#\s][^:]*):\s*(\{|.*)$", line.strip())
+        if base_indent is None:
+            if indent == 0 and key_m and key_m.group(1).strip() == "framework":
+                base_indent = indent
+                block.append(line)
+                rest = key_m.group(2)
+                if rest.startswith("{"):
+                    block.append(rest)
+                continue
+            continue
+        if indent == 0 and key_m:
+            break
+        if indent <= base_indent and key_m and key_m.group(1).strip() != "framework":
+            break
+        block.append(line)
+    return block
+
+
+def _read_framework_trusted_regex(path: str):
+    """framework.trusted_proxies und trusted_headers per Regex (kein PyYAML).
+
+    Tupel (trusted_proxies_or_None, trusted_headers_list_or_None).
+    """
+
+    text = _read_text(path)
+    if text is None:
+        return None, None
+    tp = None
+    th = None
+    th_items = []
+    in_th = False
+    for line in _framework_block_lines(text):
+        raw = line.strip()
+        if raw.startswith("#"):
+            continue
+        m = re.search(r"trusted_proxies\s*:\s*(.*)$", line)
+        if m:
+            tp = _extract_scalar(m.group(1))
+            in_th = False
+            continue
+        m = re.search(r"trusted_headers\s*:\s*(.*)$", line)
+        if m:
+            rest = m.group(1).strip()
+            in_th = True
+            if rest[:1] in ("[", "{"):
+                th = _extract_flow_seq(rest)
+            elif rest:
+                th = [_extract_scalar(rest)]
+            else:
+                th = None
+            continue
+        if in_th:
+            m = re.match(r"-\s*['\"]?([^'\"]+)['\"]?\s*(#.*)?$", raw)
+            if m:
+                th_items.append(m.group(1))
+            elif raw:
+                in_th = False
+    if th is None and th_items:
+        th = th_items
+    return tp, th
+
+
+def _has_real_ip_header(project_path: str) -> bool:
+    docker_dir = os.path.join(project_path, "docker")
+    if not os.path.isdir(docker_dir):
+        return False
+    for dirpath, _dirnames, filenames in os.walk(docker_dir):
+        for name in filenames:
+            text = _read_text(os.path.join(dirpath, name))
+            if text is not None and "real_ip_header" in text:
+                return True
+    return False
+
+
+def _env_trusted_proxies(project_path: str):
+    """Letzte Zuweisung von TRUSTED_PROXIES oder SYMFONY_TRUSTED_PROXIES in .env."""
+
+    text = _read_text(os.path.join(project_path, ".env"))
+    if text is None:
+        return None
+    result = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        if m.group(1) not in ("TRUSTED_PROXIES", "SYMFONY_TRUSTED_PROXIES"):
+            continue
+        val = m.group(2).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        result = val
+    return result
+
+
+def part_r4_trusted_proxies(project_path: str) -> None:
+    framework_path = os.path.join(project_path, "config", "packages", "framework.yaml")
+    if not os.path.isfile(framework_path):
+        ok("keine framework.yaml — Regel R4 entfällt")
+        return
+
+    rel = relative(project_path, framework_path)
+    before = findings
+
+    if yaml is not None:
+        tp, trusted_headers = _read_framework_trusted_yaml(framework_path)
+    else:
+        tp, trusted_headers = _read_framework_trusted_regex(framework_path)
+    realip = _has_real_ip_header(project_path)
+    envval = _env_trusted_proxies(project_path)
+
+    # 1) leerer Default in %env(default::…)%
+    if tp is not None and "default::" in tp:
+        finding(
+            f"{rel}: trusted_proxies nutzt %env(default::…)% — liefert ohne Variable "
+            "null und bricht mit „Invalid type for path framework.trusted_proxies“ "
+            "ab; Parameter-Default mit string:-Prozessor verwenden: "
+            "'%env(string:default:default_trusted_proxies:TRUSTED_PROXIES)%'"
+        )
+
+    # 2) trusted_proxies fehlt, obwohl nginx real_ip_header setzt
+    if realip and tp is None:
+        finding(
+            f"{rel}: trusted_proxies fehlt, obwohl nginx real_ip_header setzt — "
+            "Symfony erkennt https nicht (http:// in Canonical und Sitemap); "
+            "'%env(TRUSTED_PROXIES)%' mit TRUSTED_PROXIES=REMOTE_ADDR"
+        )
+
+    # 3) feste IP/CIDR oder private_ranges hinter nginx mit real_ip_header
+    if realip and tp is not None:
+        effective = tp if "%env(" not in tp else envval
+        if (
+            effective
+            and (
+                "private_ranges" in effective
+                or re.search(r"\d+\.\d+\.\d+\.\d+", effective)
+            )
+            and "REMOTE_ADDR" not in effective
+        ):
+            finding(
+                f"{rel}: trusted_proxies = {effective} greift hinter nginx mit "
+                "real_ip_header nie — REMOTE_ADDR verwenden"
+            )
+
+    # 4) trusted_headers mit x-forwarded-host / -prefix
+    if isinstance(trusted_headers, list):
+        low = [str(h).lower() for h in trusted_headers]
+        if "x-forwarded-host" in low or "x-forwarded-prefix" in low:
+            finding(
+                f"{rel}: trusted_headers enthält x-forwarded-host — Einfallstor für "
+                "Host-Header-Injection (vergiftete Reset-Links, Cache-Poisoning); "
+                "nur x-forwarded-for, -proto, -port"
+            )
+
+    # Hinweis: fester String REMOTE_ADDR
+    if tp is not None and tp == "REMOTE_ADDR":
+        hint(
+            f"{rel}: trusted_proxies fest auf REMOTE_ADDR — über %env(TRUSTED_PROXIES)% "
+            "steuern, damit Deployments ohne Reverse-Proxy (Apache mit eigener TLS) "
+            "es weglassen können"
+        )
+
+    if findings == before:
+        if tp is None:
+            ok("trusted_proxies nicht gesetzt, kein nginx real_ip_header — R4 passt")
+        else:
+            ok(f"trusted_proxies: {tp}")
+
+
+# --- R5: Deploy wartet auf die Prüfungen -------------------------------
+
+R5_EXCLUDED_TOP_KEYS = (
+    "variables",
+    "include",
+    "stages",
+    "default",
+    "workflow",
+)
+
+R5_CHECK_NAMES = ("test", "phpstan", "phpcs", "psalm", "deptrac", "lint")
+R5_CHECK_JOB_PREFIXES = ("test", "phpstan", "phpcs")
+R5_CHECK_EXTENDS_PREFIXES = (".test", ".phpstan", ".phpcs")
+
+
+def _normalize_extends(job: dict):
+    """`extends` als Liste von Strings; string oder Liste, sonst leer."""
+
+    ex = job.get("extends")
+    if ex is None:
+        return []
+    if isinstance(ex, str):
+        return [ex]
+    if isinstance(ex, list):
+        return [str(x) for x in ex]
+    return []
+
+
+def _needs_names(needs):
+    """Namen aus einer `needs`-Liste; Einträge sind Strings oder Dicts mit `job`."""
+
+    if not isinstance(needs, list):
+        return []
+    names = []
+    for item in needs:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            job = item.get("job")
+            if isinstance(job, str):
+                names.append(job)
+    return names
+
+
+def _reachable_jobs(start_needs, jobs):
+    """Alle Jobs, die transitiv über `needs` erreichbar sind (nur lokale Jobs)."""
+
+    reachable = set()
+    stack = list(_needs_names(start_needs))
+    while stack:
+        name = stack.pop()
+        if name in reachable or name not in jobs:
+            continue
+        reachable.add(name)
+        stack.extend(_needs_names(jobs[name].get("needs")))
+    return reachable
+
+
+def _fmt_names(names) -> str:
+    return "[" + ", ".join(f'"{n}"' for n in names) + "]"
+
+
+def part_r5_deploy_needs(project_path: str) -> None:
+    ci_path = os.path.join(project_path, ".gitlab-ci.yml")
+    if not os.path.isfile(ci_path):
+        ok("keine .gitlab-ci.yml: Regel R5 entfällt")
+        return
+
+    rel = relative(project_path, ci_path)
+
+    if yaml is None:
+        hint("PyYAML fehlt — Regel R5 nicht gemessen")
+        return
+
+    try:
+        with open(ci_path, encoding="utf-8") as f:
+            ci = yaml.load(f, Loader=_R4Loader)
+    except (OSError, yaml.YAMLError):
+        hint(f"{rel}: konnte nicht geparst werden — Regel R5 nicht gemessen")
+        return
+    if not isinstance(ci, dict):
+        hint(f"{rel}: kein YAML-Objekt — Regel R5 nicht gemessen")
+        return
+
+    # Top-Level-Schlüssel ohne dict-Wert (z. B. `stages:` als Liste) sowie Namen,
+    # die mit "." beginnen (Templates) und reservierte Schlüssel sind keine Jobs.
+    jobs = {}
+    for name, value in ci.items():
+        if not isinstance(name, str):
+            continue
+        if name.startswith("."):
+            continue
+        if name in R5_EXCLUDED_TOP_KEYS:
+            continue
+        if isinstance(value, dict):
+            jobs[name] = value
+
+    check_jobs = []
+    deploy_jobs = []
+    check_job_set = set()
+    for name, job in jobs.items():
+        exts = _normalize_extends(job)
+        stage = job.get("stage")
+        if (
+            stage == "test"
+            or name in R5_CHECK_NAMES
+            or name.startswith(R5_CHECK_JOB_PREFIXES)
+            or any(e.startswith(R5_CHECK_EXTENDS_PREFIXES) for e in exts)
+        ):
+            check_jobs.append(name)
+            check_job_set.add(name)
+        if (
+            stage == "deploy"
+            or name.startswith("deploy")
+            or any(e.startswith(".deploy") for e in exts)
+        ):
+            deploy_jobs.append(name)
+
+    if not check_jobs:
+        ok(f"{rel}: keine Prüf-Jobs, Regel R5 entfällt")
+        return
+
+    # Ein roter Prüf-Job mit allow_failure hält den Deploy nicht auf.
+    if deploy_jobs:
+        for name in check_jobs:
+            if jobs[name].get("allow_failure") is True:
+                hint(
+                    f"{rel}: Prüf-Job \"{name}\" hat allow_failure: true — "
+                    "ein roter Lauf hält den Deploy nicht auf"
+                )
+
+    before = findings
+    for name in deploy_jobs:
+        needs = jobs[name].get("needs")
+        if not isinstance(needs, list):
+            # Ohne `needs` wartet der Job über die Stage-Reihenfolge.
+            continue
+        reachable = _reachable_jobs(needs, jobs)
+        if any(job in check_job_set for job in reachable):
+            continue
+        # Haengt der Job an einem anderen Deploy-Job (etwa e2e nach dem Deploy),
+        # traegt der vorgelagerte Deploy den Befund schon -- sonst doppelt.
+        if any(job in deploy_jobs for job in reachable):
+            continue
+        needs_names = _needs_names(needs)
+        vorschlag = needs_names + check_jobs
+        checks = ", ".join(check_jobs)
+        finding(
+            f"{rel}: Job \"{name}\" hat needs {_fmt_names(needs_names)} ohne "
+            f"Prüf-Job — er deployt parallel zu {checks} und wartet nicht auf deren "
+            f"Ergebnis; needs um die Prüf-Jobs ergänzen: {_fmt_names(vorschlag)}"
+        )
+
+    if findings == before:
+        ok(f"{rel}: Deploy wartet auf die Prüf-Jobs")
+
+
+# --- Hauptprogramm -----------------------------------------------------
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        print("Verwendung: check-house-rules [projektverzeichnis]", file=sys.stderr)
+        return 2
+
+    project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    if not os.path.isdir(project_path):
+        print(f"{project_path}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    if not os.path.isfile(os.path.join(project_path, "composer.json")):
+        print("kein composer.json — nicht messbar.")
+        return 77
+
+    part_r1_phpcs4(project_path)
+    part_r2_env_dollar(project_path)
+    part_r3_timezone(project_path)
+    part_r4_trusted_proxies(project_path)
+    part_r5_deploy_needs(project_path)
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,43 @@
+include:
+    - project: 'gruppe/templates'
+      file: ['/t/test.yml']
+
+.build_x:
+    script:
+        - echo build
+
+.test_x:
+    script:
+        - echo test
+
+.phpstan_x:
+    script:
+        - echo phpstan
+
+.phpcs_x:
+    script:
+        - echo phpcs
+
+.deploy_x:
+    script:
+        - echo deploy
+
+build:
+    extends: .build_x
+
+test:
+    extends: .test_x
+
+phpstan:
+    extends: .phpstan_x
+
+phpcs:
+    extends: .phpcs_x
+
+deploy:
+    extends: .deploy_x
+    needs: ["build"]
+
+deploy_stage:
+    extends: .deploy_x
+    needs: ["build"]

@@ -18,6 +18,12 @@ Teil 2: Passwortregeln. Alle *.php unter src/ (außer src/DataFixtures/):
     - Höchstlänge (Hinweis, wenn unter dem Hausstandard).
     - Abgleich mit geleakten Passwörtern (NotCompromisedPassword).
 
+Teil 3: Passwort-Hasher (ASVS 11.4.2). security.password_hashers muss
+zeitgemäße Algorithmen (auto, bcrypt, argon2i, argon2id, sodium, native)
+verwenden; plaintext sowie md5/sha1/sha256/sha512 sind ein Befund.
+InMemoryUser-Einträge ohne memory-Provider mit Benutzern bekommen nur einen
+Hinweis. Die Abschnitte when@test/when@dev werden nicht bewertet.
+
 Die Grenzwerte stammen aus .ai/guard-policy.yml des Projekts oder, falls nicht
 vorhanden, aus der zentralen guard-policy.yml eine Ebene über dem Script.
 
@@ -486,6 +492,74 @@ def part2b_current_password(project_path: str, files: list[str], file_text: dict
         ok(f"Passwortänderung geprüft ({checked} Stelle(n))")
 
 
+# --- Teil 3: Passwort-Hasher ---------------------------------------------
+
+ALLOWED_HASHERS = {"auto", "bcrypt", "argon2i", "argon2id", "sodium", "native"}
+
+
+def _has_memory_provider_with_users(sec: dict) -> bool:
+    providers = sec.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    for provider in providers.values():
+        if not isinstance(provider, dict):
+            continue
+        memory = provider.get("memory")
+        if not isinstance(memory, dict):
+            continue
+        users = memory.get("users")
+        if isinstance(users, dict) and users:
+            return True
+    return False
+
+
+def part3_password_hashers(sec: dict) -> None:
+    """Teil 3: Passwort-Hasher (ASVS 11.4.2).
+
+    security.password_hashers muss zeitgemäße Algorithmen wie bcrypt, argon2id,
+    sodium oder auto verwenden. Plaintext und Hashes wie md5/sha1/sha256/sha512
+    gelten als schwach und werden als Befund gemeldet. InMemoryUser-Einträge ohne
+    Speicher-Provider mit Benutzern bekommen nur einen Hinweis.
+    """
+    hashers = sec.get("password_hashers")
+    if not isinstance(hashers, dict) or not hashers:
+        ok("security.password_hashers nicht gesetzt — kein lokaler Passwort-Hasher zu prüfen")
+        return
+
+    has_memory_users = _has_memory_provider_with_users(sec)
+
+    for klass, wert in hashers.items():
+        if wert is None:
+            continue
+        if isinstance(wert, str):
+            alg = wert.lower()
+        elif isinstance(wert, dict):
+            alg = wert.get("algorithm")
+            if alg is None:
+                if "id" in wert:
+                    ok(f"password_hashers: {klass} — eigener Hasher-Service (id)")
+                continue
+            alg = str(alg).lower()
+        else:
+            continue
+
+        if alg in ALLOWED_HASHERS:
+            ok(f"password_hashers: {klass} nutzt {alg}")
+            continue
+
+        if klass.endswith("InMemoryUser") and not has_memory_users:
+            hint(
+                f"password_hashers: {klass} nutzt {alg}, es gibt aber keinen "
+                f"memory-Provider mit Benutzern — Eintrag entfernen oder auf auto stellen"
+            )
+            continue
+
+        finding(
+            f"password_hashers: {klass} nutzt {alg} — unsicher (ASVS 11.4.2), "
+            f"auto, bcrypt, argon2id oder sodium verwenden"
+        )
+
+
 def main() -> int:
     if len(sys.argv) > 2:
         print("Verwendung: check-auth-policy [projektverzeichnis]", file=sys.stderr)
@@ -516,6 +590,7 @@ def main() -> int:
 
     part1_firewalls(sec, project_path)
     part2_password_rules(sec, project_path)
+    part3_password_hashers(sec)
 
     print()
     if findings:

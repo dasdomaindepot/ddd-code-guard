@@ -1,0 +1,9 @@
+security:
+    password_hashers:
+        Symfony\Component\Security\Core\User\InMemoryUser: 'plaintext'
+        App\Entity\User: auto
+    providers:
+        app_user_provider:
+            entity:
+                class: App\Entity\User
+                property: email

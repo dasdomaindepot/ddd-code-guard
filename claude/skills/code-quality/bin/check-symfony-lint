@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""check-symfony-lint — Symfonys eigene, rein lesende Selbstprüfungen fahren.
+
+Aufgerufen vom Code Guard (Check "symfony-lint"), lässt sich aber auch allein
+fahren:
+    check-symfony-lint [projektverzeichnis]      # Standard: aktuelles Verzeichnis
+
+Der Check fährt Symfonys Konsolenbefehle im laufenden php-Container über
+`docker compose exec` und wertet rein lesende Befehle aus: lint:container,
+lint:twig, lint:yaml, doctrine:schema:validate und – wenn alle Migrationen
+ausgeführt sind – doctrine:schema:validate --skip-mapping. Er ruft niemals
+schreibende Befehle auf (keine migrations:migrate, kein schema:update, kein
+cache:clear) und startet keinen Container.
+
+Nicht messbar (Exit 77), wenn bin/console fehlt, kein compose-File vorhanden
+ist oder der php-Container nicht antwortet.
+
+Exit-Codes:
+     0  keine Befunde
+     1  Befunde
+     2  Nutzungsfehler (mehr als ein Argument, Verzeichnis existiert nicht)
+    77  nicht messbar (kein bin/console, kein compose-File, Container tot)
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+findings = 0
+commands = set()
+PROJECT = "."
+DOCKER = os.environ.get("GUARD_DOCKER", "docker")
+
+
+def finding(msg: str) -> None:
+    global findings
+    findings += 1
+    print(f"BEFUND   {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"ok       {msg}")
+
+
+def hint(msg: str) -> None:
+    print(f"Hinweis  {msg}")
+
+
+# --- Hilfsfunktionen ---------------------------------------------------
+
+def strip_ansi(s: str) -> str:
+    """ANSI-Farbcodes aus einer Ausgabe entfernen."""
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", s)
+
+
+def last_lines(text: str, count: int = 3, nonempty: bool = False) -> str:
+    """Letzte `count` Zeilen; bei nonempty nur die nicht leeren."""
+    lines = [ln for ln in text.splitlines() if ln.strip()] if nonempty else text.splitlines()
+    if not lines:
+        return ""
+    return "\n".join(lines[-count:])
+
+
+def console(args, timeout: int = 180):
+    """`docker compose exec -T php php bin/console --no-interaction <args>`.
+
+    Tupel (returncode, stdout+stderr, ANSI-befreit); Timeout → (124, "Timeout").
+    """
+    cmd = [DOCKER, "compose", "exec", "-T", "php", "php", "bin/console", "--no-interaction", *args]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=PROJECT, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "Timeout"
+    except OSError:
+        return 127, "docker nicht aufrufbar"
+    return proc.returncode, strip_ansi(proc.stdout + proc.stderr)
+
+
+def has_command(name: str) -> bool:
+    return name in commands
+
+
+def run_present(label: str, args) -> None:
+    """Befehl nur fahren, wenn er verfügbar ist; sonst übersprungen melden."""
+    name = args[0]
+    if not has_command(name):
+        ok(f"{label} nicht vorhanden, übersprungen")
+        return
+    rc, out = console(args)
+    if rc == 0:
+        ok(label)
+    else:
+        detail = last_lines(out, 3)
+        finding(f"{label}: {detail}" if detail else label)
+
+
+def run_present_nonempty(label: str, args) -> None:
+    """run_present mit „letzte 3 nicht leere Zeilen“ für den Befund."""
+    name = args[0]
+    if not has_command(name):
+        ok(f"{label} nicht vorhanden, übersprungen")
+        return
+    rc, out = console(args)
+    if rc == 0:
+        ok(label)
+    else:
+        detail = last_lines(out, 3, nonempty=True)
+        finding(f"{label}: {detail}" if detail else label)
+
+
+# --- Prüfungen ---------------------------------------------------------
+
+def part_symfony_lints(project_path: str) -> None:
+    # lint:container: Container-Konstanten und Services
+    run_present_nonempty("lint:container", ["lint:container"])
+
+    # lint:twig: Twig-Vorlagen, nur wenn ein Template-Ordner existiert
+    if has_command("lint:twig") and os.path.isdir(os.path.join(project_path, "templates")):
+        rc, out = console(["lint:twig", "templates"])
+        if rc == 0:
+            ok("lint:twig templates")
+        else:
+            detail = last_lines(out, 3)
+            finding(f"lint:twig templates: {detail}" if detail else "lint:twig templates")
+    else:
+        ok("lint:twig templates nicht vorhanden, übersprungen")
+
+    # lint:yaml: YAML-Konfiguration; --parse-tags ist Pflicht (sonst bricht jede
+    # Symfony-Config an !tagged_iterator ab).
+    run_present_nonempty("lint:yaml config --parse-tags", ["lint:yaml", "config", "--parse-tags"])
+
+
+def part_doctrine_schema(project_path: str) -> None:
+    # doctrine:schema:validate --skip-sync: Mapping zwischen Entity und DB.
+    run_present_nonempty("doctrine:schema:validate --skip-sync",
+                         ["doctrine:schema:validate", "--skip-sync"])
+
+    # Migrationen und Schema-Abgleich nur, wenn beide Befehle verfügbar sind.
+    if not (has_command("doctrine:migrations:up-to-date")
+            and has_command("doctrine:schema:validate")):
+        return
+
+    # a) Nur lesend: sind alle Migrationen ausgeführt?
+    rc, out = console(["doctrine:migrations:up-to-date"])
+    if rc != 0:
+        m = re.search(r"(\d+) migration", out)
+        n = m.group(1) if m else "einige"
+        hint(
+            f"{n} Migration(en) lokal nicht ausgeführt — lokale Datenbank hinkt "
+            "hinterher; Schema-Abgleich übersprungen"
+        )
+        return
+
+    # b) Alle Migrationen ausgeführt: weicht das Schema von den Entities ab?
+    rc, out = console(["doctrine:schema:validate", "--skip-mapping"])
+    if rc != 0:
+        finding(
+            "Datenbankschema weicht von den Entities ab, obwohl alle Migrationen "
+            "ausgeführt sind — Entity geändert ohne Migration? (make:migration)"
+        )
+    else:
+        ok("Datenbankschema passt zu den Entities")
+
+
+# --- Hauptprogramm -----------------------------------------------------
+
+def main() -> int:
+    global PROJECT, DOCKER, commands
+
+    if len(sys.argv) > 2:
+        print("Verwendung: check-symfony-lint [projektverzeichnis]", file=sys.stderr)
+        return 2
+
+    PROJECT = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    if not os.path.isdir(PROJECT):
+        print(f"{PROJECT}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    DOCKER = os.environ.get("GUARD_DOCKER", "docker")
+
+    # Nicht messbar, wenn die Grundlage fehlt.
+    if not os.path.isfile(os.path.join(PROJECT, "bin", "console")):
+        print("kein bin/console — nicht messbar.")
+        return 77
+    compose_names = ("docker-compose.yml", "compose.yaml", "docker-compose.yaml")
+    if not any(os.path.isfile(os.path.join(PROJECT, n)) for n in compose_names):
+        print("kein compose-File — nicht messbar.")
+        return 77
+
+    # Der Check startet keinen Container; er prüft nur, ob der php-Container
+    # antwortet.
+    try:
+        alive = subprocess.run(
+            [DOCKER, "compose", "exec", "-T", "php", "true"],
+            cwd=PROJECT, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        print("php-Container läuft nicht — nicht messbar.")
+        return 77
+    if alive.returncode != 0:
+        print("php-Container läuft nicht — nicht messbar.")
+        return 77
+
+    # Verfügbare Befehle ermitteln.
+    rc, out = console(["list", "--format=json"])
+    try:
+        data = json.loads(out)
+        if isinstance(data, dict):
+            commands = {
+                c["name"] for c in data.get("commands", [])
+                if isinstance(c, dict) and isinstance(c.get("name"), str)
+            }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        commands = set()
+
+    if not commands:
+        detail = last_lines(out, 3)
+        msg = "bin/console list scheitert — Anwendung bootet nicht:"
+        if detail:
+            msg += " " + detail
+        finding(msg)
+        print()
+        print(f"{findings} Befund(e).")
+        return 1
+
+    part_symfony_lints(PROJECT)
+    part_doctrine_schema(PROJECT)
+
+    print()
+    if findings:
+        print(f"{findings} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

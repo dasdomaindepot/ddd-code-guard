@@ -112,6 +112,14 @@ expect 1 "keine Mindestlänge gefunden"
 run_script "$HERE/fixtures/symfony-tags"
 expect 1 "ohne temporäre Sperre"
 
+# --- schwache Passwort-Hasher (md5, sha512) — Befunde; when@test-Hasher oberster Ebene wird ignoriert
+run_script "$HERE/fixtures/schwacher-hasher"
+expect 1 "App\Entity\User nutzt md5" "App\Entity\Admin nutzt sha512" "ASVS 11.4.2"
+
+# --- InMemoryUser plaintext ohne memory-Provider mit Benutzern — nur Hinweis
+run_script "$HERE/fixtures/inmemory-plaintext"
+expect 0 "keinen memory-Provider"
+
 # --- kein security.yaml: nicht messbar
 run_script "$HERE/fixtures/no-security-yaml"
 expect 77 "nicht messbar"

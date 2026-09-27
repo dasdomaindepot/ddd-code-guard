@@ -1,0 +1,45 @@
+include:
+    - project: 'gruppe/templates'
+      file: ['/t/test.yml']
+
+.build_x:
+    script:
+        - echo build
+
+.test_x:
+    script:
+        - echo test
+
+.phpstan_x:
+    script:
+        - echo phpstan
+
+.phpcs_x:
+    script:
+        - echo phpcs
+
+.deploy_x:
+    script:
+        - echo deploy
+
+build:
+    extends: .build_x
+    script:
+        - !reference [.x, script]
+
+test:
+    extends: .test_x
+
+phpstan:
+    extends: .phpstan_x
+
+phpcs:
+    extends: .phpcs_x
+
+deploy:
+    extends: .deploy_x
+    needs: ["build", "test", "phpstan", "phpcs"]
+
+e2e:
+    stage: post_deploy
+    needs: ["deploy"]

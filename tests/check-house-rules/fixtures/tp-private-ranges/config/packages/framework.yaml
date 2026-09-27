@@ -1,0 +1,4 @@
+framework:
+    secret: '%env(APP_SECRET)%'
+    trusted_proxies: '172.16.0.0/12'
+    trusted_headers: ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto']

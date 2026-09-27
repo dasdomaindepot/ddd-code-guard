@@ -1,0 +1,10 @@
+build:
+  extends: .build_x
+test:
+  extends: .test_x
+deploy:
+  extends: .deploy_x
+  needs: ["build"]
+e2e:
+  stage: deploy
+  needs: ["deploy"]

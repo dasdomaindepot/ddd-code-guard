@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.13.0"
+VERSION="1.14.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -346,6 +346,9 @@ CHECK_DEFS=(
   "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
   "auth-policy|Login und Passwoerter|security|cheap|$SCRIPT_DIR/check-auth-policy .|file:config/packages/security.yaml,bin:python3"
   "app-static|Statische Regeln|security|cheap|$SCRIPT_DIR/check-app-static .|bin:python3"
+  "house-rules|Hausregeln|config|cheap|$SCRIPT_DIR/check-house-rules .|file:composer.json,bin:python3"
+  "secrets|Geheimnisse im Repo|security|normal|$SCRIPT_DIR/check-secrets .|bin:python3,bin:git"
+  "symfony-lint|Symfony-Selbstpruefung|static|normal|$SCRIPT_DIR/check-symfony-lint .|file:bin/console,bin:python3"
   "phpcs|Coding-Standard|style|normal|make phpcs|target:phpcs"
   "phpstan|Statische Analyse|static|normal|make phpstan|target:phpstan"
   "deptrac|Architekturregeln|architecture|normal|make deptrac|target:deptrac"
@@ -403,6 +406,23 @@ CHECK_DEFS=(
 #
 # web-resources (seit 1.13.0) blockiert nur bei kaputten internen Links und Bildern;
 # Bildgroesse/-format, fehlende Masse, SRI und Weiterleitungsketten sind Hinweise.
+#
+# house-rules (seit 1.14.0) blockiert: Hausregeln aus Betriebserfahrung. R1: ein
+# phpcs-Regelwerk, das nicht zu phpcs 4 passt (exclude-pattern type="relative"
+# ist dort still wirkungslos, Komma-Arrays und fehlende Slevomat-Sniffs lassen
+# phpcs mit Exit 16 abbrechen). R2: kein $NAME in .env-Werten. R3: Zeitzone
+# Europe/Berlin in Container und PHP. R4: trusted_proxies hinter nginx mit
+# real_ip_header. R5: Deploy-Jobs, deren needs die Pruef-Jobs ueberspringen.
+#
+# secrets (seit 1.14.0) blockiert: versionierte .env.local-Dateien und
+# gitleaks-Treffer in den versionierten Dateien (gitleaks lokal oder als bereits
+# vorhandenes Docker-Image, es wird nichts gezogen). generic-api-key und ein
+# echter APP_SECRET in der versionierten .env sind nur Hinweise -- ob Produktion
+# ihn ueberschreibt, sieht der Guard nicht.
+#
+# symfony-lint (seit 1.14.0) blockiert: lint:container, lint:twig, lint:yaml,
+# Doctrine-Mapping und Schema ohne passende Migration, rein lesend im laufenden
+# php-Container. Offene Migrationen der lokalen DB sind nur ein Hinweis.
 #
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.
@@ -667,6 +687,12 @@ for def in "${CHECK_DEFS[@]}"; do
         status="MISSING"; note="$(summarize_log "$log_file")"
     else
         status="FAIL"; note="$(summarize_log "$log_file")"
+        # phpcs bricht mit Exit 16 ab, wenn es sein Regelwerk nicht laden kann.
+        # Geprueft wurde dann keine einzige Datei -- das gehoert benannt, sonst
+        # liest sich das rote Ergebnis wie ein Stilverstoss im Code.
+        if [ "$id" = "phpcs" ] && grep -qE 'Referenced sniff .* does not exist|no longer supported since PHP_CodeSniffer 4' "$log_file" 2>/dev/null; then
+            note="Regelwerk laedt unter phpcs 4 nicht, keine Datei geprueft — siehe Check house-rules · $note"
+        fi
         if [[ "$ADVISORY_CHECKS" == *" $id "* ]]; then
             status="WARN"
             note="$(grep -c '^BEFUND' "$log_file" 2>/dev/null || echo '?') Befund(e), beratend — siehe docs/.guard/logs/$id.log"

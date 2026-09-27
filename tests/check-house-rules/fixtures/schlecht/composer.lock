@@ -1,0 +1,9 @@
+{
+    "packages": [],
+    "packages-dev": [
+        {
+            "name": "squizlabs/php_codesniffer",
+            "version": "v4.0.1"
+        }
+    ]
+}

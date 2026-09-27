@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<ruleset name="Hausregeln">
+    <description>Hausregeln</description>
+
+    <exclude-pattern>/vendor/</exclude-pattern>
+
+    <rule ref="SlevomatCodingStandard.TypeHints.DeclareStrictTypes"/>
+
+    <rule ref="SlevomatCodingStandard.Functions.ForbiddenFunctions">
+        <property name="forbiddenFunctions" type="array">
+            <element key="dump" value="null"/>
+            <element key="dd" value="null"/>
+        </property>
+    </rule>
+</ruleset>

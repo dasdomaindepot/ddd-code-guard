@@ -79,6 +79,43 @@ ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
 `prefers-reduced-motion`, `tsconfig.json` ohne `strict`. Einzeln fahrbar:
 `bin/check-app-static .`.
 
+**Hausregeln** (`house-rules`, seit 27.09.2026, **blockierend**): Regeln aus der
+Betriebserfahrung, ohne laufende Instanz. R1: Das phpcs-Regelwerk passt nicht zu
+phpcs 4 (Version aus `composer.lock`). Befunde sind `exclude-pattern type="relative"`,
+das unter phpcs 4 still nicht greift, Arrays in alter Komma-Syntax (`value="a=>b,…"`)
+und Verweise auf `SlevomatCodingStandard`, obwohl `slevomat/coding-standard` nicht
+installiert ist. Die letzten beiden lassen phpcs mit Exit 16 abbrechen, bevor es
+eine Datei prüft. Der Check `phpcs` benennt das dann ausdrücklich. R2: kein `$` vor
+einem Namen in `.env`-Werten (Docker Compose setzt dort still eine Variable ein und
+kürzt den Wert; `$$`, `'…'` und `${…}` sind in Ordnung, der Wert wird nie ausgegeben).
+R3: Zeitzone durchgehend `Europe/Berlin` (Hausstandard seit 27.09.2026). Das
+PHP-Dockerfile braucht `ENV TZ=Europe/Berlin`, PHP selbst `date.timezone = Europe/Berlin`,
+denn `TZ` wirkt nur auf Cron und Shell. R4: `trusted_proxies` hinter Traefik + nginx
+mit `real_ip_header`. Befunde sind feste CIDR/`private_ranges` (greifen nie),
+fehlendes `trusted_proxies`, `%env(default::…)%` (liefert `null`) und `x-forwarded-host`/
+`-prefix` in `trusted_headers`. R5: Ein Deploy-Job in `.gitlab-ci.yml` mit `needs`, das
+keinen Prüf-Job enthält, deployt parallel zu Tests, PHPStan und phpcs. Einzeln fahrbar:
+`bin/check-house-rules .`.
+
+**Geheimnisse im Repo** (`secrets`, seit 27.09.2026, **blockierend**): Liest nur die
+versionierten Dateien (`git ls-files`). Befunde sind eine versionierte `.env.local` bzw.
+`.env.*.local` und jeder gitleaks-Treffer außer `generic-api-key` (gitleaks lokal oder
+als vorhandenes Docker-Image `zricethezav/gitleaks`, es wird nichts gezogen). Nur Hinweise
+sind `generic-api-key` und ein echter `APP_SECRET` in `.env`/`.env.dist`/`.env.prod`
+(ob Produktion ihn überschreibt, sieht der Guard nicht). `.env.test` und `.env.dev` bleiben
+außen vor. Bewusste Ausnahmen trägt das Projekt per Fingerprint in `.gitleaksignore` ein.
+Geheimniswerte werden nie ausgegeben. Einzeln fahrbar: `bin/check-secrets .`.
+
+**Symfony-Selbstprüfung** (`symfony-lint`, seit 27.09.2026, **blockierend**): Fährt
+Symfonys eigene, rein lesende Prüfungen im **laufenden** php-Container (startet nichts,
+sonst `MISSING`): `lint:container`, `lint:twig templates`, `lint:yaml config --parse-tags`,
+`doctrine:schema:validate --skip-sync` (Mapping) und den Schema-Abgleich. Sind alle
+Migrationen ausgeführt (`doctrine:migrations:up-to-date`) und das Schema weicht trotzdem
+ab, ist das ein Befund: eine Entity-Änderung ohne Migration. Offene Migrationen der
+lokalen DB sind nur ein Hinweis, dann entfällt der Abgleich. Schreibende Befehle
+(`migrate`, `schema:update`, `cache:clear`) ruft der Check nie auf. Einzeln fahrbar:
+`bin/check-symfony-lint .`.
+
 **Angriffsfläche** (`web-exposure`, seit 27.09.2026, **blockierend**): Ergänzt
 `web-hardening` um Befunde, die sofort blockieren. Auf der lokalen Instanz dürfen
 `/.git/HEAD`, `/.env`, `/.env.local`, `/composer.lock`, `/var/log/*.log` und ähnliche
@@ -133,7 +170,9 @@ mit `PasswordCredentials`) braucht eine temporäre Sperre nach Fehlversuchen —
 `login_throttling` oder einen eigenen RateLimiter (BSI ORP.4.A13), mit höchstens
 `login_max_attempts` Versuchen. Wo die App Passwörter vergibt (`hashPassword(`), muss
 die kleinste Passwort-`Length(min: …)` die Mindestlänge aus `guard-policy.yml`
-erreichen (Hausstandard **12**). Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
+erreichen (Hausstandard **12**). `password_hashers` darf nur `auto`, `bcrypt`,
+`argon2i`/`argon2id`, `sodium` oder `native` nutzen, `plaintext`, `md5`, `sha1` und
+`sha256`/`sha512` sind ein Befund (ASVS 11.4.2). Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
 für Passwort als einzigen Faktor), Höchstlänge unter 64, kein
 `NotCompromisedPassword` (BSI ORP.4.A8), ein Formular zum Passwortändern ohne Abfrage des
 bisherigen Passworts (ASVS 6.2.3; Erstpasswort- und Token-Wege sehen gleich aus), Anmeldung per SSO/OIDC (Sperre gehört dann

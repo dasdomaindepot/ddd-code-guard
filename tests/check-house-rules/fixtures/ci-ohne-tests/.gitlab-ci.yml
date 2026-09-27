@@ -1,0 +1,8 @@
+build:
+    script:
+        - echo build
+
+deploy:
+    needs: ["build"]
+    script:
+        - echo deploy

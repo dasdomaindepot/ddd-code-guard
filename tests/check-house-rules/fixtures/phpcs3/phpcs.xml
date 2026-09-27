@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<ruleset name="Hausregeln">
+    <description>Hausregeln</description>
+
+    <exclude-pattern type="relative">^config/reference.php</exclude-pattern>
+    <exclude-pattern type="relative">src/generated/</exclude-pattern>
+
+    <property name="forbiddenFunctions" type="array"
+        value="dump=>null,dd=>null"/>
+
+    <!-- <exclude-pattern type="relative">x</exclude-pattern> -->
+
+    <rule ref="SlevomatCodingStandard.TypeHints.DeclareStrictTypes"/>
+</ruleset>
