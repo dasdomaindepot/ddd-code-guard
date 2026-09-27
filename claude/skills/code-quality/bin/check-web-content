@@ -41,6 +41,7 @@ Exit-Codes:
    77  nicht messbar (Startseite kein HTTP 200 oder keine serverseitig gerenderte Seite)
 """
 
+import json
 import os
 import re
 import ssl
@@ -141,6 +142,16 @@ class PageParser(HTMLParser):
         self.ids: list[str] = []
         self.accessible_missing: list[str] = []
         self.body_text = ""
+        # Regeln 13–19 und Hinweise
+        self.mains = 0
+        self.headings: list[tuple[int, str]] = []
+        self.first_links: list[str] = []
+        self.resources: list[tuple[str, str]] = []   # (Art, URL) für Mixed Content
+        self.ld_json: list[str] = []
+        self._ld_buffer: list[str] | None = None
+        self.pw_autocomplete_off = 0
+        self.pw_onpaste = 0
+        self.personal_no_autocomplete: list[str] = []
 
     # -- Hilfsfunktionen -------------------------------------------------
 
@@ -216,6 +227,11 @@ class PageParser(HTMLParser):
             if tag == self.ignore_tag and not self_closed:
                 self.ignore_depth += 1
             return
+        if tag == "script" and not self._is_ignored(tag, attrs):
+            if self._first(attrs, "src"):
+                self.resources.append(("script", self._first(attrs, "src")))
+            if (self._first(attrs, "type") or "").strip().lower() == "application/ld+json":
+                self._ld_buffer = []
         if not self_closed and tag not in VOID_ELEMENTS and (tag in IGNORE_TAGS or self._is_ignored(tag, attrs)):
             self.ignore_tag = tag
             self.ignore_depth = 1
@@ -227,6 +243,14 @@ class PageParser(HTMLParser):
         entry = {"tag": tag, "text": [], "img_alt": False, "svg_title": False, "self_name": False, "href": None}
         self.text_stack.append(entry)
         self._record_self(tag, attrs, entry)
+        if tag == "main" or (self._first(attrs, "role") or "").lower() == "main":
+            self.mains += 1
+        if tag == "a" and self._first(attrs, "href") is not None and len(self.first_links) < 3:
+            self.first_links.append(self._first(attrs, "href"))
+        if tag in ("iframe", "video", "audio") and self._first(attrs, "src"):
+            self.resources.append((tag, self._first(attrs, "src")))
+        if tag == "form" and self._first(attrs, "action"):
+            self.resources.append(("form", self._first(attrs, "action")))
         if tag == "body":
             self.in_body = True
         elif tag == "html":
@@ -247,12 +271,23 @@ class PageParser(HTMLParser):
             src = self._first(attrs, "src")
             alt = self._first(attrs, "alt")
             self.images.append((src, alt))
+            if src:
+                self.resources.append(("img", src))
             if self.text_stack and alt is not None and alt.strip():
                 self.text_stack[-1]["img_alt"] = True
         elif tag == "input":
             t = (self._first(attrs, "type") or "").lower()
             if t not in ("hidden", "submit", "button", "reset", "image"):
                 self._add_field(attrs, "input")
+            if t == "password":
+                if (self._first(attrs, "autocomplete") or "").strip().lower() == "off":
+                    self.pw_autocomplete_off += 1
+                if any(k == "onpaste" for k, _ in attrs):
+                    self.pw_onpaste += 1
+            name = (self._first(attrs, "name") or "").lower()
+            if (t in ("email", "tel") or PERSONAL_RE.search(name)) and self._first(attrs, "autocomplete") is None \
+                    and t not in ("hidden", "submit", "button", "reset", "image", "checkbox", "radio", "password"):
+                self.personal_no_autocomplete.append(self._first(attrs, "name") or t)
         elif tag == "meta":
             name = (self._first(attrs, "name") or "").lower()
             if name == "description":
@@ -263,8 +298,12 @@ class PageParser(HTMLParser):
             elif name == "viewport":
                 self.has_viewport = True
                 self.viewport_content = self._first(attrs, "content")
+        elif tag == "source" and self._first(attrs, "src"):
+            self.resources.append(("source", self._first(attrs, "src")))
         elif tag == "link":
             rel = (self._first(attrs, "rel") or "").lower()
+            if "stylesheet" in rel.split() and self._first(attrs, "href"):
+                self.resources.append(("stylesheet", self._first(attrs, "href")))
             if "canonical" in rel.split():
                 self.has_canonical = True
                 self.canonical_href = self._first(attrs, "href")
@@ -273,6 +312,8 @@ class PageParser(HTMLParser):
 
     def handle_data(self, data) -> None:
         if self.ignore_tag is not None:
+            if self.ignore_tag == "script" and self._ld_buffer is not None:
+                self._ld_buffer.append(data)
             return
         if self.text_stack:
             self.text_stack[-1]["text"].append(data)
@@ -284,6 +325,9 @@ class PageParser(HTMLParser):
             if tag == self.ignore_tag:
                 self.ignore_depth -= 1
                 if self.ignore_depth == 0:
+                    if tag == "script" and self._ld_buffer is not None:
+                        self.ld_json.append("".join(self._ld_buffer))
+                        self._ld_buffer = None
                     self.ignore_tag = None
             return
         if tag in VOID_ELEMENTS:
@@ -310,6 +354,8 @@ class PageParser(HTMLParser):
                 self.text_stack[-1]["svg_title"] = True
         elif tag == "h1":
             self.h1_texts.append("".join(entry["text"]))
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.headings.append((int(tag[1]), " ".join("".join(entry["text"]).split())))
         elif tag == "a":
             href = entry["href"]
             if href and not self._accessible(entry):
@@ -328,13 +374,47 @@ class PageParser(HTMLParser):
         return bool(self.body_text.strip())
 
 
+PERSONAL_RE = re.compile(r"email|phone|telefon|vorname|nachname|firstname|lastname|street|strasse|straße|plz|zip")
+DOCTYPE_RE = re.compile(r"^\ufeff?\s*(?:<!--.*?-->\s*)*<!doctype\s+html\s*>", re.I | re.S)
+CHARSET_RE = re.compile(r"<meta[^>]+charset\s*=\s*[\"']?\s*utf-?8", re.I)
+
+skip_link_reported = False
+
+
+def mixed_content(p: "PageParser") -> list[tuple[str, str]]:
+    """Unverschlüsselt geladene Ressourcen und Formularziele einer https-Seite."""
+    return [(kind, url) for kind, url in p.resources if url.strip().lower().startswith("http://")]
+
+
+def ld_json_problems(blocks: list[str]) -> list[str]:
+    problems = []
+    for raw in blocks:
+        try:
+            data = json.loads(raw)
+        except ValueError as e:
+            problems.append(f"JSON-LD ist kein gültiges JSON ({e})")
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if "@context" not in item and not isinstance(data, list):
+                problems.append("JSON-LD ohne @context")
+            if "@graph" in item:
+                if any(isinstance(g, dict) and "@type" not in g for g in item["@graph"]):
+                    problems.append("JSON-LD ohne @type (im @graph)")
+            elif "@type" not in item:
+                problems.append("JSON-LD ohne @type")
+    return problems
+
+
 def _examples(items, limit=5) -> str:
     if len(items) <= limit:
         return ", ".join(items)
     return ", ".join(items[:limit]) + ", …"
 
 
-def check_page(path: str, p: PageParser) -> None:
+def check_page(path: str, p: PageParser, raw: str = "", https: bool = False) -> None:
     # 1. lang
     if p.lang is None or not p.lang.strip():
         finding(f"{path}: <html> ohne lang-Attribut")
@@ -392,6 +472,52 @@ def check_page(path: str, p: PageParser) -> None:
     dups = [k for k, n in seen_ids.items() if n > 1]
     if dups:
         finding(f"{path}: doppelte id: {_examples(dups)}")
+    # 13. Doctype
+    if not DOCTYPE_RE.search(raw):
+        finding(f"{path}: <!DOCTYPE html> fehlt am Anfang")
+    # 14. Zeichensatz
+    m = CHARSET_RE.search(raw)
+    if not m:
+        finding(f'{path}: <meta charset="utf-8"> fehlt')
+    elif m.start() > 1024:
+        finding(f"{path}: <meta charset> steht nicht in den ersten 1024 Bytes")
+    # 15. Mixed Content
+    if https:
+        mixed = mixed_content(p)
+        forms = [u for k, u in mixed if k == "form"]
+        loads = [u for k, u in mixed if k != "form"]
+        if loads:
+            finding(f"{path}: lädt {_examples(loads, 3)} über unverschlüsseltes HTTP (Mixed Content)")
+        if forms:
+            finding(f"{path}: Formular sendet an {_examples(forms, 3)} (unverschlüsselt)")
+    # 16. Hauptbereich
+    if p.mains == 0:
+        finding(f"{path}: kein <main>-Bereich")
+    elif p.mains > 1:
+        finding(f"{path}: {p.mains} <main>-Bereiche statt einem")
+    # 17. Passwortfelder
+    if p.pw_autocomplete_off:
+        finding(f'{path}: Passwortfeld mit autocomplete="off" — blockiert Passwortmanager (ASVS 6.2.7)')
+    if p.pw_onpaste:
+        finding(f"{path}: Passwortfeld verbietet Einfügen (onpaste)")
+    # 18. JSON-LD
+    for problem in ld_json_problems(p.ld_json):
+        finding(f"{path}: {problem}")
+    # H1 Skip-Link — gemeinsames Layout, deshalb nur einmal pro Lauf
+    global skip_link_reported
+    ids = set(p.ids)
+    if not skip_link_reported and not any(h.startswith("#") and h[1:] in ids for h in p.first_links):
+        skip_link_reported = True
+        hint(f"{path}: kein Skip-Link („Zum Inhalt springen“) vor der Navigation")
+    # H2 Überschriften-Sprünge
+    for (a, _), (b, text) in zip(p.headings, p.headings[1:]):
+        if b > a + 1:
+            hint(f"{path}: Überschrift springt von h{a} auf h{b} („{text[:50]}“)")
+            break
+    # H3 autocomplete für persönliche Daten (WCAG 1.3.5)
+    if p.personal_no_autocomplete:
+        n = len(p.personal_no_autocomplete)
+        hint(f"{path}: {n} Feld(er) für persönliche Daten ohne autocomplete: {_examples(p.personal_no_autocomplete, 3)} (WCAG 1.3.5)")
 
 
 def collect_paths(base: str) -> tuple[list[str], int]:
@@ -432,6 +558,9 @@ def main() -> int:
     if total > len(paths):
         hint(f"{len(paths)} von {total} Seiten geprüft (MAX_PAGES)")
 
+    https = base.lower().startswith("https://")
+    titles: dict[str, list[str]] = {}
+    descriptions: dict[str, list[str]] = {}
     any_server_rendered = False
     for path in paths:
         status, ct, body = fetch(base + path)
@@ -444,13 +573,27 @@ def main() -> int:
             continue
         any_server_rendered = True
         before = findings
-        check_page(path, p)
+        check_page(path, p, body, https)
+        if not p.noindex:
+            t = " ".join(p.title_text.split())
+            if t:
+                titles.setdefault(t, []).append(path)
+            d = " ".join((p.meta_description_content or "").split())
+            if d:
+                descriptions.setdefault(d, []).append(path)
         if findings == before:
             ok(f"{path}: Grundgerüst, Überschriften, Bilder, Links und Formulare in Ordnung")
 
     if not any_server_rendered:
         print("Keine serverseitig gerenderte Seite erreichbar — nicht messbar.")
         return 77
+
+    # 19. Titel und Beschreibungen seitenübergreifend eindeutig
+    for label, seen in (("Titel", titles), ("Beschreibung", descriptions)):
+        for text, where in seen.items():
+            if len(where) > 1:
+                short = text if len(text) <= 60 else text[:57] + "…"
+                finding(f"{label} \"{short}\" auf {len(where)} Seiten: {_examples(where)}")
 
     print()
     if findings:

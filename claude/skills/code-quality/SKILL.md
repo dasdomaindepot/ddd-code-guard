@@ -108,7 +108,14 @@ nicht leerer `<title>`, `<meta name="description">`, `<link rel="canonical">`,
 `<meta name="viewport">` ohne Zoom-Sperre, genau ein `<h1>`, `alt` an jedem Bild
 (`alt=""` für dekorative Bilder ist erlaubt), kein Dateiname oder Platzhalter als
 Alt-Text, kein Link oder Button ohne zugänglichen Namen, kein Formularfeld ohne
-Label (ein `placeholder` zählt nicht) und keine doppelte `id`. Die Symfony-Toolbar
+Label (ein `placeholder` zählt nicht) und keine doppelte `id`. Seit 1.12.0 außerdem:
+`<!DOCTYPE html>` am Anfang, `<meta charset="utf-8">` in den ersten 1024 Bytes, kein
+Mixed Content (`http://`-Ressourcen oder Formularziele auf einer https-Seite), genau ein
+`<main>`, kein Passwortfeld mit `autocomplete="off"` oder Einfüge-Verbot (ASVS 6.2.7),
+gültiges JSON-LD mit `@context`/`@type`, und kein `<title>` oder keine Description
+doppelt über mehrere Seiten. Nur Hinweise: fehlender Skip-Link (einmal pro Lauf),
+Überschriften-Sprünge (h2 → h4), Felder für persönliche Daten ohne `autocomplete`
+(WCAG 1.3.5). Die Symfony-Toolbar
 und alles mit `hidden` oder `aria-hidden="true"` werden ausgeblendet (ein
 Honeypot-Feld gehört in ein solches Element). Seiten mit
 `<meta name="robots" content="noindex">` brauchen keine Description und kein

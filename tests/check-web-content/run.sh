@@ -81,10 +81,21 @@ expect() {
     [ "$ok" -eq 1 ] || fail=1
 }
 
+expect_not() {
+    local kw
+    for kw in "$@"; do
+        if printf '%s' "$OUT" | grep -qF -- "$kw"; then
+            echo "FEHLER: Stichwort „$kw“ unerwartet in der Ausgabe" >&2
+            fail=1
+        fi
+    done
+}
+
 # --- guter Fall: keine Befunde, Sitemap-Host wird umgeschrieben ----------
 port="$(start_server "$HERE/fixtures/good")"
 run_script "http://127.0.0.1:$port"
 expect 0 "Keine Befunde." "/kontakt/"
+expect_not "Skip-Link" "springt" "autocomplete"
 
 # --- schlechter Fall: alle 12 Prüfungen ---------------------------------
 port="$(start_server "$HERE/fixtures/bad")"
@@ -100,7 +111,8 @@ expect 1 \
     "Platzhalter" \
     "zugänglichen Namen" \
     "ohne Label" \
-    "doppelte id"
+    "doppelte id" \
+    "DOCTYPE" "charset" "kein <main>" "Passwortmanager" "kein gültiges JSON"
 
 # --- noindex: Login-Seite braucht weder Description noch Canonical -----
 port="$(start_server "$HERE/fixtures/noindex")"
@@ -111,6 +123,24 @@ expect 0 "Keine Befunde."
 port="$(start_server "$HERE/fixtures/spa")"
 run_script "http://127.0.0.1:$port"
 expect 77 "nicht messbar"
+
+# --- dupes: gleicher Titel/Beschreibung, Überschriften-Sprung, autocomplete, kein Skip-Link
+port="$(start_server "$HERE/fixtures/dupes")"
+run_script "http://127.0.0.1:$port"
+expect 1 "auf 2 Seiten" "springt von h2 auf h4" "ohne autocomplete" "Skip-Link"
+
+# --- Mixed Content als Funktion (per http:// lokal nicht auslösbar)
+if ! python3 - "$SCRIPT" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("cwc", sys.argv[1])
+spec = importlib.util.spec_from_loader("cwc", loader); m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+p = m.PageParser()
+p.feed('<html><body><main><img src="http://example.com/a.png" alt=""><img src="https://example.com/b.png" alt="">'
+       '<form action="http://example.com/x" method="post"></form></main></body></html>')
+got = m.mixed_content(p)
+assert ("img", "http://example.com/a.png") in got and ("form", "http://example.com/x") in got and len(got) == 2, got
+PY
+then echo "FEHLER: mixed_content()" >&2; fail=1; fi
 
 # --- nicht erreichbar: Port ohne Server ----------------------------------
 dead_port="$(free_port)"
