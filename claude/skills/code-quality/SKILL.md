@@ -460,6 +460,11 @@ Entwicklungsbranch her (anlegen, Fast-Forward, bei Divergenz Abbruch statt
 Merge), fährt `code-guard --boot`, ruft **dich** für den Reporttext und
 committet anschließend nur `docs/quality-report.md`.
 
+Für einen Komplett-Lauf (etwa nachts) gibt es `--full`: Dann laufen auch
+Coverage, Mutation-Testing, E2E, Asset-Build und Browser-Audit. Jeder teure Check
+darf bis zu 4 Stunden brauchen (`--expensive-timeout N`, `0` = unbegrenzt); die
+Gesamtgrenze von 30 Minuten entfällt im Komplett-Lauf (`--guard-timeout N`).
+
 Zwei Dinge, die für deine Arbeit darin gelten:
 
 1. **Fahre `code-guard` nicht erneut.** Der Turnus hat es bereits getan;

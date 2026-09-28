@@ -126,7 +126,10 @@ did not start (`--boot`).
 clean, prepares the development branch, runs `code-guard --boot`, lets an
 agent (`opencode`, `claude` or `none`) write the report text and commits only
 `docs/quality-report.md`. While a report is `open`, later runs leave it alone;
-`guard-weekly --acknowledge` marks it done.
+`guard-weekly --acknowledge` marks it done. `--full` makes it a complete run
+(coverage, mutation testing, e2e, asset build, browser audit) with up to 4 hours
+per expensive check (`--expensive-timeout N`, `0` = unlimited) and no overall
+limit (`--guard-timeout N` to set one).
 
 ### Policy
 
@@ -231,7 +234,8 @@ kein Projekt · `3` unerwartete Nebenwirkung im Worktree (anhalten und
 nachsehen) · `4` Umgebung ließ sich nicht starten (`--boot`).
 
 Für den wöchentlichen Turnus per Cron gibt es `bin/guard-weekly` — Details im
-englischen Teil und in `guard-weekly --help`.
+englischen Teil und in `guard-weekly --help`. Mit `--full` wird daraus ein
+Komplett-Lauf mit allen teuren Checks (bis 4 Stunden je Check, einstellbar).
 
 ### Mitentwickeln
 

@@ -35,7 +35,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_GUARD="$SCRIPT_DIR/code-guard"
 
@@ -54,6 +54,14 @@ BOOT_TIMEOUT=180
 # ganze Zeit aufbrauchen und am Ende als "Umgebung kaputt" gemeldet werden.
 GUARD_TIMEOUT=1800
 AGENT_TIMEOUT=1800
+# Komplett-Lauf (--full): Coverage, Mutation-Testing, E2E, Asset-Build und
+# Browser-Audit laufen mit. Jeder teure Check darf dann bis zu 4 Stunden
+# brauchen; eine Grenze bleibt Absicht -- ein haengender E2E-Test soll nicht
+# den naechsten naechtlichen Lauf blockieren. Die Gesamtgrenze entfaellt im
+# Komplett-Lauf, sonst schnitte sie jeden Full-Lauf nach 30 Minuten ab.
+FULL=0
+EXPENSIVE_TIMEOUT=14400
+GUARD_TIMEOUT_SET=0
 
 # Dateien, die dauerhaft vom committeten Stand abweichen duerfen, ohne dass der
 # Worktree als "in Arbeit" gilt. Auf jedem Rechner steht eine eigene .env --
@@ -83,6 +91,13 @@ Verwendung: guard-weekly --project DIR [OPTIONEN]
   --no-push         committen, aber nicht pushen
   --ignore-dirty P  Pfadmuster, das den Worktree nicht als schmutzig gelten
                     laesst (mehrfach; zusaetzlich zu .env und *.bak*)
+  --full            Komplett-Lauf: auch Coverage, Mutation-Testing, E2E,
+                    Asset-Build und Browser-Audit
+  --expensive-timeout N
+                    Sekunden je teurem Check im Komplett-Lauf
+                    (Vorgabe: 14400 = 4 h; 0 = unbegrenzt)
+  --guard-timeout N Sekunden fuer den ganzen code-guard-Lauf
+                    (Vorgabe: 1800, mit --full unbegrenzt; 0 = unbegrenzt)
   --boot-timeout N  Sekunden auf den Docker-Stack warten (Vorgabe: 180)
   --agent-timeout N Sekunden fuer den Agentenlauf (Vorgabe: 1800)
   -h, --help        diese Hilfe
@@ -102,6 +117,9 @@ while [ $# -gt 0 ]; do
         --ignore-dirty)  IGNORE_DIRTY+=("${2:-}"); shift 2 ;;
         --boot-timeout)  BOOT_TIMEOUT="${2:-180}"; shift 2 ;;
         --agent-timeout) AGENT_TIMEOUT="${2:-1800}"; shift 2 ;;
+        --full)          FULL=1; shift ;;
+        --expensive-timeout) EXPENSIVE_TIMEOUT="${2:-14400}"; shift 2 ;;
+        --guard-timeout) GUARD_TIMEOUT="${2:-1800}"; GUARD_TIMEOUT_SET=1; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -495,9 +513,18 @@ fi
 
 # ------------------------------------------------------------------- Messung --
 
-log "Fahre code-guard (mit --boot) …"
-timeout "$GUARD_TIMEOUT" "$CODE_GUARD" --project "$PROJECT_DIR" --boot \
-    --boot-timeout "$BOOT_TIMEOUT" --no-color
+GUARD_ARGS=(--project "$PROJECT_DIR" --boot --boot-timeout "$BOOT_TIMEOUT" --no-color)
+if [ "$FULL" -eq 1 ]; then
+    GUARD_ARGS+=(--full --expensive-timeout "$EXPENSIVE_TIMEOUT")
+    # Ohne ausdrueckliche Vorgabe keine Gesamtgrenze: die Grenze je teurem
+    # Check reicht. timeout 0 bedeutet bei coreutils "unbegrenzt".
+    [ "$GUARD_TIMEOUT_SET" -eq 1 ] || GUARD_TIMEOUT=0
+    if [ "$EXPENSIVE_TIMEOUT" = 0 ]; then grenze="unbegrenzt"; else grenze="max. ${EXPENSIVE_TIMEOUT}s"; fi
+    log "Fahre code-guard (Komplett-Lauf, mit --boot; je teurem Check $grenze) …"
+else
+    log "Fahre code-guard (mit --boot) …"
+fi
+timeout "$GUARD_TIMEOUT" "$CODE_GUARD" "${GUARD_ARGS[@]}"
 GUARD_EXIT=$?
 
 case "$GUARD_EXIT" in

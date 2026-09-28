@@ -64,9 +64,9 @@ Verwendung: code-guard [OPTIONEN]
   --only IDS       nur diese Checks, kommagetrennt (z.B. phpstan,phpcs)
   --list           nur das Inventar zeigen, nichts ausfuehren
   --install-make   'make guard' in das Makefile des Projekts eintragen
-  --timeout N      Sekunden je Check (Vorgabe: 600)
+  --timeout N      Sekunden je Check (Vorgabe: 600; 0 = unbegrenzt)
   --expensive-timeout N
-                   Sekunden je teurem Check (Vorgabe: 3600)
+                   Sekunden je teurem Check (Vorgabe: 3600; 0 = unbegrenzt)
   --quiet          nur das Verdikt ausgeben
   --no-color       ohne ANSI-Farben
   -h, --help       diese Hilfe
