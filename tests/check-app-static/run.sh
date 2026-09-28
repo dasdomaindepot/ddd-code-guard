@@ -146,6 +146,11 @@ expect 0 "ohne Timeout und Fehlerbehandlung"
 expect_not 0 "exec("
 expect_not 0 "UserRepo.php:3: "
 
+# --- H6: "strict" unter compilerOptions (dort gehört es hin) → kein Hinweis
+run_script "$HERE/fixtures/tsconfig-strict"
+expect 0
+expect_not 0 "strict"
+
 # --- H8: PHP-Sicherheits-Patzer in src-PHP (@-Unterdrückung, json_decode,
 # Request-Typcast). Die drei Beispiele melden sich an; @var und @ in Strings
 # (z. B. 'a@b.de') werden nicht als Fehlerunterdrückung gemeldet.

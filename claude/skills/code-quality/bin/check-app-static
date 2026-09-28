@@ -1270,7 +1270,10 @@ def part_h6_typescript(project_path: str) -> None:
         stripped = "\n".join(l.split("//", 1)[0] for l in raw.splitlines())
         try:
             data = json.loads(stripped)
-            strict = isinstance(data, dict) and data.get("strict") is True
+            # "strict" gehört unter "compilerOptions"; auf oberster Ebene
+            # ignoriert TypeScript den Schlüssel.
+            opts = data.get("compilerOptions") if isinstance(data, dict) else None
+            strict = isinstance(opts, dict) and opts.get("strict") is True
         except json.JSONDecodeError:
             strict = re.search(r'"strict"\s*:\s*true', raw) is not None
         if not strict:

@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.19.0"
+VERSION="1.19.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -262,7 +262,21 @@ fi
 # es gar nicht gemessen wurde. Deshalb einmal vorab: Ohne 200 auf demselben Host
 # gelten alle Web-Checks als MISSING, mit dem Grund im Ergebnis.
 WEB_URL_PROBLEM=""
-if [ -n "$WEB_URL" ] && command -v curl >/dev/null 2>&1; then
+
+# In einem verknuepften Git-Worktree zeigt DOMAIN_NAME (aus der mitkopierten
+# .env.local) auf die Instanz des Hauptprojekts. Die Web-Checks wuerden dann
+# den Stand des Haupt-Checkouts messen statt den des Worktrees -- rot fuer
+# laengst behobene Befunde, gruen fuer frisch eingebaute Fehler. Ohne eigene
+# GUARD_WEB_URL gelten sie deshalb als nicht messbar.
+if [ -n "$WEB_URL" ] && [ -z "${GUARD_WEB_URL:-}" ]; then
+    git_dir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
+    common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$git_dir" ] && [ "$git_dir" != "$common_dir" ]; then
+        WEB_URL_PROBLEM="Git-Worktree: $WEB_URL gehoert zum Haupt-Checkout, nicht zu diesem Stand — GUARD_WEB_URL setzen, um eine eigene Instanz zu messen"
+    fi
+fi
+
+if [ -n "$WEB_URL" ] && [ -z "$WEB_URL_PROBLEM" ] && command -v curl >/dev/null 2>&1; then
     probe="$(curl -skL -o /dev/null --max-time 20 -w '%{http_code} %{url_effective}' "$WEB_URL/" 2>/dev/null)"
     probe_code="${probe%% *}"
     probe_url="${probe#* }"
