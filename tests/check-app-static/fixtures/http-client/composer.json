@@ -1,0 +1,6 @@
+{
+  "name": "test/http-client-fixture",
+  "require": {
+    "symfony/http-client": "^7.3"
+  }
+}

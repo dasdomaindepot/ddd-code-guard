@@ -75,6 +75,12 @@ Darüber legen sich die Schwellen aus `guard-policy.yml`:
 Ein hochgestuftes `PASS → WARN` (siehe Statusvokabular in der SKILL.md) macht aus
 GREEN mindestens YELLOW.
 
+**Die Untergrenze des Scripts gilt auch bei Vorbestand.** Ist ein Script-Check
+rot, weil er das ganze Projekt prüft und dabei Code außerhalb des Diffs trifft,
+bleibt das Verdikt mindestens RED. Der Report sagt dann ausdrücklich: „rot durch
+Vorbestand, nicht durch diesen Diff“ und führt den Befund unter „Vorbestand“.
+Das Review selbst zählt Vorbestand nie gegen die Schwellen.
+
 **RED schlägt INCOMPLETE.** Fehlen kritische Checks, gibt es aber belegte
 Befunde über der Schwelle, ist das Verdikt RED — ein nachgewiesener Blocker
 wird durch fehlende Messungen nicht unsicherer. Im Kopf steht dann zusätzlich,
@@ -91,6 +97,39 @@ Ergebnis von Schritt 0 (siehe `project-profile.md`):
 
 Gibt es `.ai/guard-profile.yml` nicht, steht hier zusätzlich ein Vorschlag, der
 mit `bin/guard-profile-draft` erzeugt werden kann.
+
+## Achsen
+
+Jede Achse bekommt genau einen Status. Eine Achse, die nicht gelaufen ist, ist
+nie `pass`.
+
+| Status | Bedeutung |
+|---|---|
+| `pass` | geprüft, kein Befund |
+| `fail` | geprüft, mindestens ein Befund `MEDIUM` oder höher |
+| `advisory` | geprüft, nur `LOW` oder Hinweise |
+| `not_applicable` | Profil schaltet sie ab oder der Diff berührt ihren Gegenstand nicht — mit Grund |
+| `needs_context` | anwendbar, aber **insgesamt** nicht prüfbar: keine Anforderung gefunden, kein Zugriff auf die Konfiguration — mit dem, was fehlte |
+| `error` | die Prüfung selbst ist gescheitert (Werkzeug, Timeout) |
+
+```
+| Achse | Status | Befunde | Grund |
+|---|---|---|---|
+| 2 Erfundene Symbole | fail | Q5 | Paketversionen nicht prüfbar (vendor/ fehlt) |
+| 6 Mandantentrennung | fail | Q2 | |
+| 9 Integrationen | not_applicable | – | Diff ruft keinen externen Dienst |
+```
+
+Regeln für die Tabelle:
+
+- Der Status folgt den **eigenen** Befunden der Achse. Hängt eine Achse nur als
+  Nebenachse an einem Befund einer anderen Achse („(+6)“), ist ihr Status
+  `pass`, und der Grund nennt den Befund: „nur als Nebenachse von Q1“.
+- Ist nur ein Teil einer Achse nicht prüfbar, bekommt sie den Status des
+  geprüften Teils; der ungeprüfte Teil steht im Grund.
+- `needs_context` zählt wie `MISSING` im Script: nicht rot, aber nie grün. Stehen
+  kritische Achsen (3, 6, 7) auf `needs_context`, ist das Verdikt höchstens
+  YELLOW.
 
 ## Anforderungsdeckung
 

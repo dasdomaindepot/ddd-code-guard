@@ -168,6 +168,64 @@ run_script "$HERE/fixtures/ci-folge-deploy"
 expect 1 "1 Befund(e)." 'Job "deploy" hat needs'
 expect_not 1 'Job "e2e"'
 
+# --- R6: Plattform passt zum PHP im Dockerfile (Container 8.3)
+run_script "$HERE/fixtures/platform-gut"
+expect 0 "Keine Befunde."
+expect_not 0 "BEFUND"
+
+# --- R6: config.platform.php (8.2) weicht von PHP 8.3 im Dockerfile ab
+run_script "$HERE/fixtures/platform-falsch"
+expect 1 "passt nicht zur PHP-Version"
+
+# --- R6: composer.lock ist da, aber nicht versioniert
+tmp_platform_git="$(mktemp -d)"
+git -C "$tmp_platform_git" init -q
+printf '{\n  "require": {"php": "^8.3"}\n}\n' > "$tmp_platform_git/composer.json"
+printf '{}\n' > "$tmp_platform_git/composer.lock"
+git -C "$tmp_platform_git" add composer.json
+run_script "$tmp_platform_git"
+expect 1 "composer.lock ist nicht versioniert"
+rm -rf "$tmp_platform_git"
+
+# --- R6: composer.lock ist versioniert, kein R6-Befund
+tmp_platform_git_ok="$(mktemp -d)"
+git -C "$tmp_platform_git_ok" init -q
+printf '{\n  "require": {}\n}\n' > "$tmp_platform_git_ok/composer.json"
+printf '{}\n' > "$tmp_platform_git_ok/composer.lock"
+git -C "$tmp_platform_git_ok" add composer.json composer.lock
+run_script "$tmp_platform_git_ok"
+expect 0
+expect_not 0 "nicht versioniert"
+rm -rf "$tmp_platform_git_ok"
+
+# --- R7: messenger ohne failure_transport (Befund), async ohne retry
+# --- (Hinweis) und Worker ohne Limit (Hinweis) — Exit 1 wegen des Befunds
+run_script "$HERE/fixtures/messenger-ohne-failure"
+expect 1 "1 Befund(e)." "failure_transport" "retry_strategy" "--memory-limit"
+
+# --- R7: messenger in Ordnung — kein Befund, kein Hinweis
+run_script "$HERE/fixtures/messenger-gut"
+expect 0 "Keine Befunde."
+expect_not 0 "BEFUND" "Hint"
+
+# --- R8: Cron — Zeile 1 ohne Lock (Hinweis), Zeile 2 mit LockableTrait (kein
+# --- Hinweis), Zeile 3 über flock (kein Hinweis) — Exit 0, genau ein Hinweis
+run_script "$HERE/fixtures/cron"
+expect 0 "Keine Befunde."
+expect 0 "crontab:1: app:ohne-lock läuft ohne Lock"
+expect_not 0 'crontab:2:' 'crontab:3:'
+
+# --- R8: keine Crontab — Regel R8 entfällt
+run_script "$HERE/fixtures/gut"
+expect 0 "Regel R8 entfällt"
+
+# --- R9: DATABASE_URL verbindet als root — root in Produktion Befund,
+# --- in .env/.env.local nur Hinweis; Passwort und URL werden nie ausgegeben
+run_script "$HERE/fixtures/db-root"
+expect 1 "1 Befund(e)." "BEFUND" ".env.prod:1:" ".env:1:"
+expect 1 "Hinweis  .env:1: DATABASE_URL verbindet als root"
+expect_not 1 "geheim123" "prodgeheim"
+
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"
     exit 0

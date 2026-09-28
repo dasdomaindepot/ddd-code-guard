@@ -84,6 +84,9 @@ alles unbekannt.
 | 6 Mandantentrennung | `mandanten` ≠ `keine` | `mandanten: keine` |
 | 7 Injection und Mass Assignment | der Diff Eingaben verarbeitet (Controller, Formulare, Deserializer, Commands, Message-Handler) | — |
 | 8 Datenabfluss | der Diff Antworten, Serialisierung, Logs oder Fehlermeldungen berührt | — |
+| 9 Integrationen und Wiederholungen | der Diff externe Dienste, Webhooks oder Messenger-Handler berührt | — |
+| 10 Fehlerbehandlung | der Diff `try`/`catch`, Fehlerpfade oder Fallbacks enthält | — |
+| 11 Nebenläufigkeit und Datenintegrität | der Diff Schreibpfade berührt | — |
 
 ## Unbekanntes aus dem Code auflösen
 

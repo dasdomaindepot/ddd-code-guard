@@ -10,6 +10,14 @@ Hausregeln, die aus Betriebserfahrung stammen. Bisher: R1 (phpcs-Regelwerk),
 R2 (.env-Interpolation), R3 (Zeitzone Europe/Berlin), R4 (trusted_proxies
 hinter Traefik + nginx) und R5 (Deploy wartet auf die Prüf-Jobs).
 
+R6: Composer soll stets für die Laufzeitumgebung auflösen. Liegt `composer.lock`
+vor, muss es sich im Git befinden — Anwendungen installieren sonst je nach Stand
+andere Paketversionen. Fehlt das Lock einer Anwendung mit `require`, ist das
+ebenso. Dazu wird die PHP-Version des Containers aus dem PHP-Dockerfile
+(siehe R3) gelesen und mit `config.platform.php` aus composer.json sowie der
+`require.php`-Bedingung verglichen. Weicht die Plattform ab, löst Composer für
+die falsche PHP-Version auf.
+
 R1: Das phpcs-Regelwerk passt nicht zu phpcs 4 (Version aus composer.lock).
 `exclude-pattern type="relative"` greift dort still nicht, der Ausschluss ist
 wirkungslos. Array-Werte als Komma-String in `<property value="…">` und Verweise
@@ -39,6 +47,41 @@ klassifiziert Jobs an Hand ihres Namens, ihrer Stage und ihres `extends`. Findet
 ein Deploy-Job, der mit `needs` auf einen Job wartet, über die (lokalen) `needs`
 keinen Prüf-Job, ist das ein Befund.
 
+R7: Die Symfony-Messenger-Queue. `config/packages/messenger.yaml` definiert die
+Transporte. Gibt es asynchrone Transporte (DSN nicht `sync://`), aber keinen
+`failure_transport`, gehen endgültig gescheiterte Nachrichten verlustlos und still
+verloren — Befund. Jeder asynchrone Transport ohne `retry_strategy.max_retries`
+läuft nur mit dem Standard von drei Versuchen — Hinweis. Und ein Worker, der
+`bin/console messenger:consume` aufruft, soll mit mindestens einer der Optionen
+`--limit`, `--memory-limit` oder `--time-limit` gestartet werden; sonst wächst
+der Speicher und ein Abbruch hinterlässt einen halben Lauf — Hinweis mit Datei:
+Zeile. Durchsucht werden docker-compose- und compose-Dateien im Wurzelverzeichnis,
+alle Textdateien bis 200 KB unter docker/ und die Makefile.
+
+R8: Cron-Jobs mit `bin/console`. Läuft ein Befehl regelmäßig in Cron aus, aber
+länger als sein Intervall, überlappt er still mit dem nächsten Lauf. Damit das
+sichtbar wird, soll sich ein Symfony-Befehl per `LockableTrait` (oder
+`LockFactory`/`createLock`) gegen einen doppelten Lauf schützen oder die Cron-Zeile
+über `flock -n` nur einmal laufen. R8 durchsucht jede Datei unter `docker/`
+(rekursiv), deren Name `cron` enthält oder die Zeilen im Crontab-Format haben,
+sowie `crontab` im Wurzelverzeichnis. Je Zeile mit `bin/console <befehl>` zieht
+es die Command-Klasse in `src/` (an Hand von `#[AsCommand(name: '…')]` oder
+`protected static $defaultName = '…'`) und prüft, ob sich die Klasse oder die
+Zeile gegen Überlappung absichert; sonst Hinweis. `flock`-Zeile und
+Symfony-eigene Befehle (`messenger:`, `cache:`, `doctrine:`, `lint:`) werden
+übersprungen.
+
+R9: In Produktionsumgebungen verbindet die Anwendung als `root` — sie braucht
+keine Admin-Rechte; jeder Benutzer soll nur auf die App-Datenbank zugreifen.
+R9 liest `DATABASE_URL` wie in R2 (Zuweisung, Anführungszeichen weg) aus
+`.env.prod` und `.env.stage` sowie aus Produktions-Compose-Dateien
+(`docker-compose.prod.yml`, `docker-compose.production.yml`, `compose.prod.yaml`,
+jeweils als Text nach den Zeilen mit `DATABASE_URL`). `.env.prod.local` wird
+bewusst nicht geprüft. Der Benutzer ist der Teil zwischen `://` und dem nächsten
+`:` oder `@`. Ist er `root`, gibt es einen Befund. In `.env` und `.env.local`
+reicht ein Hinweis (lokale Entwicklung). Das Passwort und der Rest der URL
+werden nie ausgegeben, nur Datei, Zeile und „root“.
+
 Exit-Codes:
     0  keine Befunde
     1  Befunde
@@ -50,6 +93,7 @@ import glob
 import json
 import os
 import re
+import subprocess
 import sys
 
 try:
@@ -804,6 +848,537 @@ def part_r5_deploy_needs(project_path: str) -> None:
         ok(f"{rel}: Deploy wartet auf die Prüf-Jobs")
 
 
+# --- R6: Composer-Plattform und Lock passen zum Container --------------
+
+def _read_json(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _is_git_repo(project_path: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", project_path, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def _composer_lock_tracked(project_path: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", project_path, "ls-files", "--error-unmatch", "composer.lock"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def _container_php_version(project_path: str):
+    """PHP-Version (Haupt/Neben) aus der ersten `php:(X.Y)`-FROM-Zeile.
+
+    Durchsucht Wurzel-Dockerfile und alle Dockerfile* unter docker/; gibt None
+    zurück, wenn kein PHP-Dockerfile mit erkennbarer Version vorkommt.
+    """
+
+    candidates = []
+    root_dockerfile = os.path.join(project_path, "Dockerfile")
+    if os.path.isfile(root_dockerfile):
+        candidates.append(root_dockerfile)
+    docker_dir = os.path.join(project_path, "docker")
+    if os.path.isdir(docker_dir):
+        for dirpath, _dirnames, filenames in os.walk(docker_dir):
+            for name in filenames:
+                if name.startswith("Dockerfile"):
+                    candidates.append(os.path.join(dirpath, name))
+
+    for path in candidates:
+        text = _read_text(path)
+        if text is None:
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if not s.upper().startswith("FROM "):
+                continue
+            m = re.search(r"php:(\d+\.\d+)", s)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _require_php_excludes(composer, container_version: str) -> None:
+    """require.php prüfen, wenn config.platform.php fehlt.
+
+    Bewertung nur bei einfachen Bedingungen (^, >=, ~) mit einer eigenen
+    Version; eine solche Bedingung verweigert die Container-Version, wenn ihre
+    Version höher ist als die des Containers.
+    """
+
+    if not isinstance(composer, dict):
+        return
+    require = composer.get("require")
+    if not isinstance(require, dict):
+        return
+    constraint = require.get("php")
+    if not isinstance(constraint, str):
+        return
+    m = re.match(r"(?:\^|>=|~)\s*(\d+\.\d+)", constraint.strip())
+    if not m:
+        return
+    constraint_mm = m.group(1)
+    constraint_tuple = tuple(int(x) for x in constraint_mm.split("."))
+    container_tuple = tuple(int(x) for x in container_version.split("."))
+    if constraint_tuple > container_tuple:
+        finding(
+            f"composer.json require.php = {constraint.strip()} passt nicht zur "
+            f"PHP-Version {container_version} im Dockerfile — Composer löst dann "
+            "Pakete für die falsche Version auf"
+        )
+
+
+def part_r6_composer_platform(project_path: str) -> None:
+    before = findings
+
+    # 1) composer.lock vorhanden und versioniert? Kein Git-Repo: Teil überspringen.
+    lock_path = os.path.join(project_path, "composer.lock")
+    has_lock = os.path.isfile(lock_path)
+    if has_lock and _is_git_repo(project_path) and not _composer_lock_tracked(project_path):
+        finding(
+            "composer.lock ist nicht versioniert; Anwendungen brauchen sie für "
+            "reproduzierbare Installationen"
+        )
+
+    # composer.lock fehlt nur bei einer Anwendung mit require.
+    if not has_lock:
+        composer = _read_json(os.path.join(project_path, "composer.json"))
+        require = composer.get("require") if isinstance(composer, dict) else None
+        if isinstance(require, dict) and require:
+            finding(
+                "composer.lock fehlt; Anwendungen brauchen sie für "
+                "reproduzierbare Installationen"
+            )
+
+    # 2) PHP-Version des Containers und 3) Plattform aus composer.json.
+    container_version = _container_php_version(project_path)
+    if container_version is not None:
+        composer = _read_json(os.path.join(project_path, "composer.json"))
+        plat = None
+        if isinstance(composer, dict):
+            config = composer.get("config")
+            if isinstance(config, dict):
+                platform = config.get("platform")
+                if isinstance(platform, dict):
+                    plat = platform.get("php")
+        if isinstance(plat, str):
+            plat_mm = re.match(r"(\d+\.\d+)", plat)
+            if plat_mm and plat_mm.group(1) != container_version:
+                finding(
+                    f"composer.json config.platform.php = {plat_mm.group(1)} passt "
+                    f"nicht zur PHP-Version {container_version} im Dockerfile — "
+                    "Composer löst dann Pakete für die falsche Version auf"
+                )
+        else:
+            _require_php_excludes(composer, container_version)
+
+    if findings == before:
+        ok("Composer-Plattform und PHP-Version des Containers stimmen überein")
+
+
+# --- R7: Messenger-Queue -----------------------------------------------
+
+R7_WORKER_MIN_FLAGS = (
+    "--limit",
+    "--memory-limit",
+    "--time-limit",
+)
+
+R7_MAX_FILE_BYTES = 200 * 1024
+
+
+def _r7_scan_workers(project_path: str) -> bool:
+    """messenger:consume ohne jegliche Limit-Optione suchen.
+
+    Durchsucht docker-compose- und compose-Dateien im Wurzelverzeichnis, alle
+    Textdateien bis 200 KB unter docker/ und die Makefile. Gibt True zurück, wenn
+    mindestens eine messenger:consume-Zeile keine der Limit-Optionen enthält.
+
+    Hinweis- und Befundmeldungen passieren über die Globals des Skripts; der
+    Rückwert sagt nur, ob überhaupt eine entsprechende Zeile gefunden wurde.
+    """
+
+    found_any = False
+    candidates: list[str] = []
+    for pattern in ("docker-compose*.yml", "compose*.yaml"):
+        candidates.extend(glob.glob(os.path.join(project_path, pattern)))
+    makefile = os.path.join(project_path, "Makefile")
+    if os.path.isfile(makefile):
+        candidates.append(makefile)
+    docker_dir = os.path.join(project_path, "docker")
+    if os.path.isdir(docker_dir):
+        for dirpath, _dirnames, filenames in os.walk(docker_dir):
+            for name in filenames:
+                candidates.append(os.path.join(dirpath, name))
+
+    for path in candidates:
+        try:
+            if os.path.getsize(path) > R7_MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            if "messenger:consume" not in raw:
+                continue
+            if any(flag in raw for flag in R7_WORKER_MIN_FLAGS):
+                continue
+            found_any = True
+            hint(
+                f"{rel}:{lineno}: Worker ohne --limit/--memory-limit/"
+                "--time-limit — Speicher wächst, kein sauberer Neustart"
+            )
+    return found_any
+
+
+def part_r7_messenger(project_path: str) -> None:
+    messenger_path = os.path.join(project_path, "config", "packages", "messenger.yaml")
+    if not os.path.isfile(messenger_path):
+        ok("keine messenger.yaml: Regel R7 entfällt")
+        return
+
+    rel = relative(project_path, messenger_path)
+    before = findings
+
+    if yaml is None:
+        hint("PyYAML fehlt — Regel R7 nicht gemessen")
+        return
+
+    try:
+        with open(messenger_path, encoding="utf-8") as f:
+            data = yaml.load(f, Loader=_R4Loader)
+    except (OSError, yaml.YAMLError):
+        hint(f"{rel}: konnte nicht geparst werden — Regel R7 nicht gemessen")
+        return
+    if not isinstance(data, dict):
+        hint(f"{rel}: kein YAML-Objekt — Regel R7 nicht gemessen")
+        return
+
+    # Worker-Aufrufe sind unabhängig von der Transport-Konfiguration.
+    had_hint = _r7_scan_workers(project_path)
+
+    framework = data.get("framework")
+    messenger = framework.get("messenger") if isinstance(framework, dict) else None
+
+    if isinstance(messenger, dict):
+        transports = messenger.get("transports")
+        if not isinstance(transports, dict):
+            transports = {}
+        failure_transport = messenger.get("failure_transport")
+        if not isinstance(failure_transport, str):
+            failure_transport = None
+
+        # Name, DSN und Rohwert je Transports. Ein Transport kann eine reine
+        # DSN-Kette sein (String) oder ein Dict mit `dsn` und Optionen.
+        transport_list = []
+        for name, value in transports.items():
+            if isinstance(value, str):
+                dsn = value
+            elif isinstance(value, dict):
+                dsn = value.get("dsn")
+            else:
+                dsn = None
+            transport_list.append((name, dsn, value))
+
+        # Befund: asynchrone Transporte sind vorhanden, aber kein failure_transport.
+        has_async = any(
+            dsn is not None and dsn != "sync://" for _n, dsn, _v in transport_list
+        )
+        if has_async and not failure_transport:
+            finding(
+                f"{rel}: messenger ohne failure_transport — endgültig gescheiterte "
+                "Nachrichten verschwinden still"
+            )
+
+        # Hinweis: jeder asynchrone Transport ohne max_retries; der
+        # failure_transport selbst wird nicht als async behandelt.
+        for name, dsn, value in transport_list:
+            if dsn is None or dsn == "sync://":
+                continue
+            if failure_transport is not None and name == failure_transport:
+                continue
+            max_retries = None
+            if isinstance(value, dict):
+                retry = value.get("retry_strategy")
+                if isinstance(retry, dict):
+                    max_retries = retry.get("max_retries")
+            if max_retries is None:
+                had_hint = True
+                hint(
+                    f"{rel}: asynchroner Transport {name} ohne "
+                    "retry_strategy.max_retries — Standard sind 3 Versuche; "
+                    "bewusst festlegen"
+                )
+
+    if findings == before and not had_hint:
+        ok("messenger: failure_transport, retry und Worker-Limits in Ordnung")
+
+
+# --- R8: Cron-Befehle ohne Sperre überlassen sich --------------------
+
+R8_SKIP_PREFIXES = (
+    "messenger:",
+    "cache:",
+    "doctrine:",
+    "lint:",
+)
+
+
+def _is_crontab_line(line: str) -> bool:
+    """Erkennt eine Zeile im Crontab-Format (5 Zeitfelder, dann Befehl)."""
+
+    return re.match(r"^\s*(\S+\s+){5}\S", line) is not None
+
+
+def _find_command_class(project_path: str, command: str):
+    """Datei der Symfony-Befehlsklasse in `src/**` suchen.
+
+    Rückgabe ist der Dateipath, wenn eine Datei in src/ den Befehl entweder über
+    `#[AsCommand(name: '…')]` oder `protected static $defaultName = '…'`
+    deklariert; sonst None.
+    """
+
+    src_dir = os.path.join(project_path, "src")
+    if not os.path.isdir(src_dir):
+        return None
+    patterns = (
+        # #[AsCommand(name: 'app:x')] und die Kurzform #[AsCommand('app:x')]
+        re.compile(
+            r"#\[AsCommand\((?:[^\)]*\bname:\s*)?['\"]"
+            + re.escape(command)
+            + r"['\"]"
+        ),
+        re.compile(
+            r"protected\s+static\s+\$defaultName\s*=\s*['\"]"
+            + re.escape(command)
+            + r"['\"]"
+        ),
+    )
+    for dirpath, _dirnames, filenames in os.walk(src_dir):
+        for name in filenames:
+            if not name.endswith(".php"):
+                continue
+            text = _read_text(os.path.join(dirpath, name))
+            if text is None:
+                continue
+            for pat in patterns:
+                if pat.search(text):
+                    return os.path.join(dirpath, name)
+    return None
+
+
+def _command_uses_lock(text: str) -> bool:
+    """Nutzt eine Command-Klasse LockableTrait oder einen Lock (LockFactory/createLock)."""
+
+    if text is None:
+        return False
+    return (
+        "LockableTrait" in text
+        or "LockFactory" in text
+        or "->createLock(" in text
+    )
+
+
+def part_r8_cron_overlap(project_path: str) -> None:
+    before = findings
+
+    # Crontab-Dateien: `crontab` im Wurzelverzeichnis sowie jede Datei unter
+    # docker/ mit „cron“ im Namen oder mit Zeilen im Crontab-Format.
+    crontab_files = []
+    root_crontab = os.path.join(project_path, "crontab")
+    if os.path.isfile(root_crontab):
+        crontab_files.append(root_crontab)
+
+    docker_dir = os.path.join(project_path, "docker")
+    if os.path.isdir(docker_dir):
+        for dirpath, _dirnames, filenames in os.walk(docker_dir):
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                if "cron" in name:
+                    crontab_files.append(path)
+                    continue
+                text = _read_text(path)
+                if text is not None and _is_crontab_line(text):
+                    crontab_files.append(path)
+
+    if not crontab_files:
+        ok("keine Crontab: Regel R8 entfällt")
+        return
+
+    had_hint = False
+    for path in crontab_files:
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not _is_crontab_line(line):
+                continue
+            m = re.search(r"bin/console\s+(\S+)", line)
+            if not m:
+                continue
+            command = m.group(1)
+            # Symfony-eigene Befehle sind nicht unsere Command-Klassen.
+            if any(command.startswith(prefix) for prefix in R8_SKIP_PREFIXES):
+                continue
+            # flock -n sichert die Zeile gegen Überlappung ab.
+            if "flock" in line:
+                continue
+            class_path = _find_command_class(project_path, command)
+            if class_path is None:
+                hint(
+                    f"{rel}:{lineno}: {command} — Klasse nicht gefunden, "
+                    "Lock nicht prüfbar"
+                )
+                had_hint = True
+                continue
+            if not _command_uses_lock(_read_text(class_path)):
+                hint(
+                    f"{rel}:{lineno}: {command} läuft ohne Lock — ein langer Lauf "
+                    "überlappt mit dem nächsten; LockableTrait oder flock"
+                )
+                had_hint = True
+
+    if findings == before and not had_hint:
+        ok("Crontab-Befehle laufen mit Sperre gegen Überlappung")
+
+
+# --- R9: DATABASE_URL verbindet als root -------------------------------
+
+R9_PROD_ENV_FILES = (
+    ".env.prod",
+    ".env.stage",
+)
+
+R9_LOCAL_ENV_FILES = (
+    ".env",
+    ".env.local",
+)
+
+R9_PROD_COMPOSE = (
+    "docker-compose.prod.yml",
+    "docker-compose.production.yml",
+    "compose.prod.yaml",
+)
+
+
+def _db_user(value: str):
+    """Benutzer aus einer DATABASE_URL (zwischen :// und : bzw @).
+
+    Gibt None zurück, wenn die URL kein Schema mit // enthält. Das Passwort und
+    der Rest der URL werden nicht zurückgegeben.
+    """
+
+    m = re.search(r"://([^:@]+)", value)
+    return m.group(1) if m else None
+
+
+def _unquote(value: str) -> str:
+    """Umgebende Anführungszeichen ablegen."""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def part_r9_db_root(project_path: str) -> None:
+    before = findings
+    had_target = False
+
+    # .env-Dateien: root in Produktionsdateien ist ein Befund, in der lokalen
+    # Entwicklung nur ein Hinweis. `.env.prod.local` wird bewusst nicht geprüft.
+    env_files = []
+    for name in R9_PROD_ENV_FILES:
+        if os.path.isfile(os.path.join(project_path, name)):
+            env_files.append((name, True))
+    for name in R9_LOCAL_ENV_FILES:
+        if os.path.isfile(os.path.join(project_path, name)):
+            env_files.append((name, False))
+
+    for name, in_prod in env_files:
+        path = os.path.join(project_path, name)
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        had_target = True
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+            if not m or m.group(1) != "DATABASE_URL":
+                continue
+            user = _db_user(_unquote(m.group(2).strip()))
+            if user != "root":
+                continue
+            if in_prod:
+                finding(
+                    f"{rel}:{lineno}: DATABASE_URL verbindet als root — die "
+                    "Anwendung braucht keine Admin-Rechte; eigenen Benutzer mit "
+                    "Rechten nur auf die App-Datenbank"
+                )
+            else:
+                hint(
+                    f"{rel}:{lineno}: DATABASE_URL verbindet als root — lokale "
+                    "Entwicklung; in .env.prod/.env.stage eigenen Benutzer verwenden"
+                )
+
+    # Produktions-Compose-Dateien: als Text nach DATABASE_URL-Zeilen durchsuchen.
+    for name in R9_PROD_COMPOSE:
+        path = os.path.join(project_path, name)
+        if not os.path.isfile(path):
+            continue
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        had_target = True
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            if "DATABASE_URL" not in raw:
+                continue
+            m = re.search(r"DATABASE_URL\s*:\s*(.*)$", raw.strip())
+            if not m:
+                continue
+            user = _db_user(_unquote(m.group(1).strip()))
+            if user != "root":
+                continue
+            finding(
+                f"{rel}:{lineno}: DATABASE_URL verbindet als root — die "
+                "Anwendung braucht keine Admin-Rechte; eigenen Benutzer mit "
+                "Rechten nur auf die App-Datenbank"
+            )
+
+    if not had_target:
+        ok("keine Produktions-DATABASE_URL — Regel R9 entfällt")
+        return
+
+    if findings == before:
+        ok("DATABASE_URL verbindet nicht als root")
+
+
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
@@ -825,6 +1400,10 @@ def main() -> int:
     part_r3_timezone(project_path)
     part_r4_trusted_proxies(project_path)
     part_r5_deploy_needs(project_path)
+    part_r6_composer_platform(project_path)
+    part_r7_messenger(project_path)
+    part_r8_cron_overlap(project_path)
+    part_r9_db_root(project_path)
 
     print()
     if findings:

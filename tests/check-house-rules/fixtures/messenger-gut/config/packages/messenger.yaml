@@ -1,0 +1,11 @@
+framework:
+    secret: '%env(APP_SECRET)%'
+    messenger:
+        failure_transport: failed
+        transports:
+            async:
+                dsn: "async: '%env(MESSENGER_TRANSPORT_DSN)'"
+                retry_strategy:
+                    max_retries: 5
+            failed: 'failed://'
+            sync: 'sync://'

@@ -1,0 +1,4 @@
+services:
+    php:
+        image: symfony/php:7.4
+        command: php bin/console messenger:consume async

@@ -23,7 +23,12 @@ und Stufen, die Achse ist die speziellere Regel.
 **Ein Defekt, ein Befund:** Trifft dieselbe Ursache mehrere Achsen (ein
 Mandant aus dem Request ist Achse 3 und 6), wird daraus **ein** Befund. Er
 steht unter der Achse mit der höchsten Severity, die übrigen folgen in Klammern
-(„Achse 6 (+3)“), und er zählt einmal gegen die Schwellen.
+(„Achse 6 (+3)“), und er zählt einmal gegen die Schwellen. Nennen zwei Achsen
+für denselben Defekt unterschiedliche Severities, gilt die **höchste**.
+
+Wo ein Defekt endet, entscheidet die **Behebung**: Was mit einer Änderung
+behoben ist, ist ein Befund. Ein ungesicherter Webhook ohne Signaturprüfung, ohne
+Idempotenz und ohne Payload-Prüfung sind drei Befunde — drei Änderungen.
 
 **Befunde außerhalb der Achsen** sind erlaubt, wenn sie belegt sind — etwa ein
 abgeschalteter CSRF-Schutz oder `flush()` ohne Validierung. Sie stehen unter
@@ -61,8 +66,11 @@ Du brauchst dafür die ursprüngliche Aufgabe. Quellen, in dieser Reihenfolge:
    Widerspruch zwischen Commit-Aussage und Code ist trotzdem ein Befund, meist
    `MEDIUM`.
 
-Findest du keine dieser Quellen, ist die Achse `N/A` — behaupte niemals Deckung
-gegen eine Anforderung, die du dir selbst zusammengereimt hast.
+Sagt der Auftrag ausdrücklich, dass es keine Anforderung gibt, ist die Achse
+`not_applicable`. Findest du schlicht keine Quelle, ist sie `needs_context` —
+behaupte niemals Deckung gegen eine Anforderung, die du dir selbst
+zusammengereimt hast. Eine Konsistenzprüfung gegen die Commit-Nachricht darf
+trotzdem Befunde liefern; der Status bleibt `needs_context`.
 
 Zerlege die Anforderung in einzelne, prüfbare Aussagen und belege jede am Code:
 
@@ -94,6 +102,31 @@ Prüfe jedes im Diff **neu verwendete** Symbol gegen seine Quelle:
 | Route-Name in `generateUrl()` | eine `#[Route(name: ...)]` im Projekt |
 
 Belege heißt: Datei und Zeile nennen können. „Sieht üblich aus" ist kein Beleg.
+
+**Gegen die installierte Version prüfen, nicht gegen das Gedächtnis.** Ein
+Modell kennt eine API oft aus einer anderen Major-Version: `Connection::fetchAll()`
+gibt es seit doctrine/dbal 3 nicht mehr, und `protected static $defaultName` für
+Konsolen-Befehle ist seit symfony/console 6.1 veraltet (dort `#[AsCommand]`).
+Für jede neu verwendete
+Methode oder Option eines Pakets:
+
+1. Version aus `composer.lock` lesen (`packages[].version`).
+2. Die Deklaration in `vendor/<paket>/` suchen — Methode, Option oder
+   Konstante muss dort existieren. `@deprecated` im Docblock ist ein Befund
+   `MEDIUM`, eine fehlende Methode `HIGH`.
+3. Fehlt `vendor/` (nicht installiert), ist **diese Teilprüfung**
+   `needs_context` — nicht „gegeben“. Die übrigen Teile der Achse (Services,
+   ENV, Paketdeklaration) laufen trotzdem, und der Achsenstatus richtet sich
+   nach ihnen.
+4. Ohne `vendor/` darfst du einen dir bekannten Bruch nicht als belegt melden.
+   Er steht als `LOW` mit „Vermutung“ im Titel und dem Auftrag „nach
+   `composer install` erneut prüfen“. Belegt wird er erst am Code in `vendor/`.
+5. Ein `composer.lock` ohne `content-hash` hat nicht Composer erzeugt; die
+   Versionen darin sind nicht belastbar → `needs_context`.
+
+Nenne im belegten Befund die Version und die Fundstelle: „`fetchAll()` existiert
+in doctrine/dbal 3.10.5 nicht — `vendor/doctrine/dbal/src/Connection.php`
+deklariert nur `fetchAllAssociative()` u. a.“.
 
 Eine erfundene ENV-Variable ist besonders heimtückisch — sie stürzt nicht ab,
 sondern nimmt still den Vorgabewert. Das ist mindestens `HIGH`.
@@ -227,6 +260,84 @@ berührt.
    `public` oder mit `s-maxage` ausgeliefert werden. `BLOCKER`.
 
 Beleg ist das konkrete Feld, das nach außen geht, und der Weg dorthin.
+
+## Achse 9 — Integrationen und Wiederholungen
+
+Nur für Code im Diff, der externe Dienste aufruft (HTTP-Clients, SDKs, Mail,
+Zahlung, Versand), Webhooks annimmt oder Messenger-Handler enthält.
+
+| Frage | Befund, wenn … | Severity |
+|---|---|---|
+| Zeitbudget | ein externer Aufruf ohne `timeout`/`max_duration` läuft (auch nicht über die Client-Konfiguration) | `MEDIUM` |
+| Wiederholung | Retries unbegrenzt sind, ohne Backoff laufen oder auch bei 4xx wiederholen | `MEDIUM` |
+| Schreibaufrufe | ein schreibender Aufruf (Zahlung, Bestellung, Mail) nach Timeout blind wiederholt wird, ohne Idempotenzschlüssel oder Abgleich | `HIGH`, bei Geld `BLOCKER` |
+| Antwort | eine externe Antwort ungeprüft weiterverwendet wird (Struktur, Status, Pflichtfelder) | `MEDIUM`, führt es zu falschen Zahlungs- oder Bestandsdaten `HIGH` |
+| Webhook | die Signatur nicht **vor** der fachlichen Verarbeitung geprüft wird | `HIGH` |
+| Doppelte Zustellung | ein Webhook oder eine Nachricht bei zweiter Zustellung doppelt wirkt (zweite Buchung, zweite Mail) | `HIGH` |
+| Nebeneffekte im Handler | ein Messenger-Handler erst schreibt und dann scheitert, sodass der Retry den Nebeneffekt wiederholt | `HIGH` |
+
+Zeitbudget und Wiederholung betreffen **ausgehende** Aufrufe. Für eingehende
+Webhooks gelten Signatur, Payload-Prüfung und doppelte Zustellung. Eine fehlende
+Signatur, über die Fremde fachliche Zustände ändern können (Bestellung auf
+„bezahlt“), ist wie fehlende Autorisierung zu werten: bei Kundendaten oder Geld
+`BLOCKER`.
+
+Beleg ist der konkrete Ablauf: „Webhook `payment.succeeded` bucht in
+`PaymentWebhookController.php:52`, ohne zu prüfen, ob die Zahlungs-ID schon
+verbucht ist — Stripe stellt Webhooks mindestens einmal zu.“
+
+## Achse 10 — Fehlerbehandlung
+
+Für jeden neuen oder geänderten `try`/`catch`, jedes neue `return` im Fehlerpfad
+und jeden neuen Fallback.
+
+1. **Fehler als Erfolg:** Ein Fehlerpfad gibt `true`, `[]`, `null` oder HTTP 200
+   zurück, obwohl die Aktion nicht stattfand. `HIGH`.
+2. **Zu breites Fangen:** `catch (\Throwable)` bzw. `catch (\Exception)` ohne
+   erkennbare Strategie (weder protokolliert noch umgewandelt noch weitergeworfen).
+   `MEDIUM`, im Zahlungs- oder Datenpfad `HIGH`.
+3. **Ursache verloren:** Beim Umverpacken fehlt die ursprüngliche Exception als
+   `previous`. `LOW`.
+4. **Stiller Fallback:** Ein Standardwert ersetzt einen fehlgeschlagenen Wert so,
+   dass Datenverlust oder falsche Ergebnisse unbemerkt bleiben (leerer Preis,
+   Standardmandant, heutige statt gelieferter Datum). `HIGH`.
+5. **Aufräumen:** Ressourcen (Dateien, Locks, temporäre Daten) werden im
+   Fehlerfall nicht freigegeben — kein `finally`. `MEDIUM`. Fehlende
+   Transaktionen und `rollback()` gehören zu Achse 11.
+
+Treffen „Fehler als Erfolg“ und „zu breites Fangen“ dieselbe Stelle, ist das ein
+Befund.
+
+Das Script meldet leere `catch`-Blöcke bereits (`gate-integrity`); hier geht es
+um die, die etwas tun — nur das Falsche.
+
+## Achse 11 — Nebenläufigkeit und Datenintegrität
+
+Nur bei Diffs, die Schreibpfade berühren: Speichern, Zählen, Reservieren,
+Buchen, eindeutige Nummern vergeben.
+
+1. **Eindeutigkeit per SELECT:** „Gibt es das schon? Sonst anlegen“ ohne
+   Unique-Constraint in der Datenbank. Zwei gleichzeitige Requests legen beide an.
+   `HIGH`.
+2. **Lost Update:** Lesen, im Code ändern, zurückschreiben (Lagerbestand,
+   Guthaben, Zähler) ohne Versionierung (`#[ORM\Version]`), Sperre
+   (`PESSIMISTIC_WRITE`) oder atomares `UPDATE … SET x = x - 1`. `HIGH`, bei Geld
+   oder Bestand `BLOCKER`.
+3. **Invarianten nur im Code:** Eine Regel wie „Nummer eindeutig“ oder „nie
+   leer“ steht nur in der Validierung, nicht als Constraint bzw. `NOT NULL`.
+   `MEDIUM`.
+4. **Transaktionsgrenzen:** Zusammengehörige Schreibvorgänge liegen nicht in
+   einer Transaktion, oder in einer Transaktion steckt ein langsamer externer
+   Aufruf. `MEDIUM`.
+5. **Doppelklick:** Ein Formular oder Endpunkt, der bei doppeltem Absenden durch
+   einen Nutzer doppelt wirkt (zweite Bestellung). `MEDIUM`. Doppelte Zustellung
+   durch einen externen Dienst gehört zu Achse 9.
+
+Lost Update und eine Invariante, die nur im Code steht („Bestand nie negativ“),
+sind beim selben Wert ein Befund.
+
+Beleg ist der Ablauf mit zwei gleichzeitigen Requests, nicht die bloße
+Abwesenheit eines Locks.
 
 ## Was du nicht tust
 

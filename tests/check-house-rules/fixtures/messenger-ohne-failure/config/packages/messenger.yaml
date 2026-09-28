@@ -1,0 +1,5 @@
+framework:
+    secret: '%env(APP_SECRET)%'
+    messenger:
+        transports:
+            async: "async: '%env(MESSENGER_TRANSPORT_DSN)'"

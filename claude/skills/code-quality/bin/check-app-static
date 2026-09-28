@@ -11,8 +11,12 @@ Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert conf
     S2 CSRF-Schutz (ASVS 3.5.1)
     S3 Datei-Uploads mit Größen- und Typbegrenzung (ASVS 5.2.1, 5.2.2)
     S4 .dockerignore beim ganzen Projekt-COPY (ASVS 13.4.1)
-    S5 gefährliche Produktions-/Debug-Konfiguration (Session-Fixation,
-       Profiler/Debug-Bundle, Debug-Modus in Produktion)
+     S5 gefährliche Produktions-/Debug-Konfiguration (Session-Fixation,
+        Profiler/Debug-Bundle, Debug-Modus in Produktion)
+      S6 Geldbeträge, die als float gespeichert sind (Rundungsfehler)
+      S7 öffentlich cachebare Antwort in geschütztem Controller (ASVS 5.4)
+ 
+
 
 Hinweise (kein Einfluss auf den Exit):
     H1 Rohes SQL mit eingesetzter Variable (ASVS 1.2.4)
@@ -20,7 +24,12 @@ Hinweise (kein Einfluss auf den Exit):
     H3 Schwache Kryptografie (ASVS 11.4.1, 11.3.1)
     H4 Gefährliche Funktionen (ASVS 1.2.5, 1.3.2)
     H5 Fokus und Bewegung in CSS (WCAG 2.4.7, 2.3.3)
-    H6 TypeScript-Strictness und neue Funktionen im Frontend
+     H6 TypeScript-Strictness und neue Funktionen im Frontend
+      H7 HTTP-Requests ohne Timeout (Symfony http-client, Guzzle-Client,
+         file_get_contents)
+      H8 PHP-Sicherheits-Patzer: @-Fehlerunterdrückung, json_decode ohne
+         JSON_THROW_ON_ERROR, Typcast auf Request-Eingaben
+ 
 
 Exit-Codes:
     0  keine Befunde
@@ -137,6 +146,25 @@ def _call_has(text: str, name: str, needle: str) -> bool:
         if needle in _split_call(text, m.end() - 1):
             return True
     return False
+
+
+def _is_comment_line(line: str) -> bool:
+    s = line.strip()
+    return (
+        s.startswith("//")
+        or s.startswith("#")
+        or s.startswith("/*")
+        or s.startswith("*/")
+        or s.startswith("*")
+    )
+
+
+def _strip_strings(line: str) -> str:
+    # Anführungszeichen-Inhalte entfernen, damit @ und Klammern innerhalb von
+    # Strings (z. B. 'a@b.de' oder "json") die Regex-Erkennung nicht stören.
+    line = re.sub(r"'(?:[^'\\]|\\.)*'", "''", line)
+    line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
+    return line
 
 
 def _walk_skip(root: str, suffixes: tuple) -> list:
@@ -486,6 +514,122 @@ def part_s5_prod_config(project_path: str) -> None:
         ok("Produktions-Konfiguration: kein Debug, Session-Fixation-Schutz aktiv")
 
 
+# --- S6: Geldbetrige als float -----------------------------------------
+
+# Wortteile im Property-Namen, die auf einen Geldbetrag hinden.
+MONEY_PARTS = ("price", "amount", "total", "cost", "fee", "preis",
+               "betrag", "summe", "netto", "brutto", "gebuehr", "gebühr")
+# Namen mit diesen Wortteilen sind keine Geldbeträge (Raten, Gewichte, ...).
+MONEY_EXCLUSIONS = ("rate", "percent", "prozent", "quote", "weight", "gewicht")
+# Doctrine-Type-Marker, die auf float schlieBen lassen.
+FLOAT_ANNOTATION_RE = re.compile(
+    r"type\s*:\s*'float'|type\s*:\s*Types::FLOAT|type\s*=\s*['\"]float['\"]"
+)
+# Property-Deklaration mit Sichtbarkeit und Variablenname.
+PROP_RE = re.compile(
+    r"\b(?:private|protected|public)\b[^;]*\$(\w+)\s*(?::|=|;)"
+)
+
+
+def _is_money_name(name: str) -> bool:
+    low = name.lower()
+    if not any(part in low for part in MONEY_PARTS):
+        return False
+    return not any(excl in low for excl in MONEY_EXCLUSIONS)
+
+
+def part_s6_money_float(project_path: str) -> None:
+    here = []
+    total = 0
+    shown = 0
+    for path in php_files_under_src(project_path):
+        if "Entity" not in os.path.relpath(path, project_path).split(os.sep):
+            continue
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
+            m = PROP_RE.search(line)
+            if not m:
+                continue
+            name = m.group(1)
+            if not _is_money_name(name):
+                continue
+            is_float = re.search(r"\b\??float\b", line) is not None
+            if not is_float:
+                window = lines[max(0, idx - 5):idx]
+                if any(FLOAT_ANNOTATION_RE.search(l) for l in window):
+                    is_float = True
+            if not is_float:
+                continue
+            total += 1
+            if shown < 10:
+                here.append(
+                    f"{rel}:{idx + 1}: Geldbetrag {name} als float — "
+                    f"Rundungsfehler; decimal (string) oder Ganzzahl in Cent verwenden"
+                )
+                shown += 1
+    if here:
+        for msg in here:
+            finding(msg)
+        if total > 10:
+            hint(f"… und {total - 10} weitere Geldbeträge als float")
+    else:
+        ok("Geldbeträge in Entity-Properties: keine als float")
+
+
+# --- S7: Öffentlich cachebare Antwort in geschütztem Controller ----------
+
+# Response-Aufrufe, die eine Antwort öffentlich (shared) markieren und vom
+# Reverse-Proxy auch für nicht-authentifizierte Nutzer zwischengespeichert
+# werden darf. Nur die zeilenbasierten Marker; das #[Cache]-Attribut mit
+# public: true wird separat über die ganze Klammer geprüft.
+CACHE_LINE_RE = re.compile(
+    r"setPublic\(|setSharedMaxAge\(|addCacheControlDirective\(\s*['\"]public['\"]"
+    r"|smaxage:"
+)
+
+
+def part_s7_public_cache(project_path: str) -> None:
+    here = []
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        # Geschützt: Attribut, Aufruf oder Session-Nutzung markieren die Datei.
+        if not (
+            "#[IsGranted(" in text
+            or "denyAccessUnlessGranted(" in text
+            or "->getUser()" in text
+        ):
+            continue
+        rel = relative(project_path, path)
+        flagged = set()
+        lines = text.splitlines()
+        for idx, line in enumerate(lines, 1):
+            if CACHE_LINE_RE.search(line) or "smaxage:" in line:
+                flagged.add(idx)
+        # #[Cache(public: true)] — public kann auf einer anderen Zeile stehen,
+        # daher die ganze Klammer bis zur schließenden Klammer prüfen.
+        for m in re.finditer(r"#\[Cache\s*\(", text):
+            call = _split_call(text, m.end() - 1)
+            if "public: true" in call:
+                flagged.add(text.count("\n", 0, m.start()) + 1)
+        for ln in sorted(flagged):
+            here.append(
+                f"{rel}:{ln}: öffentlich cachebare Antwort in einem "
+                f"geschützten Controller — ein Reverse-Proxy liefert sie an "
+                f"andere Nutzer aus; private/no_store verwenden"
+            )
+    if here:
+        for m in here:
+            finding(m)
+    else:
+        ok("Öffentlich cachebare Antworten: keine in geschützten Controllern")
+
+
 # --- H1: Rohes SQL -----------------------------------------------------
 
 # Alle DBAL-/PDO-Aufrufe, die SQL als ersten Parameter nehmen. Geprüft wird der
@@ -659,6 +803,169 @@ def part_h6_typescript(project_path: str) -> None:
         hint(f"… und {total - 5} weitere")
 
 
+def _composer_has_package(project_path: str, name: str) -> bool:
+    lock = load_top_level_json(os.path.join(project_path, "composer.lock"))
+    if not isinstance(lock, dict):
+        return False
+    for pkg in lock.get("packages", []) or []:
+        if isinstance(pkg, dict) and pkg.get("name") == name:
+            return True
+    return False
+
+
+# --- H7: HTTP-Requests ohne Timeout ------------------------------------
+
+# new Client( und new \GuzzleHttp\Client( — die optionale Gruppe deckt den
+# vollqualifizierten Namen ab, bei aliastem Import bleibt sie leer.
+HTTP_CLIENT_CALL_RE = re.compile(r"new\s+(?:\\GuzzleHttp\\)?Client\s*\(")
+# file_get_contents('http ... bzw. file_get_contents("http ...
+FILE_GET_HTTP_RE = re.compile(r"file_get_contents\(\s*['\"]http")
+
+
+def part_h7_http_timeouts(project_path: str) -> None:
+    here = []
+    total_client = 0
+    shown_client = 0
+    total_fileget = 0
+    shown_fileget = 0
+
+    # Nur bei direkter Abhängigkeit: Indirekt steckt der Client in fast jedem
+    # Symfony-Projekt, ohne dass die App selbst HTTP-Aufrufe macht.
+    composer = load_top_level_json(os.path.join(project_path, "composer.json"))
+    direct = composer.get("require") if isinstance(composer, dict) else None
+    if isinstance(direct, dict) and "symfony/http-client" in direct:
+        fw = load_top_level_yaml(
+            os.path.join(project_path, "config", "packages", "framework.yaml")
+        )
+        framework = fw.get("framework") if isinstance(fw, dict) else None
+        hc = framework.get("http_client") if isinstance(framework, dict) else None
+        default_opts = hc.get("default_options") if isinstance(hc, dict) else None
+        has_default_timeout = (
+            isinstance(default_opts, dict)
+            and ("timeout" in default_opts or "max_duration" in default_opts)
+        )
+        # Auch gar nicht konfiguriert ist „ohne Timeout“ – das ist der häufigste Fall.
+        if not has_default_timeout:
+            here.append(
+                "framework.http_client.default_options ohne timeout/max_duration "
+                "— ein langsamer Dienst hält Requests unbegrenzt fest"
+            )
+        scoped = hc.get("scoped_clients") if isinstance(hc, dict) else None
+        if isinstance(scoped, dict) and not has_default_timeout:
+            for name in scoped:
+                client = scoped.get(name)
+                if not isinstance(client, dict) \
+                        or "timeout" in client or "max_duration" in client:
+                    continue
+                here.append(
+                    f"framework.http_client.scoped_clients.{name} ohne "
+                    "timeout/max_duration — ein langsamer Dienst hält Requests "
+                    "unbegrenzt fest"
+                )
+
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        uses_guzzle = "GuzzleHttp" in text
+        for m in (HTTP_CLIENT_CALL_RE.finditer(text) if uses_guzzle else ()):
+            if "timeout" in _split_call(text, m.end() - 1):
+                continue
+            total_client += 1
+            if shown_client < 10:
+                line = text.count("\n", 0, m.start()) + 1
+                here.append(
+                    f"{rel}:{line}: HTTP-Client ohne timeout — Timeouts "
+                    "konfigurieren (Guzzle 'timeout', Symfony max_duration)"
+                )
+                shown_client += 1
+        for m in FILE_GET_HTTP_RE.finditer(text):
+            total_fileget += 1
+            if shown_fileget < 10:
+                line = text.count("\n", 0, m.start()) + 1
+                here.append(
+                    f"{rel}:{line}: ohne Timeout und Fehlerbehandlung — "
+                    "HTTP-Client verwenden"
+                )
+                shown_fileget += 1
+
+    if here:
+        for m in here:
+            hint(m)
+    else:
+        ok("HTTP-Requests: keine fehlenden Timeouts erkannt")
+
+
+# --- H8: PHP-Sicherheits-Patzer ----------------------------------------
+
+# @ direkt vor einem Funktionsaufruf (@"$?\w+\s*() oder einer Variablen (@$w+).
+# Der Negative-Lookbehind hindert daran, @ nach einem Bezeichner oder
+# Anführungszeichen zu treffen; @var/@param/@return landen ohnehin in
+# Kommentarzeilen.
+AT_SUPPRESS_RE = re.compile(r"(?<![\w'\"])@(?:\$?\w+\s*\(|\$\w+)")
+# json_decode( — der ganze Aufruf wird auf JSON_THROW_ON_ERROR geprüft.
+JSON_DECODE_RE = re.compile(r"json_decode\s*\(")
+# Typcast unmittelbar vor einer Request-Eingabe: (int)/(float)/(bool)/(string)
+# vor $request->get(, $request->query->get( oder $request->request->get(.
+REQUEST_CAST_RE = re.compile(
+    r"\(\s*(?:int|float|bool|string)\s*\)\s*\$request(?:->query|->request)?->get\s*\("
+)
+
+
+def part_h8_php_hints(project_path: str) -> None:
+    suppress_total = 0
+    suppress_shown = 0
+    json_total = 0
+    json_shown = 0
+    cast_total = 0
+    cast_shown = 0
+
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        rel = relative(project_path, path)
+        for i, line in enumerate(text.splitlines(), 1):
+            if _is_comment_line(line):
+                continue
+            code = _strip_strings(line)
+
+            for _ in AT_SUPPRESS_RE.finditer(code):
+                suppress_total += 1
+                if suppress_shown < 5:
+                    hint(f"{rel}:{i}: @-Fehlerunterdrückung versteckt Fehler")
+                    suppress_shown += 1
+
+            for m in JSON_DECODE_RE.finditer(code):
+                call = _split_call(code, m.end() - 1)
+                if "JSON_THROW_ON_ERROR" not in call:
+                    json_total += 1
+                    if json_shown < 5:
+                        hint(
+                            f"{rel}:{i}: json_decode ohne JSON_THROW_ON_ERROR "
+                            f"— Fehler und gültiges null sind nicht "
+                            f"unterscheidbar"
+                        )
+                        json_shown += 1
+
+            for _ in REQUEST_CAST_RE.finditer(code):
+                cast_total += 1
+                if cast_shown < 5:
+                    hint(
+                        f"{rel}:{i}: fehlende Eingabe wird still zu "
+                        f"0/''/false — validieren statt casten"
+                    )
+                    cast_shown += 1
+
+    if suppress_total > 5:
+        hint(f"… und {suppress_total - 5} weitere @-Fehlerunterdrückungen")
+    if json_total > 5:
+        hint(f"… und {json_total - 5} weitere json_decode ohne JSON_THROW_ON_ERROR")
+    if cast_total > 5:
+        hint(f"… und {cast_total - 5} weitere gecastete Eingaben")
+
+
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
@@ -684,6 +991,8 @@ def main() -> int:
         part_s3_uploads(project_path)
         part_s4_dockerignore(project_path)
         part_s5_prod_config(project_path)
+        part_s6_money_float(project_path)
+        part_s7_public_cache(project_path)
 
     part_h1_sql(project_path)
     part_h2_raw_twig(project_path)
@@ -691,6 +1000,8 @@ def main() -> int:
     part_h4_dangerous(project_path)
     part_h5_css_focus(project_path)
     part_h6_typescript(project_path)
+    part_h7_http_timeouts(project_path)
+    part_h8_php_hints(project_path)
 
     print()
     if findings:

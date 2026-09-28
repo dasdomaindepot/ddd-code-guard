@@ -1,0 +1,3 @@
+*/5 * * * * php /var/www/bin/console app:ohne-lock
+0 * * * * php /var/www/bin/console app:mit-lock
+0 3 * * * flock -n /tmp/x php /var/www/bin/console app:ohne-lock

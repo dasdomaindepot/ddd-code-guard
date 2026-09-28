@@ -184,6 +184,53 @@ rm -rf "$GUT2"
 run_script "$TMPROOT/dies-existiert-nicht"
 expect 2
 
+# --- S4: versioniertes vendor/ → genau ein Befund je Verzeichnis --------
+VENDOR="$(new_project)"
+(
+    cd "$VENDOR"
+    git init -q
+    mkdir -p vendor
+    printf '<?php\n' > vendor/a.php
+    printf '<?php\n' > vendor/b.php
+    git add -A
+)
+run_script "$VENDOR"
+expect 1 "vendor/ ist versioniert (2 Dateien)"
+expect 1 "Befund(e)."
+befund_count="$(printf '%s' "$OUT" | grep -c '^BEFUND' || true)"
+if [ "$befund_count" -ne 1 ]; then
+    echo "FEHLER: erwartet ein Befund, aber $befund_count" >&2
+    fail=1
+fi
+rm -rf "$VENDOR"
+
+# --- S4: persönlicher IDE-Zustand mit absolutem Home-Pfad → Hinweis -----
+IDE_DIR="$(new_project)"
+(
+    cd "$IDE_DIR"
+    git init -q
+    mkdir -p .idea
+    printf '<?xml version="1.0"?><project><value path="/home/user/projekt"/></project>\n' > .idea/workspace.xml
+    git add -A
+)
+run_script "$IDE_DIR"
+expect 0 "persönlicher IDE-Zustand"
+expect_not 0 "BEFUND"
+rm -rf "$IDE_DIR"
+
+# --- S4: .DS_Store → Hinweis, kein Befund -------------------------------
+DSSTORE="$(new_project)"
+(
+    cd "$DSSTORE"
+    git init -q
+    printf '' > .DS_Store
+    git add -A
+)
+run_script "$DSSTORE"
+expect 0 "DS_Store"
+expect_not 0 "BEFUND"
+rm -rf "$DSSTORE"
+
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"
     exit 0

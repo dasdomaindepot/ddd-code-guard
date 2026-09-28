@@ -75,7 +75,13 @@ mit `cookie_secure: false` oder `cookie_samesite: none` (ASVS 3.3.1), abgeschalt
 (ASVS 13.4.1 — sonst liegt der ganze Git-Verlauf im Produktions-Image). Außerdem
 gefährliche Produktions-Konfiguration: `session_fixation_strategy: none`, Profiler- oder
 Debug-Bundle für `all`/`prod`, ein Bundle aus `require-dev` mit `'all' => true` (startet mit
-`--no-dev` nicht) und `APP_ENV=dev`/`APP_DEBUG=1` in `.env.prod` oder der Produktionsstufe. Nur Hinweise,
+`--no-dev` nicht) und `APP_ENV=dev`/`APP_DEBUG=1` in `.env.prod` oder der Produktionsstufe.
+Geldbeträge als `float` in Entities, öffentlich cachebare Antworten (`#[Cache(public: true)]`,
+`setSharedMaxAge`) in geschützten Controllern und `csrf_protection => false` in einem
+POST-Formular sind Befunde. Weitere Hinweise: HTTP-Client ohne Timeout (bei direkter
+Abhängigkeit von `symfony/http-client`), Guzzle ohne `timeout`, `file_get_contents('http…')`,
+`@`-Fehlerunterdrückung, `json_decode` ohne `JSON_THROW_ON_ERROR`, Typcasts direkt auf
+Request-Werten. Nur Hinweise,
 weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw` in Twig,
 `md5`/`sha1`/`rand` für Sicherheitszwecke, `eval`/`exec`/`shell_exec` und `unserialize`
 ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
@@ -97,8 +103,13 @@ denn `TZ` wirkt nur auf Cron und Shell. R4: `trusted_proxies` hinter Traefik + n
 mit `real_ip_header`. Befunde sind feste CIDR/`private_ranges` (greifen nie),
 fehlendes `trusted_proxies`, `%env(default::…)%` (liefert `null`) und `x-forwarded-host`/
 `-prefix` in `trusted_headers`. R5: Ein Deploy-Job in `.gitlab-ci.yml` mit `needs`, das
-keinen Prüf-Job enthält, deployt parallel zu Tests, PHPStan und phpcs. Einzeln fahrbar:
-`bin/check-house-rules .`.
+keinen Prüf-Job enthält, deployt parallel zu Tests, PHPStan und phpcs. R6: `composer.lock`
+versioniert, `config.platform.php` bzw. `require.php` passt zur PHP-Version im Dockerfile.
+R7: Messenger mit `failure_transport` (Befund), `retry_strategy.max_retries` und Worker mit
+`--limit`/`--memory-limit`/`--time-limit` (Hinweise). R8: Cron-Befehle ohne Lock (Hinweis;
+auch „Klasse nicht gefunden“ für Befehle, die es im Projekt nicht gibt). R9: `DATABASE_URL`
+als `root` in Produktionsdateien (Befund; lokal Hinweis, Passwort wird nie ausgegeben).
+Einzeln fahrbar: `bin/check-house-rules .`.
 
 **Geheimnisse im Repo** (`secrets`, seit 27.09.2026, **blockierend**): Liest nur die
 versionierten Dateien (`git ls-files`). Befunde sind eine versionierte `.env.local` bzw.
@@ -107,7 +118,9 @@ als vorhandenes Docker-Image `zricethezav/gitleaks`, es wird nichts gezogen). Nu
 sind `generic-api-key` und ein echter `APP_SECRET` in `.env`/`.env.dist`/`.env.prod`
 (ob Produktion ihn überschreibt, sieht der Guard nicht). `.env.test` und `.env.dev` bleiben
 außen vor. Bewusste Ausnahmen trägt das Projekt per Fingerprint in `.gitleaksignore` ein.
-Geheimniswerte werden nie ausgegeben. Einzeln fahrbar: `bin/check-secrets .`.
+Geheimniswerte werden nie ausgegeben. Versionierte Build-Artefakte (`vendor/`,
+`node_modules/`, `var/cache/`, `var/log/`, `public/build/`) sind je Verzeichnis ein Befund,
+persönlicher IDE-Zustand und `.DS_Store` Hinweise. Einzeln fahrbar: `bin/check-secrets .`.
 
 **Drittanbieter** (`third-party`, seit 28.09.2026, **blockierend**): Lädt die lokale
 Instanz beim ersten Aufruf Google Fonts, Google Maps, YouTube ohne

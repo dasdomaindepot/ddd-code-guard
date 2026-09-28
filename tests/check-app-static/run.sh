@@ -81,13 +81,54 @@ run_script "$HERE/fixtures/schlecht"
 expect 1 "cookie_secure" "csrf_protection" "enable_csrf: false" "ohne File-Constraint" "schließt .git nicht aus"
 expect 1 "OhneCsrfType.php:7: Formular schaltet csrf_protection ab"
 
+# --- Geldbetrag als float: genau ein Befund (totalPrice), netto und taxRate nicht
+run_script "$HERE/fixtures/geld-float"
+expect 1 "Geldbetrag totalPrice als float"
+expect_not 1 "netto als float"
+expect_not 1 "taxRate als float"
+expect_not 1 "Geldbetrag netto"
+expect_not 1 "Geldbetrag taxRate"
+
+# --- S7: öffentlich cachebare Antwort in geschütztem Controller. Genau ein
+# Befund zu KontoController.php (setSharedMaxAge); StartController ohne Schutz
+# wird nicht gemeldet.
+run_script "$HERE/fixtures/cache-public"
+expect 1 "KontoController.php" "Reverse-Proxy liefert sie an andere Nutzer aus"
+expect_not 1 "StartController.php"
+befunde=$(printf '%s' "$OUT" | grep -cF "BEFUND   " || true)
+if [ "$befunde" -ne 1 ]; then
+    echo "FEHLER: erwartet genau 1 Befund, aber $befunde" >&2
+    printf '%s\n' "$OUT" >&2
+    fail=1
+fi
+
 # --- Hinweise ändern den Exit nie (kein config/ => kein Symfony => keine Befunde)
 run_script "$HERE/fixtures/hinweise"
 expect 0 "SQL mit eingesetzter Variable" "|raw" "md5" "shell_exec" "prefers-reduced-motion" "strict" "fokus.css:1: outline:none ohne :focus-visible"
 expect 0 "Code.php:2: mt_rand für Sicherheitszwecke"
 expect 0 "MehrzeiligRepo.php:7: SQL mit eingesetzter Variable"
+expect 0 "HTTP-Client ohne timeout"
+expect 0 "ohne Timeout und Fehlerbehandlung"
 expect_not 0 "exec("
 expect_not 0 "UserRepo.php:3: "
+
+# --- H8: PHP-Sicherheits-Patzer in src-PHP (@-Unterdrückung, json_decode,
+# Request-Typcast). Die drei Beispiele melden sich an; @var und @ in Strings
+# (z. B. 'a@b.de') werden nicht als Fehlerunterdrückung gemeldet.
+run_script "$HERE/fixtures/hinweise"
+expect 0 "@-Fehlerunterdrückung versteckt Fehler"
+expect 0 "json_decode ohne JSON_THROW_ON_ERROR"
+expect 0 "validieren statt casten"
+at_hint=$(printf '%s' "$OUT" | grep -cF "@-Fehlerunterdrückung versteckt Fehler" || true)
+if [ "$at_hint" -ne 1 ]; then
+    echo "FEHLER: erwartet genau 1 @-Hinweis, aber $at_hint (z. B. @var oder @ in String)" >&2
+    printf '%s\n' "$OUT" >&2
+    fail=1
+fi
+
+# --- symfony/http-client ohne Timeout in default_options (Hinweis, Exit 0)
+run_script "$HERE/fixtures/http-client"
+expect 0 "default_options ohne timeout"
 
 # --- kein Projekt: nicht messbar
 run_script "$HERE/fixtures/leer"

@@ -1,0 +1,9 @@
+{
+    "packages": [
+        {
+            "name": "symfony/http-client",
+            "version": "6.4.12"
+        }
+    ],
+    "packages-dev": []
+}

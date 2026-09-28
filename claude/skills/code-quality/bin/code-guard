@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.16.0"
+VERSION="1.17.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -436,6 +436,7 @@ CHECK_DEFS=(
 # phpcs mit Exit 16 abbrechen). R2: kein $NAME in .env-Werten. R3: Zeitzone
 # Europe/Berlin in Container und PHP. R4: trusted_proxies hinter nginx mit
 # real_ip_header. R5: Deploy-Jobs, deren needs die Pruef-Jobs ueberspringen.
+# R6: composer.lock/Plattform, R7: Messenger, R8: Cron ohne Lock, R9: DB-root.
 #
 # secrets (seit 1.14.0) blockiert: versionierte .env.local-Dateien und
 # gitleaks-Treffer in den versionierten Dateien (gitleaks lokal oder als bereits
