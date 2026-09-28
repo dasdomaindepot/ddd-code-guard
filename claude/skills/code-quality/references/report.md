@@ -75,6 +75,23 @@ Darüber legen sich die Schwellen aus `guard-policy.yml`:
 Ein hochgestuftes `PASS → WARN` (siehe Statusvokabular in der SKILL.md) macht aus
 GREEN mindestens YELLOW.
 
+**RED schlägt INCOMPLETE.** Fehlen kritische Checks, gibt es aber belegte
+Befunde über der Schwelle, ist das Verdikt RED — ein nachgewiesener Blocker
+wird durch fehlende Messungen nicht unsicherer. Im Kopf steht dann zusätzlich,
+welche kritischen Checks fehlten.
+
+## Projektprofil
+
+Ergebnis von Schritt 0 (siehe `project-profile.md`):
+
+| Wert | Stand | Quelle |
+|---|---|---|
+| mandanten | spalte (`organisation`) | abgeleitet: `src/Entity/Order.php:7` |
+| datenbank | unbekannt | keine `.env` |
+
+Gibt es `.ai/guard-profile.yml` nicht, steht hier zusätzlich ein Vorschlag, der
+mit `bin/guard-profile-draft` erzeugt werden kann.
+
 ## Anforderungsdeckung
 
 Nur wenn eine Anforderung greifbar war (Auftrag, Ticket, Spezifikation). Sonst
@@ -85,6 +102,10 @@ eine Deckung gegen eine selbst ausgedachte Anforderung behaupten.
 ✓ <Teilanforderung>        <Datei:Zeile als Beleg>
 ✗ <Teilanforderung>        kein Beleg gefunden
 ```
+
+Hat es statt einer Anforderung nur die Commit-Nachricht gegeben, heißt dieser
+Abschnitt „Konsistenzprüfung gegen die Commit-Nachricht“ — und im Kopf steht
+`Anforderung: N/A (nur Commit-Nachricht geprüft)`.
 
 ## Gates
 
@@ -105,6 +126,20 @@ Alles mit Severity `BLOCKER` oder `HIGH` nach `guard-policy.yml`.
 ## Sollte verbessert werden
 
 <Gleiche Struktur, IDs Q<n> fortlaufend. Severity MEDIUM oder LOW.>
+
+## Sonstiges
+
+Belegte Befunde außerhalb der Achsen (siehe `semantic-review.md`), mit Severity.
+
+## Bewusste Ausnahmen
+
+Befunde, die auf eine Ausnahme aus `.ai/guard-profile.yml` treffen: Befund,
+Ausnahme, Grund. Sie zählen nicht gegen die Schwellen.
+
+## Vorbestand
+
+Probleme in Code, den der Diff nicht anfasst. Sie zählen nie gegen die
+Schwellen, gehören aber erwähnt.
 
 ## Tooling-Lücken
 

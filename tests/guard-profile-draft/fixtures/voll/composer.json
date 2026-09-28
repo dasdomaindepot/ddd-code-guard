@@ -1,0 +1,9 @@
+{
+    "name": "example/demo",
+    "description": "Fixture für guard-profile-draft",
+    "type": "project",
+    "require": {
+        "php": ">=8.2",
+        "symfony/framework-bundle": "7.2.*"
+    }
+}

@@ -1,0 +1,7 @@
+include:
+  - project: 'ddd/templates'
+    file: '/templates/symfony-docker/deploy.yml'
+
+stages:
+  - build
+  - deploy

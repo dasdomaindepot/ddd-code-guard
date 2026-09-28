@@ -1,0 +1,9 @@
+security:
+  firewalls:
+    dev:
+      security: false
+    main:
+      lazy: true
+      form_login:
+        login_path: login
+        check_path: login

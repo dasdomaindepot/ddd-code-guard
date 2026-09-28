@@ -15,7 +15,8 @@ Auftrag an den Agenten:
    ausführen (mit `--full`, wenn das in `$ARGUMENTS` steht).
 2. `docs/.guard/results.json` auswerten, bei roten Checks die Logs unter
    `docs/.guard/logs/` lesen.
-3. Den Diff gegen die fünf Achsen aus `references/semantic-review.md` prüfen.
+3. Das Projektprofil `.ai/guard-profile.yml` lesen und den Diff gegen die Achsen
+   aus `references/semantic-review.md` prüfen, die das Profil verlangt.
 4. `guard-policy.yml` anwenden und `docs/quality-report.md` schreiben.
 5. Keinen Projektcode ändern.
 

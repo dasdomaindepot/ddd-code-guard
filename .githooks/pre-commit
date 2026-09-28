@@ -39,9 +39,25 @@ fi
 if command -v gitleaks >/dev/null 2>&1; then
     gitleaks git --staged --no-banner --redact >&2 || fail=1
 elif command -v docker >/dev/null 2>&1; then
+    # Unter denselben absoluten Pfaden einhaengen: In einem Worktree ist .git nur
+    # eine Datei mit einem absoluten Verweis auf das gemeinsame Git-Verzeichnis.
+    # Unter /repo eingehaengt fand gitleaks kein Repository, scannte 0 Bytes und
+    # meldete trotzdem Erfolg.
     root="$(git rev-parse --show-toplevel)"
-    docker run --rm -v "$root":/repo -w /repo zricethezav/gitleaks:latest \
-        git --staged --no-banner --redact /repo >&2 || fail=1
+    common="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+    mounts=(-v "$root":"$root")
+    case "$common" in
+        "$root"/*) ;;
+        *) mounts+=(-v "$common":"$common") ;;
+    esac
+    out="$(docker run --rm "${mounts[@]}" -w "$root" zricethezav/gitleaks:latest \
+        git --staged --no-banner --redact "$root" 2>&1)" || fail=1
+    printf '%s\n' "$out" >&2
+    # Findet gitleaks kein Repository, hat es nichts geprueft -- das ist kein Erfolg.
+    if printf '%s' "$out" | grep -q 'not a git repository'; then
+        echo "pre-commit: gitleaks hat kein Git-Repository gefunden -- nichts geprueft." >&2
+        fail=1
+    fi
 else
     echo "pre-commit: gitleaks nicht verfuegbar -- Secret-Scan uebersprungen." >&2
 fi

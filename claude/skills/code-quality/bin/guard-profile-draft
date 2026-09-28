@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""guard-profile-draft — Entwurf einer .ai/guard-profile.yml aus dem Code ableiten.
+
+Aufgerufen vom Code Guard (Check "Projektprofil"), lässt sich aber auch allein
+fahren:
+    guard-profile-draft [projektverzeichnis]      # Standard: aktuelles Verzeichnis
+
+Der Entwurf wird auf stdout ausgegeben und NIE eine Datei geschrieben. Der
+Entwurf ist geprüft, ergänzt und dann als .ai/guard-profile.yml abzulegen.
+
+Nur lesend: es werden Dateien eingelesen, nichts gestartet oder aufgerufen.
+Kommentare in der Ausgabe nennen jeweils die Quelle des abgeleiteten Werts.
+Leere Werte heißen „unbekannt", nicht „trifft nicht zu".
+
+Exit-Codes:
+     0  Entwurf erfolgreich auf stdout
+     2  Nutzungsfehler (mehr als ein Argument, Verzeichnis existiert nicht)
+"""
+
+import glob
+import json
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+if yaml is not None:
+    # Tags wie !php/const oder !tagged_iterator in Symfony-YAML sind für uns
+    # irrelevant; wir ersetzen sie durch None, damit safe_load nicht abstürzt.
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    def _any_tag(_loader, _suffix, _node):
+        return None
+
+    _Loader.add_multi_constructor("!", _any_tag)
+
+
+# --- Hilfsfunktionen ---------------------------------------------------
+
+def _read_text(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def relative(project_path: str, path: str) -> str:
+    return os.path.relpath(path, project_path)
+
+
+def _load_yaml(path: str):
+    """YAML aus einer Datei lesen (Top-Level-Objekt) oder None."""
+
+    if yaml is None:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.load(f, Loader=_Loader)
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _last_env_assignment(text: str, key: str):
+    """Letzte Zuweisung von `key` in .env-Text (optional `export `, ohne
+    Anführungszeichen). None, wenn nicht vorhanden."""
+
+    value = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        if m.group(1) != key:
+            continue
+        val = m.group(2).strip()
+        if len(val) >= 2 and val[0] in ("\"", "'") and val[-1] == val[0]:
+            val = val[1:-1]
+        value = val
+    return value
+
+
+def _composer_package_names(project_path: str):
+    lock_path = os.path.join(project_path, "composer.lock")
+    text = _read_text(lock_path)
+    if text is None:
+        return set()
+    try:
+        lock = json.loads(text)
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(lock, dict):
+        return set()
+    names = set()
+    for section in ("packages", "packages-dev"):
+        pkg_list = lock.get(section)
+        if not isinstance(pkg_list, list):
+            continue
+        for pkg in pkg_list:
+            if not isinstance(pkg, dict):
+                continue
+            name = pkg.get("name")
+            if isinstance(name, str):
+                names.add(name.lower())
+    return names
+
+
+def _entity_files(project_path: str):
+    base = os.path.join(project_path, "src", "Entity")
+    if not os.path.isdir(base):
+        return []
+    return sorted(glob.glob(os.path.join(base, "**", "*.php"), recursive=True))
+
+
+def _list_flow(items) -> str:
+    return "[" + ", ".join(str(x) for x in items) + "]"
+
+
+# --- datenbank ---------------------------------------------------------
+
+def derive_datenbank(project_path: str):
+    """Tupel (wert, quelle). None-Wert = unbekannt."""
+
+    url = None
+    env_file = None
+    # .env.local überschreibt .env – also .env zuerst lesen. Leere Werte zählen
+    # nicht (Symfony-Rezept: DATABASE_URL= in .env, der echte Wert lokal).
+    for name in (".env", ".env.local"):
+        text = _read_text(os.path.join(project_path, name))
+        if text is None:
+            continue
+        value = _last_env_assignment(text, "DATABASE_URL")
+        if value:
+            url = value
+            env_file = name
+    if url is None:
+        return None, "# unbekannt – bitte ausfüllen"
+
+    low = url.lower()
+    m = re.search(r"serverversion=([^?&\s]+)", low)
+    if m and "mariadb" in m.group(1):
+        return "mariadb", f"# DATABASE_URL in {env_file} (serverVersion mariadb)"
+
+    for kw, db in (
+        ("mariadb", "mariadb"),
+        ("postgres", "postgresql"),
+        ("pgsql", "postgresql"),
+        ("mysql", "mysql"),
+        ("sqlite", "sqlite"),
+    ):
+        if kw in low:
+            return db, f"# DATABASE_URL in {env_file}"
+    return None, f"# DATABASE_URL in {env_file} — Schema nicht erkennbar"
+
+
+# --- auth --------------------------------------------------------------
+
+def derive_auth(project_path: str):
+    """Liste der Auth-Arten aus security.yaml; [] = Datei fehlt, None = vorhanden
+    aber keine Anmeldung erkannt."""
+
+    path = os.path.join(project_path, "config", "packages", "security.yaml")
+    data = _load_yaml(path)
+    if data is None:
+        return []  # Datei fehlt -> leer (unbekannt)
+
+    sec = data.get("security") if isinstance(data, dict) else None
+    if not isinstance(sec, dict):
+        return []
+    firewalls = sec.get("firewalls")
+    if not isinstance(firewalls, dict):
+        return []
+
+    results = set()
+    for name, fw in firewalls.items():
+        if name == "dev" and isinstance(fw, dict) and fw.get("security") is False:
+            continue
+        if not isinstance(fw, dict):
+            continue
+        blob = json.dumps({str(k): str(v) for k, v in fw.items()}).lower()
+        if "form_login" in blob or "json_login" in blob:
+            results.add("formular")
+        if "http_basic" in blob:
+            results.add("http_basic")
+        if "access_token" in blob:
+            results.add("api_token")
+        if any(t in blob for t in ("oidc", "oauth", "keycloak", "openid")):
+            results.add("oidc")
+
+    if not results:
+        return None  # security vorhanden, aber keine Anmeldung erkannt
+    return sorted(results)
+
+
+# --- messenger ---------------------------------------------------------
+
+def derive_messenger(project_path: str):
+    """Tupel (liste, quelle). liste = Transports außer sync/failed. marker
+    "fehlt" => Datei nicht vorhanden."""
+
+    path = os.path.join(project_path, "config", "packages", "messenger.yaml")
+    if not os.path.isfile(path):
+        return None, "# kein messenger.yaml"
+    data = _load_yaml(path)
+    if not isinstance(data, dict):
+        return [], "# messenger.yaml nicht geparst"
+    fw = data.get("framework")
+    if not isinstance(fw, dict):
+        return [], "# framework-Fehler im messenger.yaml"
+    msg = fw.get("messenger")
+    if not isinstance(msg, dict):
+        return [], "# kein framework.messenger im messenger.yaml"
+    transports = msg.get("transports")
+    if not isinstance(transports, dict):
+        return [], "# keine transports in messenger.yaml"
+    names = [k for k in transports.keys() if str(k) not in ("sync", "failed")]
+    return sorted(names), "# framework.messenger.transports"
+
+
+# --- geldbetraege ------------------------------------------------------
+
+GELD_RE = re.compile(r"(price|amount|total|betrag|preis|summe|netto|brutto)", re.IGNORECASE)
+IDENT_RE = re.compile(r"\$?[A-Za-z_][A-Za-z0-9_]*")
+
+
+def derive_geldbetraege(project_path: str):
+    """Tupel (ja_bool, quelle). ja_bool None = unbekannt."""
+
+    names = _composer_package_names(project_path)
+    if "moneyphp/money" in names:
+        return True, "# moneyphp/money in composer.lock"
+
+    for path in _entity_files(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            for ident in IDENT_RE.findall(raw):
+                if GELD_RE.search(ident):
+                    return True, f"# {relative(project_path, path)}:{lineno}: {ident}"
+    return None, "# unbekannt – bitte ausfüllen"
+
+
+# --- mandanten ---------------------------------------------------------
+
+TENANT_KEYS = ["tenant", "organisation", "organization", "mandant", "company", "client"]
+
+
+def _kw_file_counts(project_path: str):
+    """(Dateien_mit_Feld, pro_Schlüssel_Dateianzahl)."""
+
+    matched_files = 0
+    kw_files = {k: 0 for k in TENANT_KEYS}
+    for path in _entity_files(project_path):
+        text = _read_text(path)
+        if text is None:
+            continue
+        found = False
+        ident_text = " ".join(IDENT_RE.findall(text))
+        for kw in TENANT_KEYS:
+            if re.search(rf"(?i){kw}", ident_text):
+                kw_files[kw] += 1
+                found = True
+        if found:
+            matched_files += 1
+    return matched_files, kw_files
+
+
+def _first_sqlfilter(project_path: str):
+    src = os.path.join(project_path, "src")
+    if not os.path.isdir(src):
+        return None
+    for dirpath, _dirs, files in os.walk(src):
+        for name in sorted(files):
+            if not name.endswith(".php"):
+                continue
+            text = _read_text(os.path.join(dirpath, name))
+            if text is None:
+                continue
+            if re.search(r"extends\s+\S*SQLFilter", text):
+                return relative(project_path, os.path.join(dirpath, name))
+    return None
+
+
+def derive_mandanten(project_path: str):
+    """Tupel (wert, feld, durchsetzung, quelle). wert None = unbekannt."""
+
+    matched, kw_files = _kw_file_counts(project_path)
+    sqlfilter = _first_sqlfilter(project_path)
+
+    if matched < 3:
+        return None, None, sqlfilter, "# unbekannt – bitte ausfüllen"
+
+    feld = None
+    best = -1
+    for kw in TENANT_KEYS:
+        if kw_files[kw] > best:
+            best = kw_files[kw]
+            feld = kw
+    quelle = f"# {matched} Entities mit {feld} – prüfen"
+    return "spalte", feld, sqlfilter, quelle
+
+
+# --- deployment --------------------------------------------------------
+
+def derive_deployment(data):
+    if data is None:
+        return None, "# unbekannt – bitte ausfüllen"
+    include = data.get("include")
+    blobs = []
+    if isinstance(include, list):
+        for item in include:
+            if isinstance(item, str):
+                blobs.append(item)
+            elif isinstance(item, dict):
+                for val in item.values():
+                    if isinstance(val, str):
+                        blobs.append(val)
+                    elif isinstance(val, list):
+                        # include: - project: …, file: [ '/templates/…' ]
+                        blobs.extend(v for v in val if isinstance(v, str))
+    elif isinstance(include, str):
+        blobs.append(include)
+    text = "\n".join(blobs).lower()
+    for kw, val in (
+        ("symfony-docker", "symfony-docker"),
+        ("managed-server", "managed-server"),
+        ("kubernetes", "kubernetes"),
+    ):
+        if kw in text:
+            return val, "# .gitlab-ci.yml include"
+    return None, "# .gitlab-ci.yml include — kein bekanntes Muster"
+
+
+# --- projekt_art -------------------------------------------------------
+
+def derive_projekt_art(project_path: str, auth):
+    names = _composer_package_names(project_path)
+    if "api-platform/core" in names:
+        return "api", "# api-platform/core in composer.lock"
+    if auth:  # auth ist eine Liste ungleich [] => Anmeldung erkannt
+        return "webanwendung", "# security.yaml Anmeldung"
+    return None, "# unbekannt – bitte ausfüllen"
+
+
+# --- Hauptprogramm -----------------------------------------------------
+
+def build_yaml(project_path: str) -> str:
+    datenbank, datenbank_quelle = derive_datenbank(project_path)
+
+    auth = derive_auth(project_path)
+    auth_is_file_missing = auth == []
+    auth_unknown = auth is None
+
+    messenger, messenger_quelle = derive_messenger(project_path)
+
+    geld, geld_quelle = derive_geldbetraege(project_path)
+
+    mandanten, mandanten_feld, durchsetzung, mandanten_quelle = derive_mandanten(
+        project_path
+    )
+
+    ci_path = os.path.join(project_path, ".gitlab-ci.yml")
+    ci_data = _load_yaml(ci_path) if os.path.isfile(ci_path) else None
+    deployment, deployment_quelle = derive_deployment(ci_data)
+
+    projekt_art, projekt_art_quelle = derive_projekt_art(project_path, auth)
+
+    lines = [
+        "# Entwurf von guard-profile-draft – prüfen, ergänzen, dann als .ai/guard-profile.yml ablegen.",
+        '# Leerte heißen „unbekannt", nicht „trifft nicht zu".',
+        "version: 1",
+        "",
+        f"projekt_art: {_scalar_or_empty(projekt_art)}  {projekt_art_quelle}",
+        "",
+    ]
+
+    if auth_is_file_missing:
+        lines.append(f"auth:  # unbekannt – bitte ausfüllen")
+    elif auth_unknown:
+        lines.append("auth: [keine]  # keine Anmeldung erkannt – prüfen")
+    elif auth:
+        lines.append(f"auth: {_list_flow(auth)}  # security.firewalls")
+    lines.append("")
+
+    lines.append(f"mandanten: {_scalar_or_empty(mandanten)}  {mandanten_quelle}")
+    lines.append("")
+
+    if mandanten_feld:
+        lines.append(f"mandanten_feld: {mandanten_feld}  # häufigster Entity-Schlüssel")
+        lines.append("")
+
+    lines.append(f"mandanten_durchsetzung:  # unbekannt – bitte ausfüllen")
+    lines.append("")
+
+    if messenger is None:
+        lines.append(f"messenger: []  {messenger_quelle}")
+    else:
+        lines.append(f"messenger: {_list_flow(messenger)}  {messenger_quelle}")
+    lines.append("")
+
+    lines.append(f"geldbetraege: {_scalar_or_empty(geld)}  {geld_quelle}")
+    lines.append("")
+
+    lines.append(f"datenbank: {_scalar_or_empty(datenbank)}  {datenbank_quelle}")
+    lines.append("")
+
+    lines.append(f"deployment: {_scalar_or_empty(deployment)}  {deployment_quelle}")
+    lines.append("")
+
+    lines.append("oeffentliche_api:  # unbekannt – bitte ausfüllen")
+    lines.append("")
+    lines.append("externe_dienste:  # unbekannt – bitte ausfüllen")
+    lines.append("")
+    lines.append("kritische_ablaeufe: []  # unbekannt – bitte ausfüllen")
+    lines.append("")
+    lines.append("invarianten: []  # unbekannt – bitte ausfüllen")
+    lines.append("")
+    lines.append("ausnahmen: []  # unbekannt – bitte ausfüllen")
+
+    return "\n".join(lines) + "\n"
+
+
+def _scalar_or_empty(value):
+    if value is None:
+        return ""
+    if value is True:
+        return "ja"
+    if value is False:
+        return "nein"
+    return value
+
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        print("Verwendung: guard-profile-draft [projektverzeichnis]", file=sys.stderr)
+        return 2
+
+    project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    if not os.path.isdir(project_path):
+        print(f"{project_path}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
+    sys.stdout.write(build_yaml(project_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -79,11 +79,13 @@ expect_not 0 "Hinweis"
 # --- schlechter Fall: Befunde bei Symfony-Projekt
 run_script "$HERE/fixtures/schlecht"
 expect 1 "cookie_secure" "csrf_protection" "enable_csrf: false" "ohne File-Constraint" "schließt .git nicht aus"
+expect 1 "OhneCsrfType.php:7: Formular schaltet csrf_protection ab"
 
 # --- Hinweise ändern den Exit nie (kein config/ => kein Symfony => keine Befunde)
 run_script "$HERE/fixtures/hinweise"
 expect 0 "SQL mit eingesetzter Variable" "|raw" "md5" "shell_exec" "prefers-reduced-motion" "strict" "fokus.css:1: outline:none ohne :focus-visible"
 expect 0 "Code.php:2: mt_rand für Sicherheitszwecke"
+expect 0 "MehrzeiligRepo.php:7: SQL mit eingesetzter Variable"
 expect_not 0 "exec("
 expect_not 0 "UserRepo.php:3: "
 

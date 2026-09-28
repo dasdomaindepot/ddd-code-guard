@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.15.0"
+VERSION="1.16.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -255,6 +255,26 @@ if ! boot_stack; then
     exit 4
 fi
 
+# Antwortet unter der lokalen URL wirklich die App? Laeuft ein Projekt nicht,
+# leitet der lokale Reverse-Proxy per Catch-all auf eine Monitor-Seite um, und
+# die antwortet mit 200. Die Web-Checks folgten der Weiterleitung und prueften
+# dann die Monitor-Seite -- mit Befunden, die das Projekt rot machten, obwohl
+# es gar nicht gemessen wurde. Deshalb einmal vorab: Ohne 200 auf demselben Host
+# gelten alle Web-Checks als MISSING, mit dem Grund im Ergebnis.
+WEB_URL_PROBLEM=""
+if [ -n "$WEB_URL" ] && command -v curl >/dev/null 2>&1; then
+    probe="$(curl -skL -o /dev/null --max-time 20 -w '%{http_code} %{url_effective}' "$WEB_URL/" 2>/dev/null)"
+    probe_code="${probe%% *}"
+    probe_url="${probe#* }"
+    want_host="$(printf '%s' "$WEB_URL" | sed -E 's#^[a-z]+://##; s#[/:].*$##')"
+    got_host="$(printf '%s' "$probe_url" | sed -E 's#^[a-z]+://##; s#[/:].*$##')"
+    if [ "$probe_code" != "200" ]; then
+        WEB_URL_PROBLEM="$WEB_URL antwortet nicht mit 200 (HTTP ${probe_code:-000}) — Instanz laeuft nicht"
+    elif [ -n "$got_host" ] && [ "$got_host" != "$want_host" ]; then
+        WEB_URL_PROBLEM="$WEB_URL leitet auf $got_host um (Catch-all?) — Instanz laeuft nicht"
+    fi
+fi
+
 # Ist das Programm im laufenden Container vorhanden? Ein Fehlschlag ist kein
 # Fehler, sondern heisst nur: auf dem Host weitersuchen.
 container_has() {
@@ -370,6 +390,7 @@ CHECK_DEFS=(
   "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
   "favicon|Favicons|frontend|normal|$SCRIPT_DIR/check-favicon $WEB_URL|web-url,bin:python3"
   "web-resources|Links und Bilder|frontend|normal|$SCRIPT_DIR/check-web-resources $WEB_URL|web-url,bin:python3"
+  "third-party|Drittanbieter|legal|normal|$SCRIPT_DIR/check-third-party $WEB_URL|web-url,bin:python3"
   "browser-audit|Browser-Audit|frontend|expensive|$SCRIPT_DIR/check-browser-audit $WEB_URL|web-url,bin:node"
 )
 
@@ -435,6 +456,10 @@ CHECK_DEFS=(
 # migrations (seit 1.15.0) blockiert: nur neue Migrationen -- Entities in
 # Migrationen, NOT NULL ohne DEFAULT, DELETE/UPDATE ohne WHERE.
 #
+# third-party (seit 1.16.0) blockiert: Drittanbieter, die beim ersten Aufruf ohne
+# Einwilligung laden -- Google Fonts immer, Maps/YouTube/Analytics/Pixel ohne
+# erkennbares Consent-Tool. Mit Consent-Tool und bei externen CDNs: Hinweis.
+#
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.
 ADVISORY_CHECKS=" web-hardening legal "
@@ -495,7 +520,7 @@ requirement_met() {
             file:*)   [ -f "${req#file:}" ] || return 1 ;;
             composer) [ -n "$COMPOSER_BIN" ] || return 1 ;;
             npm-audit-bin) [ -n "$NPM_AUDIT_BIN" ] || return 1 ;;
-            web-url)  [ -n "$WEB_URL" ] || return 1 ;;
+            web-url)  [ -n "$WEB_URL" ] && [ -z "$WEB_URL_PROBLEM" ] || return 1 ;;
         esac
     done
     return 0
@@ -512,7 +537,8 @@ requirement_missing_reason() {
             file:*)   [ -f "${req#file:}" ] || { echo "Datei '${req#file:}' fehlt"; return; } ;;
             composer) [ -n "$COMPOSER_BIN" ] || { echo "composer weder im laufenden php-Container noch im PATH"; return; } ;;
             npm-audit-bin) [ -n "$NPM_AUDIT_BIN" ] || { echo "npm weder im laufenden php-Container noch im PATH"; return; } ;;
-            web-url)  [ -n "$WEB_URL" ] || { echo "keine lokale URL (DOMAIN_NAME in .env oder GUARD_WEB_URL)"; return; } ;;
+            web-url)  [ -n "$WEB_URL" ] || { echo "keine lokale URL (DOMAIN_NAME in .env oder GUARD_WEB_URL)"; return; }
+                      [ -z "$WEB_URL_PROBLEM" ] || { echo "$WEB_URL_PROBLEM"; return; } ;;
         esac
     done
     echo "unbekannt"

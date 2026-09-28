@@ -196,6 +196,17 @@ def part_s2_csrf(project_path: str) -> None:
             fl = f.get("form_login")
             if isinstance(fl, dict) and fl.get("enable_csrf") is False:
                 here.append(f"Firewall {name}: form_login mit enable_csrf: false")
+    # Einzelne Formulare können den Schutz in configureOptions() abschalten.
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is None or "csrf_protection" not in text:
+            continue
+        # GET-Formulare (Suche, Filter) verändern nichts und brauchen keinen Token.
+        if re.search(r"""['"]method['"]\s*=>\s*['"]GET['"]""", text, re.IGNORECASE):
+            continue
+        for mm in re.finditer(r"""['"]csrf_protection['"]\s*=>\s*false""", text):
+            line = text.count("\n", 0, mm.start()) + 1
+            here.append(f"{relative(project_path, path)}:{line}: Formular schaltet csrf_protection ab")
     if here:
         for m in here:
             finding(m)
@@ -477,7 +488,15 @@ def part_s5_prod_config(project_path: str) -> None:
 
 # --- H1: Rohes SQL -----------------------------------------------------
 
-SQL_RE = re.compile(r'''(executeQuery|executeStatement|->query|->exec|createNativeQuery)\(.*("[^"]*\$\w|['"]\s*\.\s*\$\w)''')
+# Alle DBAL-/PDO-Aufrufe, die SQL als ersten Parameter nehmen. Geprüft wird der
+# ganze Aufruf bis zur schließenden Klammer, nicht nur die Zeile: Doctrine-Code
+# verteilt SQL fast immer über mehrere Zeilen.
+SQL_CALL_RE = re.compile(
+    r"(?:->|::)(executeQuery|executeStatement|query|exec|prepare|createNativeQuery|createQuery"
+    r"|fetchAllAssociative|fetchAssociative|fetchAllNumeric|fetchNumeric|fetchOne"
+    r"|fetchFirstColumn|fetchAllKeyValue|fetchAllAssociativeIndexed|iterateAssociative)\s*\("
+)
+SQL_TAINT_RE = re.compile(r"""("[^"]*\$\w|['"]\s*\.\s*\$\w|\$\w[\w\->\[\]'"]*\s*\.\s*['"])""")
 
 
 def part_h1_sql(project_path: str) -> None:
@@ -488,12 +507,15 @@ def part_h1_sql(project_path: str) -> None:
         if text is None:
             continue
         rel = relative(project_path, path)
-        for i, line in enumerate(text.splitlines(), 1):
-            if SQL_RE.search(line):
-                total += 1
-                if shown < 10:
-                    hint(f"{rel}:{i}: SQL mit eingesetzter Variable — Parameter verwenden")
-                    shown += 1
+        for m in SQL_CALL_RE.finditer(text):
+            call = _split_call(text, m.end() - 1)
+            if not SQL_TAINT_RE.search(call):
+                continue
+            total += 1
+            if shown < 10:
+                line = text.count("\n", 0, m.start()) + 1
+                hint(f"{rel}:{line}: SQL mit eingesetzter Variable — Parameter verwenden")
+                shown += 1
     if total > 10:
         hint(f"… und {total - 10} weitere")
 

@@ -1,0 +1,6 @@
+include:
+  - project: 'gruppe/devops-ci-templates'
+    ref: main
+    file:
+      - '/templates/shared/base.yml'
+      - '/templates/symfony-docker/deploy.yml'

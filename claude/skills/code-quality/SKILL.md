@@ -109,6 +109,27 @@ sind `generic-api-key` und ein echter `APP_SECRET` in `.env`/`.env.dist`/`.env.p
 außen vor. Bewusste Ausnahmen trägt das Projekt per Fingerprint in `.gitleaksignore` ein.
 Geheimniswerte werden nie ausgegeben. Einzeln fahrbar: `bin/check-secrets .`.
 
+**Drittanbieter** (`third-party`, seit 28.09.2026, **blockierend**): Lädt die lokale
+Instanz beim ersten Aufruf Google Fonts, Google Maps, YouTube ohne
+`youtube-nocookie.com`, Google Analytics/Tag Manager, Meta-Pixel oder Hotjar? Geprüft
+werden `<link>`, `<script>`, `<iframe>`, `<img>`, Inline-Skripte sowie `@import` in
+Stylesheets derselben Herkunft. Google Fonts sind immer ein Befund (selbst hosten); die
+übrigen mit erkennbarem Consent-Tool (Usercentrics, Cookiebot, Borlabs, Klaro …) nur ein
+Hinweis. Ein von einem Consent-Tool blockiertes Element (`type="text/plain"`, `data-src`)
+gilt als nicht geladen. Externe CDNs sind Hinweise. Einzeln fahrbar:
+`bin/check-third-party https://test.de`.
+
+**Läuft die Instanz?** Vor allen Web-Checks fragt der Guard die lokale URL einmal ab.
+Kommt kein 200 zurück oder landet die Anfrage nach Weiterleitungen auf einem anderen
+Host (der lokale Catch-all leitet nicht laufende Projekte auf eine Monitor-Seite um),
+stehen alle Web-Checks auf `MISSING` mit diesem Grund — statt die Monitor-Seite zu
+prüfen und das Projekt fälschlich rot zu melden.
+
+**Projektprofil-Entwurf:** `bin/guard-profile-draft <projekt>` leitet einen Entwurf von
+`.ai/guard-profile.yml` aus dem Code ab (Datenbank, Anmeldung, Messenger, Mandanten-
+Kandidaten, Geldbeträge, Deployment) und gibt ihn mit Quellenangaben aus. Er schreibt
+nichts; die Datei legt ein Mensch nach Prüfung an.
+
 **Abgeschwächte Gates** (`gate-integrity`, seit 27.09.2026, **blockierend**): Vergleicht
 den Stand mit der Vergleichsbasis (`--base`, sonst automatisch). Befunde: gesenktes
 PHPStan-Level, mehr `ignoreErrors`/`excludePaths`, neue Einträge in einer Baseline, mehr
@@ -282,7 +303,7 @@ Objektebene stattfindet, ob eine Migration das Deployment sprengt.
 **Lesen und Suchen:** Nimm die dafür vorgesehenen Werkzeuge, wenn deine Umgebung
 sie hat (`read`/`Read`, `glob`/`Glob`, `grep`/`Grep`, `list`). Hat sie sie nicht,
 ist **lesendes** Suchen über die Shell ausdrücklich erlaubt — `grep -rn`, `rg`,
-`find ... -name` — denn ohne Suche sind die Achsen 2, 3 und 5 nicht prüfbar.
+`find ... -name` — denn ohne Suche sind die meisten semantischen Achsen nicht prüfbar.
 
 Die Grenze verläuft nicht zwischen Werkzeug und Shell, sondern zwischen **lesen
 und verändern**: Kein Schreiben, kein Installieren, kein `--fix`, kein
@@ -305,7 +326,8 @@ Weg steht in `references/frontend.md`.
 3. **Inventar bewerten.** Was steht auf `MISSING`? Das sind die Tooling-Lücken.
    Prüfe ergänzend `composer.json`, `package.json`, die Konfigurationsdateien
    der Werkzeuge und `CLAUDE.md`/`AGENTS.md` auf Regeln ohne Durchsetzung.
-4. **Semantisch prüfen.** Die fünf Achsen aus `references/semantic-review.md`,
+4. **Semantisch prüfen.** Erst das Projektprofil (`.ai/guard-profile.yml`, siehe
+   `references/project-profile.md`), dann die Achsen aus `references/semantic-review.md`,
    ausschließlich auf dem Diff. Die Bereichs-Referenzen unten liest du dabei,
    sobald der jeweilige Bereich dran ist — nicht auf Vorrat.
 5. **Policy anwenden.** `guard-policy.yml` entscheidet über das Verdikt, nicht
@@ -327,7 +349,8 @@ Für die Einordnung der Script-Ergebnisse und die semantische Prüfung:
 4. Architekturregeln → `references/architecture.md`
 5. Frontend → `references/frontend.md`
 6. Tests und Mutation-Testing → `references/tests.md`
-7. Die fünf semantischen Achsen → `references/semantic-review.md`
+7. Die semantischen Achsen → `references/semantic-review.md`
+8. Projektprofil (welche Achsen laufen) → `references/project-profile.md`
 
 Nach einem gewöhnlichen Qualitätsfehler machst du weiter, solange die folgenden
 Prüfungen unabhängig und sicher bleiben. Du hältst nur an bei unerwarteten

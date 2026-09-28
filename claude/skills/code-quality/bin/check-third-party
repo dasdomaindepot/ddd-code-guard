@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""check-third-party — Drittanbieter entdecken, die beim ersten Seitenaufruf ohne Einwilligung geladen
+werden (DSGVO; Abmahnwelle wegen Google Fonts).
+
+Aufgerufen vom Code Guard (Check „third-party"), lässt sich aber auch allein fahren:
+    check-third-party https://projekt.local
+
+Geprüft wird der ausgelieferte HTML-Inhalt einer lokal laufenden Instanz — Was ein serverseitig
+gerenderter Besucher im Quelltext sieht, nicht die clientseitig gerenderte SPA. Geprüft werden die
+Startseite plus alle URLs aus sitemap.xml (Host wird auf die lokale Instanz umgeschrieben). Jede
+Verletzung ist ein Befund oder (bei CDN) ein Hinweis:
+
+    1. <link href> mit rel stylesheet / preconnect / dns-prefetch / preload / icon
+    2. <script src> (außer type ist nicht leer und nicht javascript/module)
+    3. <iframe src> (ein iframe nur mit data-src gilt als nicht geladen)
+    4. <img src>
+    5. @import url(…)/url(…) in <style>-Blöcken und in verlinkten Stylesheets derselben Origin
+    6. Inline-<script> ohne src: Text wird auf die Anbieter-Hosts durchsucht
+
+Überprüft werden folgende Anbieter (Host-Suffix → Label):
+    fonts.googleapis.com / fonts.gstatic.com          → „Google Fonts"   (immer Befund)
+    youtube.com / www.youtube.com im iframe            → „YouTube ohne youtube-nocookie.com"
+    maps.google.com / www.google.com/maps / maps.googleapis.com → „Google Maps"
+    googletagmanager.com / google-analytics.com        → „Google Analytics/Tag Manager"
+    connect.facebook.net                               → „Meta-Pixel"
+    static.hotjar.com / script.hotjar.com              → „Hotjar"
+    cdn.jsdelivr.net / cdnjs.cloudflare.com / unpkg.com → „externes CDN" (immer Hinweis)
+
+Ein Consent-Tool auf der Seite (anhand von Script-src oder Inline-Script erkannt: usercentrics,
+cookiebot, borlabs, klaro, consentmanager, cookieyes, onetrust, ccm19, cookie-consent,
+cookieconsent, tarteaucitron, orestbida) wandelt die Befunde für Google Fonts und CDN aus. Alle
+anderen Anbieter werden mit Consent-Tool zum Hinweis.
+
+Nur lesende GET-Anfragen, ausschließlich gegen die übergebene URL (plus gleiche Origin für
+Verlinkte Stylesheets). HTML wird mit html.parser.HTMLParser geparst, nicht mit Regex.
+
+Exit-Codes:
+     0  keine Befunde (nur Hinweise oder nichts)
+     1  Befunde
+     2  Nutzungsfehler
+    77  nicht messbar (Startseite kein HTTP 200)
+"""
+
+import os
+import re
+import ssl
+import sys
+from html.parser import HTMLParser
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 15
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
+
+MAX_PAGES = 50
+try:
+    MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
+except (TypeError, ValueError):
+    MAX_PAGES = 50
+
+CONSENT_DETAIL = "wird geladen, Consent-Tool erkannt — prüfen, ob es erst nach Einwilligung lädt"
+ADVICE = {
+    "Google Fonts": "Schriften selbst hosten",
+    "externes CDN": "IP-Übermittlung, besser selbst hosten",
+}
+CONSENT_IDENTS = (
+    "usercentrics", "cookiebot", "borlabs", "klaro", "consentmanager", "cookieyes",
+    "onetrust", "ccm19", "cookie-consent", "cookieconsent", "tarteaucitron", "orestbida",
+)
+HOST_LABELS = [
+    ("Google Fonts", "fonts.googleapis.com"),
+    ("Google Fonts", "fonts.gstatic.com"),
+    ("Google Maps", "maps.google.com"),
+    ("Google Maps", "maps.googleapis.com"),
+    ("Google Maps", "www.google.com/maps"),
+    ("Google Analytics/Tag Manager", "googletagmanager.com"),
+    ("Google Analytics/Tag Manager", "google-analytics.com"),
+    ("Meta-Pixel", "connect.facebook.net"),
+    ("Hotjar", "static.hotjar.com"),
+    ("Hotjar", "script.hotjar.com"),
+    ("externes CDN", "cdn.jsdelivr.net"),
+    ("externes CDN", "cdnjs.cloudflare.com"),
+    ("externes CDN", "unpkg.com"),
+]
+
+# Stylesheet-Downloads global dedupen (je Stylesheet einmal über alle Seiten, höchstens 20).
+_FETCHED = set()
+_FETCHED_COUNT = 0
+
+
+class PageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stylesheet_links: list[str] = []
+        self.other_links: list[str] = []
+        self.script_srcs: list[str] = []          # alle script-src (auch für Consent-Erkennung)
+        self.loaded_scripts: list[str] = []        # script-src, die derBrowser wirklich lädt
+        self.inline_bodies: list[str] = []         # Text von Inline-Scripts ohne src
+        self.style_bodies: list[str] = []          # Text von <style>-Blöcken
+        self.iframe_srcs: list[str] = []
+        self.img_srcs: list[str] = []
+        self._inline: list[str] = []
+        self._style: list[str] = []
+        self._in_inline = False
+        self._in_style = False
+
+    @staticmethod
+    def _first(attrs, name):
+        for k, v in attrs:
+            if k == name:
+                return v
+        return None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script":
+            src = self._first(attrs, "src")
+            if src:
+                self.script_srcs.append(src)
+                t = (self._first(attrs, "type") or "").strip().lower()
+                if t == "" or t in ("text/javascript", "module", "application/javascript"):
+                    self.loaded_scripts.append(src)
+            else:
+                self._in_inline = True
+                self._inline = []
+        elif tag == "style":
+            self._in_style = True
+            self._style = []
+        elif tag == "iframe":
+            src = self._first(attrs, "src")
+            if src:
+                self.iframe_srcs.append(src)
+        elif tag == "img":
+            src = self._first(attrs, "src")
+            if src:
+                self.img_srcs.append(src)
+        elif tag == "link":
+            href = self._first(attrs, "href")
+            if not href:
+                return
+            rels = (self._first(attrs, "rel") or "").lower().split()
+            if "stylesheet" in rels:
+                self.stylesheet_links.append(href)
+            elif any(r in rels for r in ("preconnect", "dns-prefetch", "preload", "icon")):
+                self.other_links.append(href)
+
+    def handle_data(self, data) -> None:
+        if self._in_inline:
+            self._inline.append(data)
+        elif self._in_style:
+            self._style.append(data)
+
+    def handle_endtag(self, tag) -> None:
+        if tag == "script" and self._in_inline:
+            self._in_inline = False
+            self.inline_bodies.append("".join(self._inline))
+        elif tag == "style" and self._in_style:
+            self._in_style = False
+            self.style_bodies.append("".join(self._style))
+
+
+def fetch(url: str) -> tuple[int, str, str]:
+    """(Status, Content-Type, Body). Folgt Weiterleitungen."""
+    req = urllib.request.Request(url, headers={"User-Agent": "code-guard-third-party"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
+            ct = r.headers.get("Content-Type", "")
+            return r.status, ct, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, "", ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0, "", ""
+
+
+def host_of(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def provider_for(url: str):
+    """(Label, _) oder None für eine URL. youtube-nocookie.com gilt als in Ordnung."""
+    try:
+        u = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    host = (u.hostname or "").lower()
+    path = u.path or ""
+    if host.endswith("youtube-nocookie.com"):
+        return None
+    if host.endswith(("fonts.googleapis.com", "fonts.gstatic.com")):
+        return "Google Fonts"
+    if (host == "maps.google.com" or host.endswith("maps.googleapis.com")
+            or (host == "www.google.com" and path.startswith("/maps"))):
+        return "Google Maps"
+    if host.endswith("googletagmanager.com") or host.endswith("google-analytics.com"):
+        return "Google Analytics/Tag Manager"
+    if host.endswith("connect.facebook.net"):
+        return "Meta-Pixel"
+    if host.endswith(("static.hotjar.com", "script.hotjar.com")):
+        return "Hotjar"
+    if host.endswith(("cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com")):
+        return "externes CDN"
+    if host.endswith("youtube.com") or host.endswith("www.youtube.com"):
+        return "YouTube ohne youtube-nocookie.com"
+    return None
+
+
+def css_urls(css_text: str) -> list[tuple[str, str]]:
+    """(Art, URL) für @import url(…)/„…" und url(…) in einem Stylesheet, Dedup in Erhalt."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in re.findall(r"""@import\s+(?:url\(\s*|['"])([^'")\s]+)""", css_text, re.I):
+        u = m.strip()
+        if u not in seen:
+            seen.add(u)
+            out.append(("@import", u))
+    for m in re.findall(r"""url\(\s*(['"]?)([^'")\s]+)\1\s*\)""", css_text):
+        u = m[1]
+        if u not in seen:
+            seen.add(u)
+            out.append(("url", u))
+    return out
+
+
+def detect_consent(p: PageParser) -> bool:
+    hay = " ".join(p.script_srcs + p.inline_bodies).lower()
+    return any(ident in hay for ident in CONSENT_IDENTS)
+
+
+def _enqueue_css(abs_url: str, css_display: str, path: str, base: str,
+                 findings: list[dict], status_for) -> None:
+    """Ein gleich-origin Stylesheet holen, nach Anbietern durchsuchen, evtl. folgende laden."""
+    global _FETCHED_COUNT
+    if abs_url in _FETCHED or _FETCHED_COUNT >= 20:
+        return
+    status, _, body = fetch(abs_url)
+    if status != 200:
+        return
+    _FETCHED.add(abs_url)
+    _FETCHED_COUNT += 1
+    origin_scheme, origin_netloc = urllib.parse.urlsplit(base)[0], urllib.parse.urlsplit(base)[1]
+    for desc, url in css_urls(body):
+        label = provider_for(url)
+        if label:
+            findings.append({
+                "label": label, "detail": f"über {css_display}",
+                "src": f"{desc} {host_of(url)}", "advice": ADVICE.get(label),
+                "status": status_for(label),
+            })
+        # Nur @import ist wieder ein Stylesheet; url(...) zeigt auf Schriften und
+        # Bilder, die hier nichts zu suchen haben. Relative Pfade gelten
+        # gegenüber dem Stylesheet, nicht gegenüber der Seite.
+        if desc != "@import":
+            continue
+        next_url = urllib.parse.urljoin(abs_url, url)
+        ns, nl = urllib.parse.urlsplit(next_url)[:2]
+        if ns == origin_scheme and nl == origin_netloc:
+            _enqueue_css(next_url, urllib.parse.urlsplit(next_url).path, path, base,
+                         findings, status_for)
+
+
+class _Consent:
+    __slots__ = ("value",)
+
+
+def analyze_page(p: PageParser, path: str, base: str) -> list[dict]:
+    ctx = _Consent()
+    ctx.value = detect_consent(p)
+
+    def status_for(label: str) -> str:
+        if label == "Google Fonts":
+            return "befund"
+        if label == "externes CDN":
+            return "hint"
+        return "befund" if not ctx.value else "hint"
+
+    def direct(label: str, src: str) -> dict:
+        st = status_for(label)
+        return {"label": label,
+                "detail": "ohne Einwilligung" if st == "befund" else CONSENT_DETAIL,
+                "src": src, "advice": ADVICE.get(label), "status": st}
+
+    findings: list[dict] = []
+    added: set[str] = set()
+
+    def emit(label: str, src: str, detail: str) -> None:
+        if label in added:
+            return
+        added.add(label)
+        st = status_for(label)
+        findings.append({
+            "label": label, "detail": detail, "src": src,
+            "advice": ADVICE.get(label), "status": st,
+        })
+
+    for href in p.other_links:
+        label = provider_for(href)
+        if label:
+            emit(label, f"link {host_of(href)}",
+                 "ohne Einwilligung" if status_for(label) == "befund" else CONSENT_DETAIL)
+
+    for href in p.stylesheet_links:
+        label = provider_for(href)
+        if label:
+            emit(label, f"link {host_of(href)}",
+                 "ohne Einwilligung" if status_for(label) == "befund" else CONSENT_DETAIL)
+        abs_url = urllib.parse.urljoin(base + "/", href)
+        ns, nl = urllib.parse.urlsplit(abs_url)[:2]
+        os_, on_ = urllib.parse.urlsplit(base)[:2]
+        if ns == os_ and nl == on_:
+            _enqueue_css(abs_url, urllib.parse.urlsplit(abs_url).path, path, base,
+                         findings, status_for)
+
+    for src in p.loaded_scripts:
+        label = provider_for(src)
+        if label:
+            emit(label, f"script {host_of(src)}",
+                 "ohne Einwilligung" if status_for(label) == "befund" else CONSENT_DETAIL)
+
+    for src in p.iframe_srcs:
+        label = provider_for(src)
+        if label:
+            emit(label, f"iframe {host_of(src)}",
+                 "ohne Einwilligung" if status_for(label) == "befund" else CONSENT_DETAIL)
+
+    for src in p.img_srcs:
+        label = provider_for(src)
+        if label:
+            emit(label, f"img {host_of(src)}",
+                 "ohne Einwilligung" if status_for(label) == "befund" else CONSENT_DETAIL)
+
+    for body in p.style_bodies:
+        for desc, url in css_urls(body):
+            label = provider_for(url)
+            if label:
+                emit(label, f"{desc} {host_of(url)}", "im <style>-Block")
+
+    for body in p.inline_bodies:
+        bl = body.lower()
+        for label, suffix in HOST_LABELS:
+            if suffix in bl:
+                emit(label, "Inline-Script",
+                     "ohne Einwilligung" if status_for(label) == "befund" else CONSENT_DETAIL)
+                break
+
+    return findings
+
+
+def _body(label: str, detail: str, src: str, advice) -> str:
+    text = f"{label} {detail} ({src})" if detail else f"{label} ({src})"
+    if advice:
+        text += f" — {advice}"
+    return text
+
+
+def print_output(pages: list[tuple[str, list[dict] | None]]) -> int:
+    key_paths: dict[tuple, list[str]] = {}
+    order: list[tuple] = []
+    for path, flist in pages:
+        if not flist:
+            continue
+        seen: set[tuple] = set()
+        for f in flist:
+            k = (f["status"], f["label"], f["detail"], f["src"], f["advice"])
+            if k in seen:
+                continue
+            seen.add(k)
+            if k not in key_paths:
+                key_paths[k] = []
+                order.append(k)
+            key_paths[k].append(path)
+
+    befunds = 0
+    for path, flist in pages:
+        if not flist:
+            print(f"ok       {path}: keine Drittanbieter beim ersten Aufruf")
+            continue
+        seen: set[tuple] = set()
+        for f in flist:
+            k = (f["status"], f["label"], f["detail"], f["src"], f["advice"])
+            if k in seen:
+                continue
+            seen.add(k)
+            pl = key_paths[k]
+            if len(pl) > 3 and pl.index(path) >= 3:
+                continue  # in aggregierter Zeile weiter unten
+            prefix = "BEFUND   " if f["status"] == "befund" else "Hinweis  "
+            if f["status"] == "befund":
+                befunds += 1
+            print(f"{prefix}{path}: {_body(f['label'], f['detail'], f['src'], f['advice'])}")
+
+    for k in order:
+        pl = key_paths[k]
+        if len(pl) > 3:
+            status, label, detail, src, advice = k
+            prefix = "BEFUND   " if status == "befund" else "Hinweis  "
+            if status == "befund":
+                befunds += 1
+            names = ", ".join(pl[:3])
+            print(f"{prefix}{_body(label, detail, src, advice)} auf {names} … und auf {len(pl) - 3} weiteren Seiten")
+
+    return 1 if befunds else 0
+
+
+def collect_paths(base: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    add("/")
+    status, _, sitemap = fetch(base + "/sitemap.xml")
+    if status == 200:
+        for loc in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", sitemap):
+            add(urllib.parse.urlparse(loc.strip()).path or "/")
+    return paths[:MAX_PAGES]
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Verwendung: check-third-party <https://lokale-url>", file=sys.stderr)
+        return 2
+    base = sys.argv[1].rstrip("/")
+
+    status, _, _ = fetch(base + "/")
+    if status != 200:
+        print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
+        return 77
+
+    pages: list[tuple[str, list[dict] | None]] = []
+    for path in collect_paths(base):
+        status, ct, body = fetch(base + path)
+        if status != 200 or "text/html" not in ct.lower():
+            continue
+        p = PageParser()
+        p.feed(body)
+        findings = analyze_page(p, path, base)
+        pages.append((path, findings))
+
+    print()
+    return print_output(pages)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
