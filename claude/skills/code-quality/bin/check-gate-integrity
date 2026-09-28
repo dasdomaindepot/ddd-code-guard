@@ -81,7 +81,28 @@ G8_PATTERNS = (
 results = []
 
 
+
+# Stabile Regel-ID der gerade laufenden Prüfung (#1957). Sie steht vor jeder
+# BEFUND- und Hinweis-Zeile, damit Befunde über Läufe vergleichbar sind und
+# Ausnahmen gezielt auf eine Regel zeigen können.
+CHECK_ID = "gate-integrity"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    # Für tests/rule-coverage.sh: welche Regel hat im Testlauf ausgelöst?
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
 def finding(msg: str) -> None:
+    msg = _rid() + msg
     results.append(("finding", msg))
 
 
@@ -90,6 +111,7 @@ def note(msg: str) -> None:
 
 
 def hint(msg: str) -> None:
+    msg = _rid() + msg
     results.append(("hint", msg))
 
 
@@ -217,6 +239,8 @@ def count_list_block(text: str, key: str) -> int:
 
 
 def part_g1(project: str, base: str, rel: str, before: str, after: str) -> None:
+    global RULE
+    RULE = "G1"
     snap = len(results)
     bl = extract_level(before)
     al = extract_level(after)
@@ -244,6 +268,8 @@ def baseline_total(text: str) -> int:
 
 
 def part_g2(rel: str, before: str, after: str) -> None:
+    global RULE
+    RULE = "G2"
     snap = len(results)
     bt = baseline_total(before)
     at = baseline_total(after)
@@ -265,6 +291,8 @@ def phpcs_excludes(text: str) -> int:
 
 
 def part_g3(rel: str, before: str, after: str) -> None:
+    global RULE
+    RULE = "G3"
     snap = len(results)
     be = phpcs_excludes(before)
     ae = phpcs_excludes(after)
@@ -281,6 +309,8 @@ def part_g3(rel: str, before: str, after: str) -> None:
 # --- G4: PHPUnit --------------------------------------------------------
 
 def part_g4(rel: str, before: str, after: str) -> None:
+    global RULE
+    RULE = "G4"
     snap = len(results)
     be = len(re.findall(r"<exclude\b", before))
     ae = len(re.findall(r"<exclude\b", after))
@@ -293,6 +323,8 @@ def part_g4(rel: str, before: str, after: str) -> None:
 # --- G5: Unterdrückungen im Code ---------------------------------------
 
 def part_g5(rel: str, after: str, added) -> None:
+    global RULE
+    RULE = "G5"
     snap = len(results)
     if not after:
         return
@@ -340,6 +372,8 @@ def parse_ci_jobs(text: str):
 
 
 def part_g6(rel: str, before: str, after: str, added) -> None:
+    global RULE
+    RULE = "G6"
     snap = len(results)
     lines = after.splitlines()
     for ln in added:
@@ -359,6 +393,8 @@ def part_g6(rel: str, before: str, after: str, added) -> None:
 # --- G7: Makefile -------------------------------------------------------
 
 def part_g7(rel: str, after: str, added) -> None:
+    global RULE
+    RULE = "G7"
     snap = len(results)
     if not after:
         return
@@ -392,6 +428,8 @@ G8_EMPTY_CATCH = re.compile(
 
 
 def part_g8(rel: str, after: str, added) -> None:
+    global RULE
+    RULE = "G8"
     snap = len(results)
     if not after:
         return

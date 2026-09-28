@@ -314,8 +314,11 @@ und jeden neuen Fallback.
 Treffen „Fehler als Erfolg“ und „zu breites Fangen“ dieselbe Stelle, ist das ein
 Befund.
 
-Das Script meldet leere `catch`-Blöcke bereits (`gate-integrity`); hier geht es
-um die, die etwas tun — nur das Falsche.
+Das Script meldet leere `catch`-Blöcke (`gate-integrity/G8`) und verschluckte Fehler
+(`error-visibility`: echo/die, Stacktrace an den Client, generischer Fang ohne
+Weiterwerfen/Sentry/Log) bereits. Hier bewertest du die Strategie: Ist die
+Reaktion fachlich richtig? Erreicht ein „protokollierter“ Fehler wirklich jemanden –
+ist der Logger-Kanal an Sentry/Bugsink angeschlossen (E4 im Script)?
 
 ## Achse 11 — Nebenläufigkeit und Datenintegrität
 

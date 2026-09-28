@@ -36,7 +36,28 @@ import urllib.request
 findings = 0
 
 
+
+# Stabile Regel-ID der gerade laufenden Prüfung (#1957). Sie steht vor jeder
+# BEFUND- und Hinweis-Zeile, damit Befunde über Läufe vergleichbar sind und
+# Ausnahmen gezielt auf eine Regel zeigen können.
+CHECK_ID = "versions"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    # Für tests/rule-coverage.sh: welche Regel hat im Testlauf ausgelöst?
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
 def finding(msg: str) -> None:
+    msg = _rid() + msg
     global findings
     findings += 1
     print(f"BEFUND   {msg}")
@@ -47,6 +68,7 @@ def ok(msg: str) -> None:
 
 
 def hint(msg: str) -> None:
+    msg = _rid() + msg
     print(f"Hinweis  {msg}")
 
 
@@ -266,6 +288,8 @@ def _evaluate_product(label: str, version: str, releases, today: datetime.date) 
 
 def run_v1(project_path: str, today: datetime.date):
     """V1 ausführen. Gibt 77 zurück, wenn das Projekt nicht messbar ist."""
+    global RULE
+    RULE = "V1"
 
     php_version = detect_php(project_path)
     sym_version = detect_symfony(project_path)
@@ -366,6 +390,8 @@ def _composer_outdated(project_path: str):
 
 
 def part_v2_outdated(project_path: str) -> None:
+    global RULE
+    RULE = "V2"
     installed, grund = _composer_outdated(project_path)
     if installed is None:
         hint(f"composer outdated nicht gelaufen ({grund})")

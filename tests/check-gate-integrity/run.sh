@@ -171,6 +171,15 @@ writef "$d" "phpcs.xml" "<?xml version=\"1.0\"?>\n<ruleset>\n    <exclude-patter
 run_script "$d" main
 expect 1 "exclude"
 
+# --- G4: mehr <exclude> in der PHPUnit-Konfiguration → Befund; weniger → ok
+d="$(new_repo)"
+writef "$d" "phpunit.xml.dist" "<phpunit><testsuites><testsuite name=\"u\"><directory>tests</directory></testsuite></testsuites></phpunit>\n"
+commit_base "$d" "Basis"
+git -C "$d" checkout -q -b feature
+writef "$d" "phpunit.xml.dist" "<phpunit><testsuites><testsuite name=\"u\"><directory>tests</directory><exclude>tests/Langsam</exclude></testsuite></testsuites></phpunit>\n"
+run_script "$d" main
+expect 1 "[gate-integrity/G4]"
+
 # --- G5: neue @phpstan-ignore-next-line in src/A.php (Zeile 7) ---
 d="$(new_repo)"
 writef "$d" "src/A.php" "<?php\n// l2\n// l3\n// l4\n// l5\n// l6\n"

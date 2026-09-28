@@ -69,7 +69,28 @@ M5_PATTERNS = (
 results = []
 
 
+
+# Stabile Regel-ID der gerade laufenden Prüfung (#1957). Sie steht vor jeder
+# BEFUND- und Hinweis-Zeile, damit Befunde über Läufe vergleichbar sind und
+# Ausnahmen gezielt auf eine Regel zeigen können.
+CHECK_ID = "migrations"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    # Für tests/rule-coverage.sh: welche Regel hat im Testlauf ausgelöst?
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
 def finding(msg: str) -> None:
+    msg = _rid() + msg
     results.append(("finding", msg))
 
 
@@ -78,6 +99,7 @@ def note(msg: str) -> None:
 
 
 def hint(msg: str) -> None:
+    msg = _rid() + msg
     results.append(("hint", msg))
 
 
@@ -153,6 +175,8 @@ def new_migrations(project: str, base: str):
 # --- Einzelprüfungen -----------------------------------------------------
 
 def check_m1(rel: str, text: str) -> None:
+    global RULE
+    RULE = "M1"
     snap = len(results)
     linenos = []
     kinds = set()
@@ -244,6 +268,8 @@ def up_calls(text: str):
 
 
 def check_m2(rel: str, text: str, engine) -> None:
+    global RULE
+    RULE = "M2"
     """ADD … NOT NULL ohne DEFAULT. PostgreSQL bricht auf einer Tabelle mit
     Bestandszeilen ab (Befund); MySQL/MariaDB füllen still einen impliziten
     Wert wie 0 oder '' ein (Hinweis: gewollt?)."""
@@ -278,6 +304,8 @@ def check_m2(rel: str, text: str, engine) -> None:
 
 
 def check_m3(rel: str, text: str) -> None:
+    global RULE
+    RULE = "M3"
     snap = len(results)
     linenos = set()
     for line, sql in up_calls(text):
@@ -317,6 +345,8 @@ def function_body(text: str, pattern: str):
 
 
 def check_m4(rel: str, text: str) -> None:
+    global RULE
+    RULE = "M4"
     snap = len(results)
     down = re.search(r"function\s+down\s*\(", text, re.IGNORECASE)
     up = re.search(r"function\s+up\s*\(", text, re.IGNORECASE)
@@ -341,6 +371,8 @@ def check_m4(rel: str, text: str) -> None:
 
 
 def check_m5(rel: str, text: str) -> None:
+    global RULE
+    RULE = "M5"
     """DELETE/UPDATE ohne WHERE – je SQL-Anweisung, nicht je Zeile: Doctrine-
     Migrationen verteilen eine Anweisung oft über mehrere Zeilen."""
     snap = len(results)

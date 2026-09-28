@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.18.0"
+VERSION="1.19.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -371,6 +371,7 @@ CHECK_DEFS=(
   "secrets|Geheimnisse im Repo|security|normal|$SCRIPT_DIR/check-secrets .|bin:python3,bin:git"
   "symfony-lint|Symfony-Selbstpruefung|static|normal|$SCRIPT_DIR/check-symfony-lint .|file:bin/console,bin:python3"
   "gate-integrity|Abgeschwaechte Gates|process|cheap|$SCRIPT_DIR/check-gate-integrity . \"$BASE_REF\"|bin:python3,bin:git"
+  "error-visibility|Verschluckte Fehler|errors|cheap|$SCRIPT_DIR/check-error-visibility . \"$BASE_REF\"|bin:python3,bin:git"
   "migrations|Neue Migrationen|database|cheap|$SCRIPT_DIR/check-migrations . \"$BASE_REF\"|bin:python3,bin:git"
   "phpcs|Coding-Standard|style|normal|make phpcs|target:phpcs"
   "phpstan|Statische Analyse|static|normal|make phpstan|target:phpstan"
@@ -461,6 +462,11 @@ CHECK_DEFS=(
 # neue ignoreErrors/Baseline-Eintraege, neue Unterdrueckungen im Code, entfernte
 # Pruef-Jobs, "|| true" im Makefile, leere catch-Bloecke. Eine Zeile
 # "Guard-Ausnahme: <Grund>" in einer Commit-Nachricht macht daraus Hinweise.
+#
+# error-visibility (seit 1.19.0) blockiert fuer neuen Code: catch-Bloecke, die
+# Fehler an Sentry/Bugsink vorbei verschlucken (echo/die/var_dump, Stacktrace an
+# den Client, generischer Fang ohne Weiterwerfen/Sentry/Log im Controller).
+# Bestand ist Hinweis. Ausnahme je Stelle: "// guard: erwartet – <Grund>".
 #
 # migrations (seit 1.15.0) blockiert: nur neue Migrationen -- Entities in
 # Migrationen, NOT NULL ohne DEFAULT, DELETE/UPDATE ohne WHERE.

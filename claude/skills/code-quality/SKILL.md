@@ -170,6 +170,18 @@ neuen Code (`TODO`, `example.com`, `not implemented`) sind Hinweise. Eine Zeile
 `Guard-Ausnahme: <Grund>` in einer Commit-Nachricht macht aus allen Befunden Hinweise.
 Einzeln fahrbar: `bin/check-gate-integrity . origin/main`.
 
+**Verschluckte Fehler** (`error-visibility`, seit 28.09.2026, **blockierend für neuen
+Code**): Findet in `src/` catch-Blöcke, deren Fehler nie in Sentry/Bugsink ankommen.
+Befunde bei neuen oder geänderten Zeilen gegenüber der Basis: `echo`/`die`/`exit`/
+`var_dump`/`dump`/`dd` im catch (E1), Stacktrace, Datei oder Zeile in einer Antwort (E2),
+generischer Fang (`\Throwable`, `\Exception`, `\Error`, `\TypeError`) ohne `throw`,
+`captureException` oder `$logger->error()` in `src/Controller/` (E3, anderswo Hinweis).
+Hinweis auf Projektebene (E4): `sentry/sentry-symfony` installiert, aber kein Monolog-
+Handler `type: sentry` – dann erreicht auch `$logger->error()` Sentry nicht. Bestand ist
+immer nur Hinweis. Spezifische Exceptions (`JsonException`, eigene Klassen) sind erwartete
+Steuerung und werden nicht gemeldet. Ausnahme je Stelle: `// guard: erwartet – <Grund>`
+im catch. Einzeln fahrbar: `bin/check-error-visibility . origin/main`.
+
 **Neue Migrationen** (`migrations`, seit 27.09.2026, **blockierend**): Nur Migrationen, die
 gegenüber der Basis neu sind, und nur deren `up()`. Befunde: Entities, Repositories oder
 EntityManager in einer Migration (bricht, sobald sich die Entity ändert), `DELETE`/
@@ -371,6 +383,15 @@ Die Referenzdateien liegen unter
 `~/.claude/skills/code-quality/references/`. Lies sie direkt mit
 ihrem vollen Pfad — eine Glob-Suche greift dort nicht und liefert fälschlich
 null Treffer.
+
+## Regel-IDs
+
+Jede BEFUND- und Hinweis-Zeile der Check-Scripts trägt vorne eine stabile Kennung
+`[<check>/<regel>]` (`[house-rules/R3]`, `[app-static/S6]`, `[auth-policy/A4]`,
+`[gate-integrity/G5]`, `[migrations/M2]`, `[secrets/S3]`, `[versions/V1]`).
+Die Nummern ändern sich nicht, wenn Regeln dazukommen. Das semantische Review
+nutzt `review/A<achse>`. Im Report stehen die Kennungen unter „Quelle“; gleiche
+Ursachen werden zu einem Befund mit allen Kennungen zusammengefasst.
 
 ## Bereichs-Referenzen
 

@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""check-error-visibility — erkennen, ob catch-Blöcke Fehler verschlucken.
+
+Aufgerufen vom Code Guard (Check "error-visibility"), lässt sich aber auch
+allein fahren:
+    check-error-visibility <projektverzeichnis> [<basis-ref>]
+
+Der Check durchsucht `src/**/*.php` nach `catch`-Blöcken, die einen Fehler
+verschlucken, sodass er nie in Sentry/Bugsink ankommt: Fehler werden direkt am
+Skript ausgegeben (`echo`/`die`), Stacktrace-Informationen an den Client
+leckt oder als „generischer" Fang ohne Weiterwerfen/Sentry/Log einfach
+ignoriert. Gefunden werden nur *neue* Veränderungen gegenüber dem merge-base
+von <basis-ref>; die Basis ist der Referenzstand, dagegen wird vergleicht.
+Ohne Basis (oder wenn sie nicht auflösbar ist) gilt alles als Bestand.
+
+Geprüft werden nur Texte; es wird nichts gestartet oder aufgerufen. Alle
+Git-Zugriffe laufen per subprocess gegen das Projektverzeichnis, ein
+misslungener Aufruf zählt als „kein Befund" undürzt nie.
+
+Ausgenommen werden `vendor/`, `node_modules/`, `var/` und `docs/.guard/`.
+
+Regeln:
+     1  `die`/`exit`/`echo`/`print`/`var_dump`/`print_r`/`dd`/`dump` im
+        catch-Body — der Fehler wird direkt ausgegeben/beendet.
+     2  Stacktrace-/Datei-/Zeilenfunktionen (`getTraceAsString`/`getFile`/
+        `getLine`) gemeinsam mit einer Antwort (`Response`/`json`/`JsonResponse`/
+        `addFlash`/`render`) — Informationsabfluss an den Client.
+     3  Generischer Fang (`Throwable`/`Exception`/`Error`/`TypeError`), der
+        nicht weiterwirft, nach Sentry loggt oder monolog-loggt — der Fehler
+        verschwindet.
+     4  (Projektebene) `sentry/sentry-symfony` installiert, aber Monolog
+        leitet nicht an Sentry weiter.
+
+Ausnahme je Stelle: Steht im Body ein Kommentar
+`// guard: erwartet – <Grund>`, wird der catch nicht gemeldet.
+
+Exit-Codes:
+      0  keine Befunde
+      1  Befunde
+      2  Nutzungsfehler (nicht zwei oder drei Argumente, Verzeichnis existiert nicht)
+     77  kein `src/`
+"""
+
+import os
+import re
+import json
+import subprocess
+import sys
+
+EXCLUDED_PREFIXES = ("vendor/", "node_modules/", "var/", "docs/.guard/")
+
+# Generische Fang-Typen (Kurznamen, ohne führenden Backslash).
+GENERIC_TYPES = ("Throwable", "Exception", "Error", "TypeError")
+
+# Befund 1: Ausgabe/Beendigung im catch-Body. (Regex-Objekt oder Suchwort, Label)
+OUTPUT_KEYWORDS = (
+    (re.compile(r"\bdie\b"), "die"),
+    (re.compile(r"\bexit\b"), "exit"),
+    (re.compile(r"\becho\b"), "echo"),
+    (re.compile(r"\bprint\b"), "print"),
+    (re.compile(r"\bvar_dump\("), "var_dump("),
+    (re.compile(r"\bprint_r\("), "print_r("),
+    (re.compile(r"\bdd\("), "dd("),
+    (re.compile(r"\bdump\("), "dump("),
+)
+
+# Befund 2: Stacktrace-Informationen.
+TRACE_FUNCTIONS = ("getTraceAsString(", "getFile(", "getLine(")
+RESPONSE_MARKERS = ("Response", "json(", "JsonResponse", "addFlash(", "render(")
+
+# Befund 3: Logger-Methoden, die (auf einer „logger"-Variablen) Sichtbarkeit
+# erzeugen.
+LOGGER_METHODS = ("error", "critical", "alert", "emergency")
+
+
+# --- Ergebnisse ------------------------------------------------------------
+# (kind, meldung); kind ∈ {"finding", "ok", "hint", "more"}.
+
+output = []
+
+
+# Stabile Regel-ID der gerade gemeldeten Prüfung (#1957), siehe _rid().
+CHECK_ID = "error-visibility"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
+
+def finding(msg: str) -> None:
+    output.append(("finding", _rid() + msg))
+
+
+def note(msg: str) -> None:
+    output.append(("ok", msg))
+
+
+def hint(msg: str) -> None:
+    output.append(("hint", _rid() + msg))
+
+
+def more(msg: str) -> None:
+    output.append(("more", msg))
+
+# Globale Zählhilfe: Wurde überhaupt ein catch-Block analysiert?
+analyzed_catches = 0
+
+
+# --- Git-/Datei-Hilfsfunktionen ------------------------------------------
+
+def git_run(project: str, args) -> str:
+    """Git-Aufruf mit cwd=project, stdout zurück; jeder Fehler → leer."""
+    try:
+        proc = subprocess.run(
+            ["git"] + list(args),
+            cwd=project,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout
+
+
+def read_file(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def is_excluded(path: str) -> bool:
+    return any(path.startswith(pref) for pref in EXCLUDED_PREFIXES)
+
+
+def added_from_diff(project: str, base: str, path: str):
+    """Zeilennummern (1-gezählt, nachher) der hinzugefügten Zeilen eines Diffs."""
+    out = git_run(project, ["diff", "-U0", base, "--", path])
+    added = []
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("@@"):
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            cur = int(m.group(1)) if m else None
+            continue
+        if cur is None:
+            continue
+        if line.startswith("++") or line.startswith("--"):
+            continue
+        if line.startswith("+"):
+            added.append(cur)
+            cur += 1
+    return added
+
+
+def changed_files(project: str, base: str):
+    """Relative Pfade der `src/*.php`-Änderungen: Diff gegen base + unversioniert.
+
+    Tupel (pfad, vorher_text, nachher_text, zeilen_hinzugefgt).
+    """
+    diff_names = git_run(project, ["diff", "--name-only", base])
+    unversioned = git_run(project, ["ls-files", "--others", "--exclude-standard"])
+
+    entries = {}
+    for line in diff_names.splitlines():
+        p = line.strip()
+        if p and not is_excluded(p):
+            entries[p] = False
+    for line in unversioned.splitlines():
+        p = line.strip()
+        if p and not is_excluded(p):
+            entries[p] = True
+
+    items = []
+    for path, unv in entries.items():
+        if not (path.startswith("src/") and path.endswith(".php")):
+            continue
+        before = ""
+        if not unv:
+            before = git_run(project, ["show", f"{base}:{path}"])
+        after = read_file(os.path.join(project, path))
+        after = after if after is not None else ""
+        if unv:
+            added = list(range(1, len(after.splitlines()) + 1))
+        else:
+            added = added_from_diff(project, base, path)
+        items.append((path, before, after, added))
+    items.sort()
+    return items
+
+
+def all_src_files(project: str):
+    """Alle `src/**/*.php`-Dateien als Tupel (pfad, vorher, nachher, alle_zeilen)."""
+    srcdir = os.path.join(project, "src")
+    items = []
+    if not os.path.isdir(srcdir):
+        return items
+    for root, _dirs, files in os.walk(srcdir):
+        for fn in files:
+            if not fn.endswith(".php"):
+                continue
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, project)
+            after = read_file(full)
+            after = after if after is not None else ""
+            added = list(range(1, len(after.splitlines()) + 1)) if after else []
+            items.append((rel, "", after, added))
+    items.sort()
+    return items
+
+
+# --- PHP-Maskierung --------------------------------------------------------
+
+def mask_php(text: str) -> str:
+    """Kommentare und String-Inhalte durch Leerzeichen ersetzen, Zeilen bleiben.
+
+    Zeilenumbrüche werden behalten, damit Zeilennummern unverändert bleiben.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        # Zeilenkommentar //
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = i
+            while j < n and text[j] != "\n":
+                out.append(" ")
+                j += 1
+            i = j
+            continue
+        # Blockkommentar /* ... */
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = i + 2
+            while j < n:
+                if text[j] == "*" and j + 1 < n and text[j + 1] == "/":
+                    break
+                out.append(" " if text[j] != "\n" else "\n")
+                j += 1
+            if j < n:
+                out.append(" ")  # das *
+                out.append(" ")  # das /
+                i = j + 2
+            else:
+                i = j
+            continue
+        # Einfach-String
+        if c == "'":
+            j = i + 1
+            closed = False
+            while j < n:
+                if text[j] == "\\":
+                    out.append(" ")
+                    out.append(" ")
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    out.append(" ")  # schließendes
+                    out.append(" ")  # öffnendes
+                    i = j + 1
+                    closed = True
+                    break
+                out.append(" " if text[j] != "\n" else "\n")
+                j += 1
+            if not closed:
+                i = j
+            continue
+        # Doppel-String
+        if c == '"':
+            j = i + 1
+            closed = False
+            while j < n:
+                if text[j] == "\\":
+                    out.append(" ")
+                    out.append(" ")
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    out.append(" ")
+                    out.append(" ")
+                    i = j + 1
+                    closed = True
+                    break
+                out.append(" " if text[j] != "\n" else "\n")
+                j += 1
+            if not closed:
+                i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def iter_catches(masked: str, raw: str):
+    """Alle `catch`-Blöcke zurückgeben; jeder Body wird eigenständig per
+    Klammerzählung bestimmt (verschachtelte try/catch und Closures korrekt).
+
+    Tupel (typen_str, catch_zeile, body_maskiert, body_raw).
+    """
+    out = []
+    for m in re.finditer(r"\bcatch\s*\(", masked):
+        paren_open = m.end() - 1
+        depth = 0
+        i = paren_open
+        closed_paren = False
+        while i < len(masked):
+            ch = masked[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    closed_paren = True
+                    i += 1
+                    break
+            i += 1
+        if not closed_paren:
+            continue
+        types_str = masked[paren_open + 1 : i - 1]
+        brace = masked.find("{", i)
+        if brace == -1:
+            continue
+        depth = 0
+        j = brace
+        closed_brace = False
+        while j < len(masked):
+            ch = masked[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    closed_brace = True
+                    j += 1
+                    break
+            j += 1
+        if not closed_brace:
+            continue
+        body_open = brace
+        body_end = j - 1
+        catch_line = masked.count("\n", 0, m.start()) + 1
+        out.append((types_str, catch_line,
+                    masked[body_open + 1:body_end],
+                    raw[body_open + 1:body_end]))
+    return out
+
+
+def parse_types(types_str: str):
+    """Typen zerlegen (by `|` getrennt, führenden Backslash ignorieren,
+    Kurzname = letzter Namensteil). Der optionale variable Name am Ende
+    wird abgeschnitten (catch mit Throwable-Variable)."""
+    s = re.sub(r"\s*\$\w+\s*$", "", types_str.strip())
+    types = []
+    for part in s.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        short = part.rsplit("\\", 1)[-1]
+        types.append(short)
+    return types
+
+
+def types_display(types_str: str) -> str:
+    """Fang-Typen-Anzeige ohne variable Endung."""
+    return re.sub(r"\s*\$\w+\s*$", "", types_str.strip())
+
+
+def is_generic(types) -> bool:
+    return any(t in GENERIC_TYPES for t in types)
+
+
+# --- Analyse-Hilfen --------------------------------------------------------
+
+def has_output_keyword(body: str) -> bool:
+    for pat, _label in OUTPUT_KEYWORDS:
+        if isinstance(pat, str):
+            if pat in body:
+                return True
+        elif pat.search(body):
+            return True
+    return False
+
+
+def has_trace_and_response(body: str) -> bool:
+    has_trace = any(fn in body for fn in TRACE_FUNCTIONS)
+    has_resp = any(mk in body for mk in RESPONSE_MARKERS)
+    return has_trace and has_resp
+
+
+def has_logger_error(body: str) -> bool:
+    """`->error(`/`->critical(`/`->alert(`/`->emergency(` auf einer Variablen,
+    deren Name „logger“ enthält (case-insensitiv)."""
+    for meth in LOGGER_METHODS:
+        for m in re.finditer(r"->" + re.escape(meth) + r"\s*\(", body):
+            prefix = body[:m.start()]
+            vm = re.search(r"([A-Za-z_$][\w$]*)\s*$", prefix)
+            if vm and "logger" in vm.group(1).lower():
+                return True
+    return False
+
+
+def is_visible_generic(body: str) -> bool:
+    """Ein generischer catch ist „sichtbar“, wenn er weiterwirft, nach Sentry
+    loggt oder über einen Logger (name contains „logger“) loggt."""
+    if re.search(r"\bthrow\b", body):
+        return True
+    if "captureException(" in body:
+        return True
+    if has_logger_error(body):
+        return True
+    return False
+
+
+def guard_excepted(body_raw: str) -> bool:
+    """Body hat den Kommentar `// guard: erwartet – <Grund>` (auch `-` statt `–`)."""
+    return re.search(r"guard:\s*erwartet[ \t]*[–-]", body_raw) is not None
+
+
+# --- Projekt-Konfiguration -------------------------------------------------
+
+def has_sentry_handler(project: str) -> bool:
+    """Irgendeine YAML-Datei unter config/packages/ mit `type: sentry`
+    außerhalb von Kommentarzeilen."""
+    config_dir = os.path.join(project, "config", "packages")
+    if not os.path.isdir(config_dir):
+        return False
+    for root, _dirs, files in os.walk(config_dir):
+        for fn in files:
+            if not (fn.endswith(".yml") or fn.endswith(".yaml")):
+                continue
+            text = read_file(os.path.join(root, fn))
+            if text is None:
+                continue
+            for line in text.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                if re.search(r"type:\s*sentry", line):
+                    return True
+    return False
+
+
+def composer_has_sentry(project: str) -> bool:
+    """Ist `sentry/sentry-symfony` in composer.lock (packages) deklariert?"""
+    text = read_file(os.path.join(project, "composer.lock"))
+    if text is None:
+        return False
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in ("packages", "dev-packages"):
+        block = data.get(key)
+        if not isinstance(block, list):
+            continue
+        for pkg in block:
+            if isinstance(pkg, dict) and pkg.get("name") == "sentry/sentry-symfony":
+                return True
+    return False
+
+
+# --- Hauptlogik ------------------------------------------------------------
+
+def analyze(project: str, base):
+    """Alle `src/*.php`-Änderungen analysieren; Befunde/Anmerkungen in output."""
+    has_sentry_handler_flag = has_sentry_handler(project)
+    if base is None:
+        items = all_src_files(project)
+    else:
+        items = changed_files(project, base)
+
+    project_has_sentry_composer = composer_has_sentry(project)
+    project_logger_catch = False
+
+    for path, _before, after, added in items:
+        if not after:
+            continue
+        added_set = set(added)
+        masked = mask_php(after)
+        catches = iter_catches(masked, after)
+        if not catches:
+            continue
+        global analyzed_catches
+        analyzed_catches += 1
+
+        events = []  # (befundart, is_finding, is_bestand, zeile, meldung)
+        in_controller = path.startswith("src/Controller/")
+        for types_str, line, body_masked, body_raw in catches:
+            if guard_excepted(body_raw):
+                continue
+            new = (base is not None) and (line in added_set)
+            is_bestand = not new
+            types = parse_types(types_str)
+            generic = is_generic(types)
+            f1 = has_output_keyword(body_masked)
+            f2 = has_trace_and_response(body_masked)
+            f3 = generic and not f1 and not f2 and not is_visible_generic(body_masked)
+
+            if f1:
+                events.append((1, new, is_bestand, line,
+                    f"{path}:{line}: catch gibt den Fehler direkt aus bzw. "
+                    f"beendet das Skript (echo/die) — Fehler erreicht Sentry nicht"))
+            if f2:
+                events.append((2, new, is_bestand, line,
+                    f"{path}:{line}: catch leckt Stacktrace/Datei/Zeile in die "
+                    f"Antwort (Informationsabfluss)"))
+            if f3:
+                # Finding 3 ist nur in src/Controller/ ein Befund, sonst Hinweis.
+                is_finding = new and in_controller
+                events.append((
+                    3, is_finding, is_bestand, line,
+                    f"{path}:{line}: generischer catch ({types_display(types_str)}) "
+                    f"ohne Weiterwerfen/Sentry/Log — der Fehler verschwindet"))
+            if has_logger_error(body_masked):
+                project_logger_catch = True
+
+        render_events(path, events)
+
+    if (project_has_sentry_composer
+            and not has_sentry_handler_flag
+            and project_logger_catch):
+        global RULE
+        RULE = "E4"
+        hint(
+            "sentry/sentry-symfony ist installiert, aber Monolog leitet nicht "
+            "an Sentry weiter — $logger->error() in catch-Blöcken erreicht "
+            "Sentry nicht (monolog.handlers.sentry mit type: sentry ergänzen)")
+
+
+def render_events(path: str, events):
+    """Befunde/Anmerkungen einer Datei sammeln; je Datei und Befundart
+    höchstens 5 Zeilen, sonst „… und N weitere"."""
+    by_type = {}
+    for ev in events:
+        by_type.setdefault(ev[0], []).append(ev)
+    for _t in sorted(by_type):
+        evs = sorted(by_type[_t], key=lambda e: e[3])
+        shown = evs[:5]
+        rest = len(evs) - len(shown)
+        global RULE
+        RULE = f"E{_t}"
+        for _typ, is_finding, is_bestand, _line, msg in shown:
+            if is_finding:
+                finding(msg)
+            else:
+                hint(msg + (" (Bestand)" if is_bestand else ""))
+        if rest:
+            more(f"… und {rest} weitere")
+
+
+def main() -> int:
+    if not (len(sys.argv) == 2 or len(sys.argv) == 3):
+        print(
+            "Verwendung: check-error-visibility <projektverzeichnis> [<basis-ref>]",
+            file=sys.stderr,
+        )
+        return 2
+
+    project = os.path.abspath(sys.argv[1])
+    basis = sys.argv[2] if len(sys.argv) == 3 else None
+
+    if not os.path.isdir(project):
+        print(f"{project}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    # basis-ref auflösen; nicht auflösbar → alles Bestand (base = None).
+    base = None
+    if basis:
+        verify = subprocess.run(
+            ["git", "rev-parse", "--verify", basis],
+            cwd=project,
+            capture_output=True,
+            text=True,
+        )
+        if verify.returncode == 0:
+            base_out = git_run(project, ["merge-base", basis, "HEAD"]).strip()
+            if base_out:
+                base = base_out
+
+    if not os.path.isdir(os.path.join(project, "src")):
+        print(f"{project}: kein src/ — nicht messbar", file=sys.stderr)
+        return 77
+
+    analyze(project, base)
+
+    nfind = sum(1 for t, _ in output if t == "finding")
+
+    for typ, msg in output:
+        if typ == "finding":
+            print(f"BEFUND   {msg}")
+        elif typ == "ok":
+            print(f"ok       {msg}")
+        elif typ == "hint":
+            print(f"Hinweis  {msg}")
+        else:
+            print(msg)
+    print()
+    if nfind:
+        print(f"{nfind} Befund(e).")
+        return 1
+    if analyzed_catches and not any(t == "hint" for t, _ in output):
+        print("ok       catch-Blöcke: keine verschluckten Fehler")
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

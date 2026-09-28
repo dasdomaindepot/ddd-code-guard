@@ -67,6 +67,10 @@ ausnahmen:
   - achse: injection
     pfad: src/Command/Migration/
     grund: Einmalige Import-Befehle, nur per CLI, Eingaben aus eigener Datei.
+  # Statt einer Achse kann eine Ausnahme auf eine Regel-ID zeigen:
+  - regel: app-static/H8
+    pfad: src/Legacy/
+    grund: Altcode, wird mit dem Umbau Q1/2027 ersetzt.
 ```
 
 Alle Schlüssel sind optional. Ein Projekt ohne Profil ist erlaubt — dann ist
@@ -107,6 +111,6 @@ Mandantentrennung aus `src/Entity/…` abgeleitet“.
 
 ## Ausnahmen
 
-Eine Ausnahme gilt nur mit Achse, Pfad **und** Grund. Trifft ein Befund auf eine
+Eine Ausnahme gilt nur mit Achse bzw. Regel-ID, Pfad **und** Grund. Trifft ein Befund auf eine
 Ausnahme, wird er im Report unter „Bewusste Ausnahmen“ mit dem Grund geführt,
 nicht verschwiegen und nicht gezählt. Eine Ausnahme ohne Grund ist ungültig.

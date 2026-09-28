@@ -86,6 +86,15 @@ Befunde über der Schwelle, ist das Verdikt RED — ein nachgewiesener Blocker
 wird durch fehlende Messungen nicht unsicherer. Im Kopf steht dann zusätzlich,
 welche kritischen Checks fehlten.
 
+## Regel-IDs
+
+Jede BEFUND- und Hinweis-Zeile des Scripts beginnt mit einer stabilen Kennung
+`[<check>/<regel>]`, etwa `[house-rules/R3]` oder `[app-static/S6]`. Die
+Befunde des semantischen Reviews tragen `review/A<achse>`, etwa `review/A7`.
+Übernimm die Kennung in „Quelle“. Hat derselbe Defekt am selben Pfad mehrere
+Kennungen (Script und Review, oder zwei Script-Regeln), ist es **ein** Befund
+mit allen Kennungen – gezählt wird einmal.
+
 ## Projektprofil
 
 Ergebnis von Schritt 0 (siehe `project-profile.md`):
@@ -157,7 +166,7 @@ Alles mit Severity `BLOCKER` oder `HIGH` nach `guard-policy.yml`.
 ### Q1 — <Titel>
 - **Severity:** BLOCKER | HIGH
 - **Datei:** `pfad/zur/datei.php:42`
-- **Quelle:** phpstan (Level 8) | Achse 2 (erfundene Symbole) | …
+- **Quelle:** Regel-ID(s), z. B. `house-rules/R3`, `app-static/S6`, `review/A7` | phpstan (Level 8) | …
 - **Befund:** <ein Satz>
 - **Beleg:** `docs/.guard/logs/phpstan.log` oder die Codestelle, die es beweist
 - **Auftrag:** <was zu tun ist, eng genug für einen Coding-Agenten>

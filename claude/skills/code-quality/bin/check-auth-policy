@@ -81,7 +81,28 @@ _Loader.add_multi_constructor("!", _any_tag)
 findings = 0
 
 
+
+# Stabile Regel-ID der gerade laufenden Prüfung (#1957). Sie steht vor jeder
+# BEFUND- und Hinweis-Zeile, damit Befunde über Läufe vergleichbar sind und
+# Ausnahmen gezielt auf eine Regel zeigen können.
+CHECK_ID = "auth-policy"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    # Für tests/rule-coverage.sh: welche Regel hat im Testlauf ausgelöst?
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
 def finding(msg: str) -> None:
+    msg = _rid() + msg
     global findings
     findings += 1
     print(f"BEFUND   {msg}")
@@ -92,6 +113,7 @@ def ok(msg: str) -> None:
 
 
 def hint(msg: str) -> None:
+    msg = _rid() + msg
     print(f"Hinweis  {msg}")
 
 
@@ -234,6 +256,8 @@ def _throttling_for_password_firewall(name: str, fw: dict, project_path: str):
 
 
 def part1_firewalls(sec: dict, project_path: str) -> None:
+    global RULE
+    RULE = "A1"
     firewalls = sec.get("firewalls") if isinstance(sec, dict) else None
     if not isinstance(firewalls, dict) or not firewalls:
         ok("keine Anmeldung mit Passwort gefunden")
@@ -362,6 +386,8 @@ def _belongs_to_other_field(lines: list[str], idx: int) -> bool:
 
 
 def part2_password_rules(sec: dict, project_path: str) -> None:
+    global RULE
+    RULE = "A2"
     files = php_files_under_src(project_path)
 
     hash_file = None
@@ -483,6 +509,8 @@ CURRENT_PW_RE = re.compile(r"UserPassword\b|isPasswordValid\(|current_?password|
 
 
 def part2b_current_password(project_path: str, files: list[str], file_text: dict[str, str]) -> None:
+    global RULE
+    RULE = "A2b"
     """Passwort ändern verlangt das bisherige Passwort (ASVS 6.2.3) — nur Hinweis.
 
     Kandidaten sind Dateien wie ChangePasswordType.php oder NewPWFormType.php. Wird eine
@@ -532,6 +560,8 @@ def _has_memory_provider_with_users(sec: dict) -> bool:
 
 
 def part3_password_hashers(sec: dict) -> None:
+    global RULE
+    RULE = "A3"
     """Teil 3: Passwort-Hasher (ASVS 11.4.2).
 
     security.password_hashers muss zeitgemäße Algorithmen wie bcrypt, argon2id,
@@ -605,6 +635,8 @@ def _plain_prefix(prefix: str) -> bool:
 
 
 def part4_access_control(sec: dict) -> None:
+    global RULE
+    RULE = "A4"
     """Teil 4: Reihenfolge von security.access_control (SYM-026).
 
     Symfony wertet access_control von oben nach unten aus, die erste passende
@@ -748,6 +780,8 @@ def _check_bundle_lifetime(project_path: str) -> None:
 
 
 def part5_reset_tokens(project_path: str) -> None:
+    global RULE
+    RULE = "A5"
     """Teil 5: Passwort-Zurücksetzung (ASVS 6.4.1).
 
     Liegt symfonycasts/reset-password-bundle in composer.lock vor, wird die

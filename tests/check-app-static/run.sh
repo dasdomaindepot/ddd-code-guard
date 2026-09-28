@@ -164,6 +164,10 @@ fi
 run_script "$HERE/fixtures/http-client"
 expect 0 "default_options ohne timeout"
 
+# --- S5: gefährliche Produktions-Konfiguration (Fixture war angelegt, aber nie geprüft)
+run_script "$HERE/fixtures/prod-debug"
+expect 1 "[app-static/S5]" "Session Fixation" "Profiler/Debug in Produktion" "FooDevBundle kommt aus require-dev" "Debug-Modus"
+
 # --- kein Projekt: nicht messbar
 run_script "$HERE/fixtures/leer"
 expect 77 "nicht messbar"

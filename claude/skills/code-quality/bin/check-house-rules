@@ -131,7 +131,28 @@ if yaml is not None:
 findings = 0
 
 
+
+# Stabile Regel-ID der gerade laufenden Prüfung (#1957). Sie steht vor jeder
+# BEFUND- und Hinweis-Zeile, damit Befunde über Läufe vergleichbar sind und
+# Ausnahmen gezielt auf eine Regel zeigen können.
+CHECK_ID = "house-rules"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    # Für tests/rule-coverage.sh: welche Regel hat im Testlauf ausgelöst?
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
 def finding(msg: str) -> None:
+    msg = _rid() + msg
     global findings
     findings += 1
     print(f"BEFUND   {msg}")
@@ -142,6 +163,7 @@ def ok(msg: str) -> None:
 
 
 def hint(msg: str) -> None:
+    msg = _rid() + msg
     print(f"Hinweis  {msg}")
 
 
@@ -217,6 +239,8 @@ def _major_version(version) -> int | None:
 # --- R1: Das phpcs-Regelwerk passt nicht zu phpcs 4 --------------------
 
 def part_r1_phpcs4(project_path: str) -> None:
+    global RULE
+    RULE = "R1"
     version, slevomat_installed = _load_phpcs_info(project_path)
     major = _major_version(version)
     if version is None or major is None or major < 4:
@@ -297,6 +321,8 @@ R2_ENV_FILES = (
 
 
 def part_r2_env_dollar(project_path: str) -> None:
+    global RULE
+    RULE = "R2"
     env_files = set(R2_ENV_FILES)
     env_files.update(os.path.basename(p) for p in glob.glob(os.path.join(project_path, ".env.*.local")))
     paths = sorted(os.path.join(project_path, name) for name in env_files)
@@ -374,6 +400,8 @@ def _dockerfile_tz(text: str):
 
 
 def part_r3_timezone(project_path: str) -> None:
+    global RULE
+    RULE = "R3"
     before = findings
 
     # Kandidaten: Wurzel-Dockerfile und alle Dockerfile* unter docker/
@@ -634,6 +662,8 @@ def _env_trusted_proxies(project_path: str):
 
 
 def part_r4_trusted_proxies(project_path: str) -> None:
+    global RULE
+    RULE = "R4"
     framework_path = os.path.join(project_path, "config", "packages", "framework.yaml")
     if not os.path.isfile(framework_path):
         ok("keine framework.yaml — Regel R4 entfällt")
@@ -770,6 +800,8 @@ def _fmt_names(names) -> str:
 
 
 def part_r5_deploy_needs(project_path: str) -> None:
+    global RULE
+    RULE = "R5"
     ci_path = os.path.join(project_path, ".gitlab-ci.yml")
     if not os.path.isfile(ci_path):
         ok("keine .gitlab-ci.yml: Regel R5 entfällt")
@@ -959,6 +991,8 @@ def _require_php_excludes(composer, container_version: str) -> None:
 
 
 def part_r6_composer_platform(project_path: str) -> None:
+    global RULE
+    RULE = "R6"
     before = findings
 
     # 1) composer.lock vorhanden und versioniert? Kein Git-Repo: Teil überspringen.
@@ -1065,6 +1099,8 @@ def _r7_scan_workers(project_path: str) -> bool:
 
 
 def part_r7_messenger(project_path: str) -> None:
+    global RULE
+    RULE = "R7"
     messenger_path = os.path.join(project_path, "config", "packages", "messenger.yaml")
     if not os.path.isfile(messenger_path):
         ok("keine messenger.yaml: Regel R7 entfällt")
@@ -1213,6 +1249,8 @@ def _command_uses_lock(text: str) -> bool:
 
 
 def part_r8_cron_overlap(project_path: str) -> None:
+    global RULE
+    RULE = "R8"
     before = findings
 
     # Crontab-Dateien: `crontab` im Wurzelverzeichnis sowie jede Datei unter
@@ -1318,6 +1356,8 @@ def _unquote(value: str) -> str:
 
 
 def part_r9_db_root(project_path: str) -> None:
+    global RULE
+    RULE = "R9"
     before = findings
     had_target = False
 
@@ -1482,6 +1522,8 @@ def _r10_source_persistent(source, project_path: str) -> bool:
 
 
 def part_r10_compose(project_path: str) -> None:
+    global RULE
+    RULE = "R10"
     before = findings
 
     # Nur die Basis-Compose-Dateien im Wurzelverzeichnis — kein override, kein

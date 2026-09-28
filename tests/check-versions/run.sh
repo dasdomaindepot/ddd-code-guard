@@ -84,7 +84,7 @@ run_script "$HERE/fixtures/alt"
 expect 1 "1 Befund(e)."
 expect 1 "BEFUND" "PHP 8.1 bekommt seit 2025-12-31" "auf eine unterstützte Version heben"
 expect 1 "Symfony 7.2 verliert am 2026-11-30 den Support"
-expect 1 "Hinweis  symfony/framework-bundle 6.4.34 → 7.3.4 (neue Hauptversion)"
+expect 1 "Hinweis  [versions/V2] symfony/framework-bundle 6.4.34 → 7.3.4 (neue Hauptversion)"
 
 # --- aktuell: PHP und Symfony unterstützt — Exit 0, kein Befund
 run_script "$HERE/fixtures/aktuell"

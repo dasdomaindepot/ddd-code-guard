@@ -63,10 +63,13 @@ def last_lines(text: str, count: int = 3, nonempty: bool = False) -> str:
     return "\n".join(lines[-count:])
 
 
-def console(args, timeout: int = 180):
+def console_raw(args, timeout: int = 180):
     """`docker compose exec -T php php bin/console --no-interaction <args>`.
 
-    Tupel (returncode, stdout+stderr, ANSI-befreit); Timeout → (124, "Timeout").
+    Tupel (returncode, stdout, stderr), jeweils ANSI-befreit. stdout und stderr
+    bleiben getrennt: Monolog schreibt Deprecations als JSON-Zeilen auf stderr,
+    und hinter dem JSON von `list --format=json` angehängt machten sie die
+    Ausgabe unlesbar – der Check meldete dann „bootet nicht“ bei laufender App.
     """
     cmd = [DOCKER, "compose", "exec", "-T", "php", "php", "bin/console", "--no-interaction", *args]
     try:
@@ -75,10 +78,16 @@ def console(args, timeout: int = 180):
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return 124, "Timeout"
+        return 124, "", "Timeout"
     except OSError:
-        return 127, "docker nicht aufrufbar"
-    return proc.returncode, strip_ansi(proc.stdout + proc.stderr)
+        return 127, "", "docker nicht aufrufbar"
+    return proc.returncode, strip_ansi(proc.stdout), strip_ansi(proc.stderr)
+
+
+def console(args, timeout: int = 180):
+    """Wie console_raw, aber stdout und stderr zusammen – für Meldungstexte."""
+    rc, out, err = console_raw(args, timeout)
+    return rc, out + err
 
 
 def has_command(name: str) -> bool:
@@ -208,9 +217,10 @@ def main() -> int:
         return 77
 
     # Verfügbare Befehle ermitteln.
-    rc, out = console(["list", "--format=json"])
+    rc, stdout, stderr = console_raw(["list", "--format=json"])
+    out = stdout + stderr
     try:
-        data = json.loads(out)
+        data = json.loads(stdout)
         if isinstance(data, dict):
             commands = {
                 c["name"] for c in data.get("commands", [])

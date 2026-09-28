@@ -48,6 +48,7 @@ rather than improvising:
 | `symfony-lint` | Read-only Symfony self-checks in the running `php` container: `lint:container`, `lint:twig`, `lint:yaml --parse-tags`, Doctrine mapping, and schema drift when all migrations are applied (entity changed without a migration); pending local migrations are a hint | `bin/check-symfony-lint` (blocking, python3, running container) |
 | `third-party` | Running local instance: third parties loaded on first page view without consent — Google Fonts (always a finding), Google Maps, YouTube without `youtube-nocookie.com`, Google Analytics/Tag Manager, Meta Pixel, Hotjar (hints when a consent tool is detected); external CDNs are hints; checks `<link>`, `<script>`, `<iframe>`, `<img>`, inline scripts and same-origin `@import` | `bin/check-third-party` (blocking, python3) |
 | `gate-integrity` | Diff against the base: lowered PHPStan level, more `ignoreErrors`/`excludePaths`, new baseline entries, weaker phpcs/PHPUnit config, new `@phpstan-ignore`/`phpcs:ignore`/`markTestSkipped`, `allow_failure` or a removed check job in `.gitlab-ci.yml`, `\|\| true` in Make recipes, new empty `catch` blocks; placeholders (`TODO`, `example.com`) are hints; a `Guard-Ausnahme: <reason>` line in a commit message downgrades everything to hints | `bin/check-gate-integrity` (blocking, python3 + git) |
+| `error-visibility` | `catch` blocks in `src/` whose errors never reach Sentry/Bugsink: `echo`/`die`/`var_dump` in a catch, stack trace/file/line in a response, generic catch (`\Throwable`, `\Exception`) without rethrow/`captureException`/`$logger->error()` in controllers; findings for new code only, existing code is a hint; project hint when `sentry/sentry-symfony` is installed but Monolog has no `type: sentry` handler; per-site exception via `// guard: erwartet – <reason>` | `bin/check-error-visibility` (blocking for new code, python3 + git) |
 | `migrations` | New migrations only, `up()` only: entities/repositories inside a migration, `DELETE`/`UPDATE` without `WHERE`, `NOT NULL` column without `DEFAULT` on PostgreSQL (hint on MySQL/MariaDB); hints for DROP/rename and irreversible `down()` | `bin/check-migrations` (blocking, python3 + git) |
 | `secrets` | Tracked files only: committed `.env.local`/`.env.*.local` and gitleaks hits (local binary or an already pulled `zricethezav/gitleaks` image) are findings; `generic-api-key` hits and a real `APP_SECRET` in a committed `.env` are hints; committed build artefacts (`vendor/`, `node_modules/`, `var/cache/`, `public/build/`) are findings, personal IDE state is a hint; exceptions via `.gitleaksignore`; secret values are never printed | `bin/check-secrets` (blocking, python3 + git) |
 | `web-exposure` | Running local instance: no `.git`, `.env`, `composer.lock` or log files served (ASVS 13.4.1), unknown paths return 404 without stack trace, session cookies with Secure/HttpOnly/SameSite (ASVS 3.3.1), permanent http→https redirect, no CORS reflection with credentials | `bin/check-web-exposure` (blocking, python3) |
@@ -63,6 +64,8 @@ rather than improvising:
 To fix favicon findings, `bin/favicon-generate <logo> [project] [--name …] [--color #rrggbb]` builds the full icon set into `public/` with [RealFaviconGenerator](https://realfavicongenerator.net/) (npm `realfavicon`, runs locally) and prints the `<link>` tags for your layout. It is a helper, not a check: it never overwrites existing files without `--force` and never edits templates.
 
 Expensive checks (coverage, infection, e2e, build) only run with `--full`.
+
+Every finding and hint line of the check scripts starts with a stable rule ID such as `[house-rules/R3]` or `[app-static/S6]`; the semantic review uses `review/A<axis>`. IDs never change when rules are added, so findings stay comparable across runs and exceptions in `.ai/guard-profile.yml` can point at a single rule.
 
 ### Assumptions
 
@@ -142,6 +145,13 @@ private denylist of regexes from `~/.config/ddd-code-guard/denylist`
 (override with `DDD_GUARD_DENYLIST`) — handy for keeping customer names and
 internal hostnames out of a public repo.
 
+Every check has a self-test under `tests/<check>/run.sh` with cases for a
+violation, a compliant variant and, where the check knows exceptions, an
+exception that must stay silent. Run them from any directory — some bugs only
+show up outside the repo. `bash tests/rule-coverage.sh` runs all self-tests and
+lists every rule ID that never fired, i.e. a rule without a violation case
+(`--strict` makes that an error).
+
 ### License
 
 MIT — see [LICENSE](LICENSE).
@@ -177,6 +187,8 @@ Composer, PHPStan, phpcs, Deptrac, Linter, Tests, Coverage, Infection, E2E,
 npm-Skripte, die Web-Härtung und die Rechtstexte (Impressum, Datenschutz, AGB)
 der lokal laufenden Instanz. Teure Checks
 laufen nur mit `--full`.
+
+Jede Befund- und Hinweiszeile der Check-Scripts beginnt mit einer stabilen Regel-ID wie `[house-rules/R3]` oder `[app-static/S6]`, das semantische Review nutzt `review/A<Achse>`. Die IDs ändern sich nicht, wenn Regeln dazukommen – Befunde bleiben über Läufe vergleichbar, und Ausnahmen in `.ai/guard-profile.yml` können auf eine einzelne Regel zeigen.
 
 ### Annahmen
 
@@ -227,6 +239,13 @@ Den Pre-Commit-Hook einmal pro Klon aktivieren:
 `git config core.hooksPath .githooks`. Er fährt `gitleaks` und, falls vorhanden,
 eine private Sperrliste aus `~/.config/ddd-code-guard/denylist` — damit
 Kundennamen und interne Hosts nicht in einem öffentlichen Repo landen.
+
+Jeder Check hat einen Selbsttest unter `tests/<check>/run.sh` mit einem Verstoß,
+einer konformen Variante und – wo der Check Ausnahmen kennt – einer Ausnahme, die
+still bleiben muss. Die Tests aus einem beliebigen Verzeichnis fahren; manche
+Fehler zeigen sich nur außerhalb des Repos. `bash tests/rule-coverage.sh` fährt
+alle Selbsttests und listet jede Regel-ID, die nie ausgelöst hat – also eine
+Regel ohne Verstoß-Fall (`--strict` macht daraus einen Fehler).
 
 ### Lizenz
 

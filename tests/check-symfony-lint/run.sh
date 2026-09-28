@@ -73,7 +73,12 @@ json='{"commands":[{"name":"lint:container"},{"name":"lint:twig"},{"name":"lint:
 
 case "$cmd" in
     list)
-        printf '%s\n' "$json"; exit 0
+        printf '%s\n' "$json"
+        # Wie Monolog im Dev-Modus: Deprecations als JSON-Zeile auf stderr
+        if [ "${FAKE_CASE:-all-green}" = deprecation-stderr ]; then
+            printf '%s\n' '{"message":"User Deprecated: Since symfony/x 7.4: foo","channel":"deprecation","level":200}' >&2
+        fi
+        exit 0
         ;;
     lint:container)
         exit 0
@@ -256,6 +261,14 @@ expect 77 "nicht messbar"
 # --- zwei Argumente → Exit 2 ---
 run_script "$LAST_FIXTURE" "$LAST_FIXTURE"
 expect 2
+
+# --- #1990: Deprecation-Zeile auf stderr darf list --format=json nicht zerstören
+LAST_FIXTURE="$(mktemp -d "$WORK/fixture.XXXXXX")"
+make_fixture "$LAST_FIXTURE"
+reset_env deprecation-stderr
+run_script "$LAST_FIXTURE"
+expect 0 "Keine Befunde."
+expect_not 0 "bootet nicht"
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"

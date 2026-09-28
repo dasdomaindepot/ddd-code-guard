@@ -223,16 +223,16 @@ expect 0 "Regel R8 entfällt"
 # --- in .env/.env.local nur Hinweis; Passwort und URL werden nie ausgegeben
 run_script "$HERE/fixtures/db-root"
 expect 1 "1 Befund(e)." "BEFUND" ".env.prod:1:" ".env:1:"
-expect 1 "Hinweis  .env:1: DATABASE_URL verbindet als root"
+expect 1 "Hinweis  [house-rules/R9] .env:1: DATABASE_URL verbindet als root"
 expect_not 1 "geheim123" "prodgeheim"
 
 # --- R10: healthcheck und Volumes in docker-compose — nur Hinweise
 # --- php und nginx ohne healthcheck, public/uploads nur über Code-Mount
 run_script "$HERE/fixtures/compose"
 expect 0 "Keine Befunde."
-expect 0 "Hinweis  Dienst php ohne healthcheck"
-expect 0 "Hinweis  Dienst nginx ohne healthcheck"
-expect 0 "Hinweis  public/uploads liegt nur"
+expect 0 "Hinweis  [house-rules/R10] Dienst php ohne healthcheck"
+expect 0 "Hinweis  [house-rules/R10] Dienst nginx ohne healthcheck"
+expect 0 "Hinweis  [house-rules/R10] public/uploads liegt nur"
 expect 0 "in Produktion prüfen"
 expect_not 0 "BEFUND"
 

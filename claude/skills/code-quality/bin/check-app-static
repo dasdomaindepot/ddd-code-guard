@@ -73,7 +73,28 @@ _Loader.add_multi_constructor("!", _any_tag)
 findings = 0
 
 
+
+# Stabile Regel-ID der gerade laufenden Prüfung (#1957). Sie steht vor jeder
+# BEFUND- und Hinweis-Zeile, damit Befunde über Läufe vergleichbar sind und
+# Ausnahmen gezielt auf eine Regel zeigen können.
+CHECK_ID = "app-static"
+RULE = ""
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    # Für tests/rule-coverage.sh: welche Regel hat im Testlauf ausgelöst?
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
 def finding(msg: str) -> None:
+    msg = _rid() + msg
     global findings
     findings += 1
     print(f"BEFUND   {msg}")
@@ -84,6 +105,7 @@ def ok(msg: str) -> None:
 
 
 def hint(msg: str) -> None:
+    msg = _rid() + msg
     print(f"Hinweis  {msg}")
 
 
@@ -194,6 +216,8 @@ def _walk_skip(root: str, suffixes: tuple) -> list:
 # --- S1: Session-Cookies -----------------------------------------------
 
 def part_s1_session(project_path: str) -> None:
+    global RULE
+    RULE = "S1"
     doc = load_top_level_yaml(os.path.join(project_path, "config", "packages", "framework.yaml"))
     framework = doc.get("framework") if isinstance(doc, dict) else None
     session = framework.get("session") if isinstance(framework, dict) else None
@@ -216,6 +240,8 @@ def part_s1_session(project_path: str) -> None:
 # --- S2: CSRF ----------------------------------------------------------
 
 def part_s2_csrf(project_path: str) -> None:
+    global RULE
+    RULE = "S2"
     here = []
     fw = load_top_level_yaml(os.path.join(project_path, "config", "packages", "framework.yaml"))
     framework = fw.get("framework") if isinstance(fw, dict) else None
@@ -252,6 +278,8 @@ def part_s2_csrf(project_path: str) -> None:
 # --- S3: Datei-Uploads -------------------------------------------------
 
 def part_s3_uploads(project_path: str) -> None:
+    global RULE
+    RULE = "S3"
     here = []
     count = 0
     for path in php_files_under_src(project_path):
@@ -320,6 +348,8 @@ def _find_dockerfiles(project_path: str):
 
 
 def part_s4_dockerignore(project_path: str) -> None:
+    global RULE
+    RULE = "S4"
     whole = [(p, ln) for (p, ln) in _find_dockerfiles(project_path) if ln is not None]
     if not whole:
         ok("kein Dockerfile mit 'COPY .' — kein .dockerignore nötig")
@@ -436,6 +466,8 @@ def _dockerfile_debug_in_prod(text: str) -> bool:
 
 
 def part_s5_prod_config(project_path: str) -> None:
+    global RULE
+    RULE = "S5"
     here = []
 
     # 1. Session-Fixation (nur Top-Level security:, nicht when@…)
@@ -546,6 +578,8 @@ def _is_money_name(name: str) -> bool:
 
 
 def part_s6_money_float(project_path: str) -> None:
+    global RULE
+    RULE = "S6"
     here = []
     total = 0
     shown = 0
@@ -600,6 +634,8 @@ CACHE_LINE_RE = re.compile(
 
 
 def part_s7_public_cache(project_path: str) -> None:
+    global RULE
+    RULE = "S7"
     here = []
     for path in php_files_under_src(project_path):
         text = _read_text(path)
@@ -688,6 +724,8 @@ def _domain_locale(filename: str):
 
 
 def part_s10_translation_placeholders(project_path: str) -> None:
+    global RULE
+    RULE = "S10"
     translations_dir = os.path.join(project_path, "translations")
     if not os.path.isdir(translations_dir):
         ok("keine Übersetzungsdateien (.yaml/.yml) — S10 entfällt")
@@ -920,6 +958,8 @@ def _check_one_dockerfile(project_path: str, path: str) -> None:
 
 
 def part_s8_docker_hardening(project_path: str) -> None:
+    global RULE
+    RULE = "S8"
     candidates = [
         d for d in _dockerfiles_for_hardening(project_path)
         if not _is_dev_dockerfile(os.path.basename(d))
@@ -1035,6 +1075,8 @@ def _project_has_filetype(project_path: str) -> bool:
 
 
 def part_s9_nginx(project_path: str) -> None:
+    global RULE
+    RULE = "S9"
     config_texts = _read_nginx_configs(project_path)
     if not config_texts:
         ok("keine nginx-Konfiguration: S9 entfällt")
@@ -1081,6 +1123,8 @@ SQL_TAINT_RE = re.compile(r"""("[^"]*\$\w|['"]\s*\.\s*\$\w|\$\w[\w\->\[\]'"]*\s*
 
 
 def part_h1_sql(project_path: str) -> None:
+    global RULE
+    RULE = "H1"
     total = 0
     shown = 0
     for path in php_files_under_src(project_path):
@@ -1107,6 +1151,8 @@ RAW_RE = re.compile(r"\| ?raw\b")
 
 
 def part_h2_raw_twig(project_path: str) -> None:
+    global RULE
+    RULE = "H2"
     templates = os.path.join(project_path, "templates")
     if not os.path.isdir(templates):
         return
@@ -1135,6 +1181,8 @@ def part_h2_raw_twig(project_path: str) -> None:
 # --- H3: Schwache Kryptografie -----------------------------------------
 
 def part_h3_crypto(project_path: str) -> None:
+    global RULE
+    RULE = "H3"
     for path in php_files_under_src(project_path):
         text = _read_text(path)
         if text is None:
@@ -1166,6 +1214,8 @@ RAW_FN_RE = re.compile(r"""(?<![\w>:$])(eval|exec|shell_exec|system|passthru|pro
 
 
 def part_h4_dangerous(project_path: str) -> None:
+    global RULE
+    RULE = "H4"
     for path in php_files_under_src(project_path):
         text = _read_text(path)
         if text is None:
@@ -1181,6 +1231,8 @@ def part_h4_dangerous(project_path: str) -> None:
 # --- H5: Fokus und Bewegung in CSS -------------------------------------
 
 def part_h5_css_focus(project_path: str) -> None:
+    global RULE
+    RULE = "H5"
     assets = os.path.join(project_path, "assets")
     if not os.path.isdir(assets):
         return
@@ -1210,6 +1262,8 @@ def part_h5_css_focus(project_path: str) -> None:
 # --- H6: TypeScript ----------------------------------------------------
 
 def part_h6_typescript(project_path: str) -> None:
+    global RULE
+    RULE = "H6"
     tsconfig = os.path.join(project_path, "tsconfig.json")
     if os.path.isfile(tsconfig):
         raw = _read_text(tsconfig) or ""
@@ -1260,6 +1314,8 @@ FILE_GET_HTTP_RE = re.compile(r"file_get_contents\(\s*['\"]http")
 
 
 def part_h7_http_timeouts(project_path: str) -> None:
+    global RULE
+    RULE = "H7"
     here = []
     total_client = 0
     shown_client = 0
@@ -1351,6 +1407,8 @@ REQUEST_CAST_RE = re.compile(
 
 
 def part_h8_php_hints(project_path: str) -> None:
+    global RULE
+    RULE = "H8"
     suppress_total = 0
     suppress_shown = 0
     json_total = 0
