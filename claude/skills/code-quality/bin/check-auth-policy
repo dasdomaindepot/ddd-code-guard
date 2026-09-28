@@ -24,6 +24,13 @@ verwenden; plaintext sowie md5/sha1/sha256/sha512 sind ein Befund.
 InMemoryUser-Einträge ohne memory-Provider mit Benutzern bekommen nur einen
 Hinweis. Die Abschnitte when@test/when@dev werden nicht bewertet.
 
+Teil 4: Reihenfolge von security.access_control (SYM-026). Symfony wertet die
+Regeln von oben nach unten aus, die erste passende Regel gewinnt. Wird eine
+Regel j von einer früheren Regel i überschattet (i trifft jeden Pfad, der j
+trifft, und ist nicht durch weitere Einschränkungen verfeinert), ohne dass sich
+die Rollen unterscheiden, wird sie als nie wirksam gemeldet. Fehlt eine
+abschließende Regel für ^/, sind nicht erfasste Pfade öffentlich (Hinweis).
+
 Die Grenzwerte stammen aus .ai/guard-policy.yml des Projekts oder, falls nicht
 vorhanden, aus der zentralen guard-policy.yml eine Ebene über dem Script.
 
@@ -560,6 +567,101 @@ def part3_password_hashers(sec: dict) -> None:
         )
 
 
+# --- Teil 4: Reihenfolge von access_control ------------------------------
+
+EXTRA_RESTRICTIONS = ("host", "ips", "methods", "port", "allow_if",
+                      "requires_channel", "attributes", "route")
+PLAIN_CHARS = (
+    "/"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789-_"
+)
+
+
+def _normalize_roles(roles):
+    if roles is None:
+        return None
+    if isinstance(roles, str):
+        return roles.strip()
+    if isinstance(roles, list):
+        return ",".join(sorted(str(r).strip() for r in roles))
+    return str(roles).strip()
+
+
+def _plain_prefix(prefix: str) -> bool:
+    """Enthält prefix außer /, Buchstaben, Ziffern, - und _ keine Regex-Zeichen?"""
+    return all(ch in PLAIN_CHARS for ch in prefix)
+
+
+def part4_access_control(sec: dict) -> None:
+    """Teil 4: Reihenfolge von security.access_control (SYM-026).
+
+    Symfony wertet access_control von oben nach unten aus, die erste passende
+    Regel gewinnt. Eine Regel j wird von einer vorherigen Regel i überschattet,
+    wenn i keine weitere Einschränkung hat und jeder Pfad, der j trifft, auch i
+    trifft. Solche nie wirksamen Regeln werden als Befund gemeldet; fehlt eine
+    abschließende Regel für ^/, sind nicht erfasste Pfade öffentlich (Hinweis).
+    """
+    rules = sec.get("access_control")
+    if not isinstance(rules, list) or not rules:
+        ok("security.access_control nicht gesetzt — Zugriff nur über Attribute/Voter")
+        return
+
+    entries = []
+    for entry in rules:
+        if not isinstance(entry, dict):
+            entries.append(None)
+            continue
+        entries.append((
+            entry.get("path"),
+            _normalize_roles(entry.get("roles")),
+            any(key in entry for key in EXTRA_RESTRICTIONS),
+        ))
+
+    overshadowing = False
+    for j in range(len(entries)):
+        # Einträge, die kein dict sind, lassen sich nicht bewerten.
+        if entries[j] is None:
+            continue
+        pj, rj, ej = entries[j]
+        if pj is None or ej:
+            continue
+        for i in range(j):
+            if entries[i] is None:
+                continue
+            pi, ri, ei = entries[i]
+            if ei:
+                continue
+            if _normalize_roles(ri) == _normalize_roles(rj):
+                continue
+            # Ohne path passt eine Regel auf jeden Pfad, ebenso ^/ und /.
+            if pi is None or pi in ("^/", "/"):
+                shadow = True
+            elif isinstance(pi, str) and isinstance(pj, str) and pi.startswith("^") and pj.startswith("^"):
+                pi_plain = pi[1:]
+                pj_plain = pj[1:]
+                shadow = _plain_prefix(pi_plain) and not pi_plain.endswith("$") and pj_plain.startswith(pi_plain)
+            else:
+                shadow = False
+            if shadow:
+                overshadowing = True
+                finding(
+                    f"security.access_control: Regel {j + 1} ({pj}, {rj}) "
+                    f"wird nie wirksam — Regel {i + 1} ({pi}, {ri}) passt vorher; "
+                    f"spezifischere Regeln nach oben"
+                )
+                break
+
+    catch_all = any(e is not None and e[0] in (None, "^/", "/") for e in entries)
+    if not catch_all:
+        hint(
+            "security.access_control ohne abschließende Regel für ^/ — nicht "
+            "erfasste Pfade sind öffentlich, sofern kein Attribut schützt (deny by default)"
+        )
+    elif not overshadowing:
+        ok("security.access_control: Reihenfolge plausibel")
+
+
 def main() -> int:
     if len(sys.argv) > 2:
         print("Verwendung: check-auth-policy [projektverzeichnis]", file=sys.stderr)
@@ -591,6 +693,7 @@ def main() -> int:
     part1_firewalls(sec, project_path)
     part2_password_rules(sec, project_path)
     part3_password_hashers(sec)
+    part4_access_control(sec)
 
     print()
     if findings:

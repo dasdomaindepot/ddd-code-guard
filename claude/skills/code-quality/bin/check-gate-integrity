@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""check-gate-integrity — erkennen, ob eine Änderung Qualitätsprüfungen abschwächt.
+
+Aufgerufen vom Code Guard (Check "gate-integrity"), lässt sich aber auch allein
+fahren:
+    check-gate-integrity <projektverzeichnis> <basis-ref>
+
+Im Gegensatz zu den üblichen Checks sucht dieses Skript nicht nach Fehlern im
+Code, sondern danach, dass eine Änderung die Prüfmechaniken selbst lockert:
+PHPStan-Level oder Baseline werden gesenkt, Sniffs/Tests werden ausgeschlossen,
+Unterdrückungen werden eingeführt, Prüf-Jobs und Makefile-Rezepte werden mit
+Fehler-Ignore versehen. Gefunden werden nur *neue* Veränderungen gegenüber dem
+merge-base von <basis-ref> und HEAD; die Basis ist der Referenzstand, dagegen
+vergleicht wird.
+
+Geprüft werden nur Texte; es wird nichts gestartet oder aufgerufen. Alle
+Git-Zugriffe laufen per subprocess gegen das Projektverzeichnis, ein
+misslungener Aufruf zählt als „kein Befund" undürzt nie.
+
+Ausgenommem werden `vendor/`, `node_modules/`, `var/` und `docs/.guard/`.
+
+Regeln:
+    G1  PHPStan-Konfiguration (level gesenkt, ignoreErrors/excludePaths gewachsen)
+    G2  PHPStan-Baseline (mehr Fehler in die Baseline geschoben)
+    G3  phpcs-Regelwerk (more exclude-patterns/-sniffs, rule ref entfernt)
+    G4  PHPUnit (more <exclude>)
+    G5  Unterdrückungen im Code (@phpstan-ignore, @psalm-suppress, …)
+    G6  CI (.gitlab-ci.yml: allow_failure, geprüfter Job entfernt)
+    G7  Makefile (Rezeptzeilen, die Fehler ignorieren)
+    G8  PHP-Code in src/ (Platzhalter/TODO, leerer catch-Block)
+
+Ausnahme: Enthält ein Commit im Bereich <base>..HEAD eine Zeile
+`Guard-Ausnahme: …`, werden alle Befunde dieses Laufs zu Hinweisen und der
+Exit ist 0.
+
+Exit-Codes:
+     0  keine Befunde
+     1  Befunde
+     2  Nutzungsfehler (nicht genau zwei Argumente, Verzeichnis existiert nicht)
+    77  nicht messbar (kein Git-Repo, basis-ref leer oder nicht verifizierbar)
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+PHPS_CONFIGS = ("phpstan.neon", "phpstan.neon.dist", "phpstan.dist.neon")
+PHPCS_CONFIGS = (".phpcs.xml", "phpcs.xml", ".phpcs.xml.dist", "phpcs.xml.dist")
+PHPUNIT_CONFIGS = ("phpunit.xml", "phpunit.xml.dist", "phpunit.dist.xml")
+
+EXCLUDED_PREFIXES = ("vendor/", "node_modules/", "var/", "docs/.guard/")
+
+CHECK_JOB_NAMES = ("test", "phpstan", "phpcs", "psalm", "lint")
+
+# G5: Suchwort (Substring) → im Befund angezeigter Name.
+G5_PATTERNS = (
+    ("@phpstan-ignore", "@phpstan-ignore"),
+    ("@psalm-suppress", "@psalm-suppress"),
+    ("phpcs:ignore", "phpcs:ignore"),
+    ("phpcs:disable", "phpcs:disable"),
+    ("@codeCoverageIgnore", "@codeCoverageIgnore"),
+    ("markTestSkipped(", "markTestSkipped("),
+    ("markTestIncomplete(", "markTestIncomplete("),
+)
+
+# G8: Platzhalter-/Stoppwörter im neuen PHP-Code. Eintrag (Muster, Label);
+# ein String wird als Suchwort (Substring) gesucht, ein regex als Volltreffer.
+G8_PATTERNS = (
+    (re.compile(r"\bTODO\b", re.IGNORECASE), "TODO"),
+    (re.compile(r"\bFIXME\b", re.IGNORECASE), "FIXME"),
+    ("example.com", "example.com"),
+    ("example.org", "example.org"),
+    ("lorem ipsum", "lorem ipsum"),
+    ("'dummy'", "dummy"),
+    ('"dummy"', "dummy"),
+    (re.compile(r"not implemented", re.IGNORECASE), "not implemented"),
+)
+
+# (Typ, Meldung). „finding" wird als Befund ausgegeben, „ok"/"hint" als Hinweis.
+results = []
+
+
+def finding(msg: str) -> None:
+    results.append(("finding", msg))
+
+
+def note(msg: str) -> None:
+    results.append(("ok", msg))
+
+
+def hint(msg: str) -> None:
+    results.append(("hint", msg))
+
+
+def _none_since(snapshot: int) -> bool:
+    """True, wenn seit snapshot kein Befund hinzugekommen ist."""
+    return all(t != "finding" for t, _ in results[snapshot:])
+
+
+# --- Git-/Datei-Hilfsfunktionen ----------------------------------------
+
+def git_run(project: str, args) -> str:
+    """Git-Aufruf mit cwd=project, stdout zurück; jeder Fehler → leer."""
+    try:
+        proc = subprocess.run(
+            ["git"] + list(args),
+            cwd=project,
+            capture_output=True,
+            text=True,
+            # Binaerdateien (Bilder, Dumps) liefern kein UTF-8; ohne errors
+            # stuerzt der Lauf ab, und ein Absturz saehe aus wie ein Befund.
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout
+
+
+def read_file(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def is_excluded(path: str) -> bool:
+    return any(path.startswith(pref) for pref in EXCLUDED_PREFIXES)
+
+
+def added_from_diff(project: str, base: str, path: str):
+    """Zeilennummern (1-gezählt, nachher) der+hinzugefügten Zeilen eines Diffs."""
+    out = git_run(project, ["diff", "-U0", base, "--", path])
+    added = []
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("@@"):
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            cur = int(m.group(1)) if m else None
+            continue
+        if cur is None:
+            continue
+        if line.startswith("++") or line.startswith("--"):
+            continue
+        if line.startswith("+"):
+            added.append(cur)
+            cur += 1
+    return added
+
+
+def collect_changed(project: str, base: str):
+    """Relative Pfade der Änderungen: Diff gegen base + unversionierte Dateien.
+
+    Tupel (pfad, unversioniert, vorher_text, nachher_text, zeilen_hinzugefgt).
+    """
+    diff_names = git_run(project, ["diff", "--name-only", base])
+    unversioned = git_run(project, ["ls-files", "--others", "--exclude-standard"])
+
+    entries = {}
+    for line in diff_names.splitlines():
+        p = line.strip()
+        if p and not is_excluded(p):
+            entries[p] = False
+    for line in unversioned.splitlines():
+        p = line.strip()
+        if p and not is_excluded(p):
+            entries[p] = True
+
+    items = []
+    for path, unv in entries.items():
+        before = ""
+        if not unv:
+            before = git_run(project, ["show", f"{base}:{path}"])
+        after = read_file(os.path.join(project, path))
+        after = after if after is not None else ""
+        if unv:
+            added = list(range(1, len(after.splitlines()) + 1))
+        else:
+            added = added_from_diff(project, base, path)
+        items.append((path, unv, before, after, added))
+    return items
+
+
+# --- G1: PHPStan-Konfiguration -----------------------------------------
+
+def extract_level(text: str):
+    """PHPStan-level als Zahl (max = 10) oder None."""
+    for line in text.splitlines():
+        m = re.match(r"^\s*level:\s*(max|\d+)\s*$", line)
+        if m:
+            return 10 if m.group(1) == "max" else int(m.group(1))
+    return None
+
+
+def count_list_block(text: str, key: str) -> int:
+    """Anzahl `- `-Zeilen im Block eines Top-Schlüssels (bis zur nächsten
+    Zeile mit gleicher oder geringer Einrückung)."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.match(rf"^\s*{re.escape(key)}:\s*$", line):
+            indent = len(line) - len(line.lstrip())
+            count = 0
+            for nl in lines[i + 1:]:
+                if nl.strip() == "":
+                    continue
+                if nl.lstrip().startswith("#"):
+                    continue
+                nindent = len(nl) - len(nl.lstrip())
+                if nindent <= indent:
+                    break
+                if nl.lstrip().startswith("- "):
+                    count += 1
+            return count
+    return 0
+
+
+def part_g1(project: str, base: str, rel: str, before: str, after: str) -> None:
+    snap = len(results)
+    bl = extract_level(before)
+    al = extract_level(after)
+    if bl is not None and al is not None and al < bl:
+        finding(f"{rel}: PHPStan-Level von {bl} auf {al} gesenkt")
+    bic = count_list_block(before, "ignoreErrors")
+    aic = count_list_block(after, "ignoreErrors")
+    if aic > bic:
+        finding(f"{rel}: {aic} ignoreErrors-Einträge (vorher {bic})")
+    bep = count_list_block(before, "excludePaths")
+    aep = count_list_block(after, "excludePaths")
+    if aep > bep:
+        finding(f"{rel}: {aep} excludePaths-Einträge (vorher {bep})")
+    if _none_since(snap):
+        note(f"{rel}: PHPStan-Konfiguration nicht abgeschwächt")
+
+
+# --- G2: PHPStan-Baseline ----------------------------------------------
+
+def baseline_total(text: str) -> int:
+    counts = re.findall(r"count:\s*(\d+)", text)
+    if counts:
+        return sum(int(c) for c in counts)
+    return len(re.findall(r"message:", text))
+
+
+def part_g2(rel: str, before: str, after: str) -> None:
+    snap = len(results)
+    bt = baseline_total(before)
+    at = baseline_total(after)
+    if at > bt:
+        finding(
+            f"{rel}: {at - bt} neue Fehler in die Baseline geschoben "
+            f"({bt} → {at})"
+        )
+    if _none_since(snap):
+        note(f"{rel}: Baseline nicht vergrößert ({at})")
+
+
+# --- G3: phpcs-Regelwerk -----------------------------------------------
+
+def phpcs_excludes(text: str) -> int:
+    return len(re.findall(r"<exclude-pattern", text)) + len(
+        re.findall(r"<exclude name=", text)
+    )
+
+
+def part_g3(rel: str, before: str, after: str) -> None:
+    snap = len(results)
+    be = phpcs_excludes(before)
+    ae = phpcs_excludes(after)
+    if ae > be:
+        finding(f"{rel}: {ae} exclude-Pattern/-sniffs (vorher {be})")
+    br = len(re.findall(r"<rule ref=", before))
+    ar = len(re.findall(r"<rule ref=", after))
+    if br > ar:
+        finding(f"{rel}: <rule ref>-Eintrag entfernt ({br} → {ar})")
+    if _none_since(snap):
+        note(f"{rel}: phpcs-Regelwerk nicht abgeschwächt")
+
+
+# --- G4: PHPUnit --------------------------------------------------------
+
+def part_g4(rel: str, before: str, after: str) -> None:
+    snap = len(results)
+    be = len(re.findall(r"<exclude\b", before))
+    ae = len(re.findall(r"<exclude\b", after))
+    if ae > be:
+        finding(f"{rel}: {ae} <exclude>-Einträge (vorher {be})")
+    if _none_since(snap):
+        note(f"{rel}: kein zusätzlicher <exclude>")
+
+
+# --- G5: Unterdrückungen im Code ---------------------------------------
+
+def part_g5(rel: str, after: str, added) -> None:
+    snap = len(results)
+    if not after:
+        return
+    lines = after.splitlines()
+    linenos = []
+    kinds = set()
+    for ln in added:
+        idx = ln - 1
+        if idx >= len(lines):
+            continue
+        raw = lines[idx]
+        for needle, label in G5_PATTERNS:
+            if needle in raw:
+                kinds.add(label)
+                linenos.append(ln)
+                break
+    if not linenos:
+        return
+    linenos = sorted(set(linenos))
+    shown = linenos[:20]
+    rest = len(linenos) - len(shown)
+    head = ",".join(str(x) for x in shown)
+    if rest:
+        head += f", … und {rest} weitere"
+    finding(f"{rel}:{head}: neue Unterdrückung ({', '.join(sorted(kinds))})")
+    if _none_since(snap):
+        note(f"{rel}: keine neue Unterdrückung")
+
+
+# --- G6: CI (.gitlab-ci.yml) -------------------------------------------
+
+def parse_ci_jobs(text: str):
+    """Job-Namen (Einrückung 0) aus einer .gitlab-ci.yml, Regex-basiert."""
+    excluded_top = ("variables", "include", "stages", "default", "workflow")
+    jobs = set()
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z0-9_:.-]+):\s*$", line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name.startswith(".") or name in excluded_top:
+            continue
+        jobs.add(name)
+    return jobs
+
+
+def part_g6(rel: str, before: str, after: str, added) -> None:
+    snap = len(results)
+    lines = after.splitlines()
+    for ln in added:
+        idx = ln - 1
+        if idx >= len(lines):
+            continue
+        if "allow_failure: true" in lines[idx]:
+            finding(f"{rel}:{ln}: allow_failure: true")
+    removed = parse_ci_jobs(before) - parse_ci_jobs(after)
+    for name in sorted(removed):
+        if any(k in name for k in CHECK_JOB_NAMES):
+            finding(f"{rel}: Prüf-Job \"{name}\" entfernt")
+    if _none_since(snap):
+        note(f"{rel}: CI-Prüf-Jobs unverändert")
+
+
+# --- G7: Makefile -------------------------------------------------------
+
+def part_g7(rel: str, after: str, added) -> None:
+    snap = len(results)
+    if not after:
+        return
+    lines = after.splitlines()
+    for ln in added:
+        idx = ln - 1
+        if idx >= len(lines):
+            continue
+        raw = lines[idx]
+        if raw.startswith("\t"):
+            rest = raw[1:]
+            if (
+                "|| true" in raw
+                or "|| :" in raw
+                or "; true" in raw
+                or rest.startswith("-")
+            ):
+                finding(f"{rel}:{ln}: Makefile-Rezept ignoriert Fehler ({raw.strip()})")
+    if _none_since(snap):
+        note(f"{rel}: Makefile-Rezepte nicht fehlerignorierend")
+
+
+# --- G8: Platzhalter und vorgetäuschte Erfolge -------------------------
+
+# G8: leerer catch-Block — `catch … {}`; innerhalb der Klammern zählen nur
+# Whitespace und Kommentare (// …, /* … */) als leer, regex über re.DOTALL.
+G8_EMPTY_CATCH = re.compile(
+    r"catch\s*\([^)]*\)\s*\{\s*(?:\/\/[^\n]*|/\*.*?\*/\s*)*\s*\}",
+    re.DOTALL,
+)
+
+
+def part_g8(rel: str, after: str, added) -> None:
+    snap = len(results)
+    if not after:
+        return
+    lines = after.splitlines()
+    added_set = set(added)
+
+    # Hinweis: Platzhalter/TODO im neuen Code.
+    hinweis = []
+    kinds = set()
+    for ln in added:
+        idx = ln - 1
+        if idx >= len(lines):
+            continue
+        raw = lines[idx]
+        for pat, label in G8_PATTERNS:
+            if isinstance(pat, str):
+                hit = pat in raw
+            else:
+                hit = pat.search(raw) is not None
+            if hit:
+                kinds.add(label)
+                hinweis.append(ln)
+                break
+    hinweis = sorted(set(hinweis))
+    if hinweis:
+        shown = hinweis[:10]
+        rest = len(hinweis) - len(shown)
+        head = ",".join(str(x) for x in shown)
+        if rest:
+            head += f", … und {rest} weitere"
+        hint(f"{rel}:{head}: Platzhalter im neuen Code ({', '.join(sorted(kinds))}) — vor dem Merge auflösen")
+
+    # Befund: leerer catch-Block, dessen catch-Zeile neu ist.
+    catch = []
+    for m in G8_EMPTY_CATCH.finditer(after):
+        lineno = after.count("\n", 0, m.start()) + 1
+        if lineno in added_set:
+            catch.append(lineno)
+    catch = sorted(set(catch))
+    if catch:
+        shown = catch[:10]
+        rest = len(catch) - len(shown)
+        head = ",".join(str(x) for x in shown)
+        if rest:
+            head += f", … und {rest} weitere"
+        finding(f"{rel}:{head}: leerer catch-Block verschluckt den Fehler — behandeln, loggen oder weiterwerfen")
+
+    if not hinweis and not catch:
+        note(f"{rel}: keine Platzhalter, keine leeren catch-Blöcke")
+
+
+# --- Hauptprogramm ------------------------------------------------------
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(
+            "Verwendung: check-gate-integrity <projektverzeichnis> <basis-ref>",
+            file=sys.stderr,
+        )
+        return 2
+
+    project = os.path.abspath(sys.argv[1])
+    basis = sys.argv[2]
+
+    if not os.path.isdir(project):
+        print(f"{project}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    if not basis:
+        print("basis-ref ist leer — nicht messbar.", file=sys.stderr)
+        return 77
+
+    # basis-ref muss existieren (scheitert bei fehlendem Git-Repo gleich mit).
+    verify = subprocess.run(
+        ["git", "rev-parse", "--verify", basis],
+        cwd=project,
+        capture_output=True,
+        text=True,
+    )
+    if verify.returncode != 0:
+        print(
+            f"{basis}: nicht messbar (kein Git-Repo oder Ref fehlt)",
+            file=sys.stderr,
+        )
+        return 77
+
+    base_out = git_run(project, ["merge-base", basis, "HEAD"]).strip()
+    if not base_out:
+        print("merge-base nicht bestimmbar — nicht messbar.", file=sys.stderr)
+        return 77
+    base = base_out
+
+    # Guard-Ausnahme im Commitverlauf?
+    log = git_run(project, ["log", "--format=%B", f"{base}..HEAD"])
+    exception_line = None
+    for line in log.splitlines():
+        if line.startswith("Guard-Ausnahme:"):
+            exception_line = line
+            break
+
+    items = collect_changed(project, base)
+    if not items:
+        print(f"ok       keine Änderungen gegenüber {basis}")
+        return 0
+
+    for path, _unv, before, after, added in items:
+        name = os.path.basename(path)
+        # Eine neu angelegte Konfiguration verschaerft; abgeschwaecht werden kann
+        # nur, was es vorher schon gab. Die Baseline (G2) ist die Ausnahme: Eine
+        # neue Baseline schiebt vorhandene Fehler unter den Teppich.
+        existed = before != ""
+        if name in PHPS_CONFIGS and existed:
+            part_g1(project, base, path, before, after)
+        if "baseline" in name and (
+            name.endswith(".neon") or name.endswith(".php")
+        ):
+            part_g2(path, before, after)
+        if name in PHPCS_CONFIGS and existed:
+            part_g3(path, before, after)
+        if name in PHPUNIT_CONFIGS and existed:
+            part_g4(path, before, after)
+        if name.endswith(".php"):
+            part_g5(path, after, added)
+        if name.endswith(".php") and path.startswith("src/"):
+            part_g8(path, after, added)
+        if name == ".gitlab-ci.yml":
+            part_g6(path, before, after, added)
+        if name.lower() == "makefile":
+            part_g7(path, after, added)
+
+    nfind = sum(1 for t, _ in results if t == "finding")
+
+    if exception_line is not None:
+        print(f"Hinweis  Guard-Ausnahme gefunden: {exception_line}")
+        for typ, msg in results:
+            if typ == "finding":
+                print(f"Hinweis  {msg} (Guard-Ausnahme im Commit begründet)")
+            elif typ == "ok":
+                print(f"ok       {msg}")
+            else:
+                print(f"Hinweis  {msg}")
+        return 0
+
+    for typ, msg in results:
+        if typ == "finding":
+            print(f"BEFUND   {msg}")
+        elif typ == "ok":
+            print(f"ok       {msg}")
+        else:
+            print(f"Hinweis  {msg}")
+    print()
+    if nfind:
+        print(f"{nfind} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

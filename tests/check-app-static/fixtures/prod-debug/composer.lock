@@ -1,0 +1,12 @@
+{
+    "packages-dev": [
+        {
+            "name": "foo/dev-bundle",
+            "autoload": {
+                "psr-4": {
+                    "Foo\\DevBundle\\": "src/"
+                }
+            }
+        }
+    ]
+}

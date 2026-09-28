@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.14.0"
+VERSION="1.15.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -349,6 +349,8 @@ CHECK_DEFS=(
   "house-rules|Hausregeln|config|cheap|$SCRIPT_DIR/check-house-rules .|file:composer.json,bin:python3"
   "secrets|Geheimnisse im Repo|security|normal|$SCRIPT_DIR/check-secrets .|bin:python3,bin:git"
   "symfony-lint|Symfony-Selbstpruefung|static|normal|$SCRIPT_DIR/check-symfony-lint .|file:bin/console,bin:python3"
+  "gate-integrity|Abgeschwaechte Gates|process|cheap|$SCRIPT_DIR/check-gate-integrity . \"$BASE_REF\"|bin:python3,bin:git"
+  "migrations|Neue Migrationen|database|cheap|$SCRIPT_DIR/check-migrations . \"$BASE_REF\"|bin:python3,bin:git"
   "phpcs|Coding-Standard|style|normal|make phpcs|target:phpcs"
   "phpstan|Statische Analyse|static|normal|make phpstan|target:phpstan"
   "deptrac|Architekturregeln|architecture|normal|make deptrac|target:deptrac"
@@ -423,6 +425,15 @@ CHECK_DEFS=(
 # symfony-lint (seit 1.14.0) blockiert: lint:container, lint:twig, lint:yaml,
 # Doctrine-Mapping und Schema ohne passende Migration, rein lesend im laufenden
 # php-Container. Offene Migrationen der lokalen DB sind nur ein Hinweis.
+#
+# gate-integrity (seit 1.15.0) blockiert: Aenderungen gegenueber der Basis, die
+# Pruefungen abschwaechen statt Fehler zu beheben -- gesenktes PHPStan-Level,
+# neue ignoreErrors/Baseline-Eintraege, neue Unterdrueckungen im Code, entfernte
+# Pruef-Jobs, "|| true" im Makefile, leere catch-Bloecke. Eine Zeile
+# "Guard-Ausnahme: <Grund>" in einer Commit-Nachricht macht daraus Hinweise.
+#
+# migrations (seit 1.15.0) blockiert: nur neue Migrationen -- Entities in
+# Migrationen, NOT NULL ohne DEFAULT, DELETE/UPDATE ohne WHERE.
 #
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.

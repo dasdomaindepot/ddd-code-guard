@@ -72,7 +72,10 @@ mit `cookie_secure: false` oder `cookie_samesite: none` (ASVS 3.3.1), abgeschalt
 (`csrf_protection: false`, `enable_csrf: false` am `form_login`), `FileType` ohne
 `File`/`Image`-Constraint mit `maxSize` bzw. ohne `mimeTypes` (ASVS 5.2.1/5.2.2), und ein
 `COPY .` im Dockerfile ohne `.dockerignore`, die `.git` und `.env.local` ausschließt
-(ASVS 13.4.1 — sonst liegt der ganze Git-Verlauf im Produktions-Image). Nur Hinweise,
+(ASVS 13.4.1 — sonst liegt der ganze Git-Verlauf im Produktions-Image). Außerdem
+gefährliche Produktions-Konfiguration: `session_fixation_strategy: none`, Profiler- oder
+Debug-Bundle für `all`/`prod`, ein Bundle aus `require-dev` mit `'all' => true` (startet mit
+`--no-dev` nicht) und `APP_ENV=dev`/`APP_DEBUG=1` in `.env.prod` oder der Produktionsstufe. Nur Hinweise,
 weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw` in Twig,
 `md5`/`sha1`/`rand` für Sicherheitszwecke, `eval`/`exec`/`shell_exec` und `unserialize`
 ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
@@ -105,6 +108,26 @@ sind `generic-api-key` und ein echter `APP_SECRET` in `.env`/`.env.dist`/`.env.p
 (ob Produktion ihn überschreibt, sieht der Guard nicht). `.env.test` und `.env.dev` bleiben
 außen vor. Bewusste Ausnahmen trägt das Projekt per Fingerprint in `.gitleaksignore` ein.
 Geheimniswerte werden nie ausgegeben. Einzeln fahrbar: `bin/check-secrets .`.
+
+**Abgeschwächte Gates** (`gate-integrity`, seit 27.09.2026, **blockierend**): Vergleicht
+den Stand mit der Vergleichsbasis (`--base`, sonst automatisch). Befunde: gesenktes
+PHPStan-Level, mehr `ignoreErrors`/`excludePaths`, neue Einträge in einer Baseline, mehr
+Ausschlüsse oder weniger Regeln im phpcs-Regelwerk, mehr `<exclude>` in der PHPUnit-
+Konfiguration, neue `@phpstan-ignore`/`@psalm-suppress`/`phpcs:ignore`/`@codeCoverageIgnore`/
+`markTestSkipped`, `allow_failure: true` oder ein entfernter Prüf-Job in `.gitlab-ci.yml`,
+`|| true` in Make-Rezepten und neue leere `catch`-Blöcke in `src/`. Neu angelegte
+Konfigurationen zählen nicht (sie verschärfen), eine neue Baseline schon. Platzhalter im
+neuen Code (`TODO`, `example.com`, `not implemented`) sind Hinweise. Eine Zeile
+`Guard-Ausnahme: <Grund>` in einer Commit-Nachricht macht aus allen Befunden Hinweise.
+Einzeln fahrbar: `bin/check-gate-integrity . origin/main`.
+
+**Neue Migrationen** (`migrations`, seit 27.09.2026, **blockierend**): Nur Migrationen, die
+gegenüber der Basis neu sind, und nur deren `up()`. Befunde: Entities, Repositories oder
+EntityManager in einer Migration (bricht, sobald sich die Entity ändert), `DELETE`/
+`UPDATE` ohne `WHERE`, und unter PostgreSQL eine neue `NOT NULL`-Spalte ohne `DEFAULT`
+(MySQL/MariaDB füllen still einen impliziten Wert ein, dort nur Hinweis). Hinweise: DROP
+oder Umbenennung (Expand-Contract), nicht umkehrbares `down()`. Einzeln fahrbar:
+`bin/check-migrations . origin/main`.
 
 **Symfony-Selbstprüfung** (`symfony-lint`, seit 27.09.2026, **blockierend**): Fährt
 Symfonys eigene, rein lesende Prüfungen im **laufenden** php-Container (startet nichts,
@@ -172,7 +195,7 @@ mit `PasswordCredentials`) braucht eine temporäre Sperre nach Fehlversuchen —
 die kleinste Passwort-`Length(min: …)` die Mindestlänge aus `guard-policy.yml`
 erreichen (Hausstandard **12**). `password_hashers` darf nur `auto`, `bcrypt`,
 `argon2i`/`argon2id`, `sodium` oder `native` nutzen, `plaintext`, `md5`, `sha1` und
-`sha256`/`sha512` sind ein Befund (ASVS 11.4.2). Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
+`sha256`/`sha512` sind ein Befund (ASVS 11.4.2). In `access_control` ist eine Regel, die eine frühere, allgemeinere Regel mit anderer Rolle nie zum Zug kommen lässt, ein Befund. Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
 für Passwort als einzigen Faktor), Höchstlänge unter 64, kein
 `NotCompromisedPassword` (BSI ORP.4.A8), ein Formular zum Passwortändern ohne Abfrage des
 bisherigen Passworts (ASVS 6.2.3; Erstpasswort- und Token-Wege sehen gleich aus), Anmeldung per SSO/OIDC (Sperre gehört dann

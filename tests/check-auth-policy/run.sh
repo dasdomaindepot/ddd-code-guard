@@ -120,6 +120,25 @@ expect 1 "App\Entity\User nutzt md5" "App\Entity\Admin nutzt sha512" "ASVS 11.4.
 run_script "$HERE/fixtures/inmemory-plaintext"
 expect 0 "keinen memory-Provider"
 
+# --- access_control: Regel ohne path überschattet; Nicht-dict-Eintrag stürzt nicht ab
+TMP_AC="$(mktemp -d)"
+cp -r "$HERE/fixtures/access-control-gut/." "$TMP_AC/"
+python3 - "$TMP_AC/config/packages/security.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]
+d = yaml.safe_load(open(p))
+d["security"]["access_control"] = [
+    {"roles": "PUBLIC_ACCESS"},
+    "kaputt",
+    {"path": "^/admin", "roles": "ROLE_ADMIN"},
+]
+yaml.safe_dump(d, open(p, "w"))
+PY
+run_script "$TMP_AC"
+expect 1 "Regel 3 (^/admin, ROLE_ADMIN) wird nie wirksam"
+expect_not 1 "Traceback"
+rm -rf "$TMP_AC"
+
 # --- kein security.yaml: nicht messbar
 run_script "$HERE/fixtures/no-security-yaml"
 expect 77 "nicht messbar"
@@ -133,6 +152,14 @@ expect_not 0 "ChangePasswordFormType.php"
 run_script "$HERE/fixtures/strlen"
 expect 1 "Mindestlänge 8" "PasswordResetApiController.php:12"
 expect_not 1 "keine Mindestlänge gefunden"
+
+# --- access_control: Regel wird von früherer Regel überschattet (Übersattung)
+run_script "$HERE/fixtures/access-control-schatten"
+expect 1 "wird nie wirksam"
+
+# --- access_control: Regel mit ^/ als abschließende Regel, Reihenfolge plausibel
+run_script "$HERE/fixtures/access-control-gut"
+expect 0 "Reihenfolge plausibel"
 
 # --- ohne Argument: aktuelles Verzeichnis (hier ohne security.yaml)
 OUT="$(cd "$HERE/fixtures/no-security-yaml" && "$SCRIPT" 2>&1)" && RC=0 || RC=$?

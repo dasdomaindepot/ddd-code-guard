@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+r"""check-migrations — neue Doctrine-Migrationen auf typische Fallstricke prüfen.
+
+Aufgerufen vom Code Guard (Check "migrations"), lässt sich aber auch allein
+fahren:
+    check-migrations <projektverzeichnis> <basis-ref>
+
+Geprüft werden nur *neue* Migrationsdateien — `migrations/**/*.php`, die
+gegenüber der merge-base von <basis-ref> und HEAD hinzugekommen sind
+(`git diff --name-only --diff-filter=A <base>`) oder unversioniert sind
+(`git ls-files --others --exclude-standard migrations`). Die Basis ist der
+Referenzstand; alter Code, der dort schon existiert, wird nicht geprüft.
+
+Geprüft werden nur Texte; es wird nichts gestartet oder aufgerufen. Alle
+Git-Zugriffe laufen per subprocess gegen das Projektverzeichnis, ein
+misslungener Aufruf zählt als „kein Befund" undürzt nie.
+
+Regeln je neuer Datei (Meldungen immer mit `<pfad>:<zeile>:`):
+    M1  Befund: Migration hängt an Entities/Repositories (use App\Entity\,
+        use App\Repository\, getRepository(, EntityManager) — bricht, sobald
+        sich diese ändern; nur SQL bzw. DBAL verwenden.
+    M2  Befund unter PostgreSQL, sonst Hinweis: ADD einer Spalte mit NOT NULL ohne DEFAULT in derselben
+        SQL-Anweisung (Regex über den Stringinhalt von $this->addSql(...));
+        CREATE TABLE ist ausgenommen.
+    M3  Hinweis: DROP COLUMN, DROP TABLE, CHANGE/RENAME COLUMN — alter Code
+        nutzt die Spalte während des Deploys ggf. noch (Expand-Contract).
+    M4  Hinweis: down() fehlt, ist leer oder enthält nur throw — nicht
+        umkehrbar.
+    M5  Befund: DELETE FROM oder UPDATE … SET ohne WHERE — verändert alle
+        Zeilen.
+
+Exit-Codes:
+      0  keine Befunde (nur Hinweise/ok)
+      1  Befunde
+      2  Nutzungsfehler (nicht genau zwei Argumente, Verzeichnis existiert nicht)
+     77  nicht messbar (kein Git-Repo, basis-ref nicht verifizierbar oder kein
+         Ordner migrations/)
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+EXCLUDED_PREFIXES = ("vendor/", "node_modules/", "var/", "docs/.guard/")
+
+# M1: Suchwort (Substring) → im Befund angezeigter Name.
+M1_PATTERNS = (
+    ("use App\\Entity\\", "use App\\Entity\\"),
+    ("use App\\Repository\\", "use App\\Repository\\"),
+    ("getRepository(", "getRepository("),
+    ("EntityManager", "EntityManager"),
+)
+
+# M3: Suchwort (Regex oder Substring) → Label.
+M3_PATTERNS = (
+    (re.compile(r"\bdrop\s+column\b", re.IGNORECASE), "DROP COLUMN"),
+    (re.compile(r"\bdrop\s+table\b", re.IGNORECASE), "DROP TABLE"),
+    (re.compile(r"\bchange\b", re.IGNORECASE), "CHANGE"),
+    (re.compile(r"\brename\s+(column|index)\b", re.IGNORECASE), "RENAME"),
+)
+
+# M5: Suchwort (Regex) → Label.
+M5_PATTERNS = (
+    (re.compile(r"\bdelete\s+from\b", re.IGNORECASE), "DELETE FROM"),
+    (re.compile(r"\bupdate\b\s+\S+\s+set\b", re.IGNORECASE), "UPDATE … SET"),
+)
+
+results = []
+
+
+def finding(msg: str) -> None:
+    results.append(("finding", msg))
+
+
+def note(msg: str) -> None:
+    results.append(("ok", msg))
+
+
+def hint(msg: str) -> None:
+    results.append(("hint", msg))
+
+
+def _none_since(snapshot: int) -> bool:
+    """True, wenn seit snapshot weder Befund noch Hinweis dazukam – sonst
+    stünde unter einem Hinweis ein widersprechendes „ok“."""
+    return all(t == "ok" for t, _ in results[snapshot:])
+
+
+# --- Git-/Datei-Hilfsfunktionen ----------------------------------------
+
+def git_run(project: str, args) -> str:
+    """Git-Aufruf mit cwd=project, stdout zurück; jeder Fehler → leer."""
+    try:
+        proc = subprocess.run(
+            ["git"] + list(args),
+            cwd=project,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout
+
+
+def read_file(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def strip_sql_comments(text: str) -> str:
+    """SQL-Kommentare (/* … */ und –… Zeilen) entfernen."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"--[^\n]*", " ", text)
+    return text
+
+
+def is_migration(path: str) -> bool:
+    return path.startswith("migrations/") and path.endswith(".php")
+
+
+def new_migrations(project: str, base: str):
+    """Relative Pfade der neuen Migrationen (gegen base added + unversioniert).
+
+    Tupel (pfad, unversioniert, text).
+    """
+    added = git_run(project, ["diff", "--name-only", "--diff-filter=A", base])
+    unversioned = git_run(
+        project, ["ls-files", "--others", "--exclude-standard", "migrations"]
+    )
+
+    entries = {}
+    for line in added.splitlines():
+        p = line.strip()
+        if p and is_migration(p):
+            entries[p] = False
+    for line in unversioned.splitlines():
+        p = line.strip()
+        if p and is_migration(p):
+            entries[p] = True
+
+    items = []
+    for path, unv in entries.items():
+        text = read_file(os.path.join(project, path))
+        text = text if text is not None else ""
+        items.append((path, unv, text))
+    return items
+
+
+# --- Einzelprüfungen -----------------------------------------------------
+
+def check_m1(rel: str, text: str) -> None:
+    snap = len(results)
+    linenos = []
+    kinds = set()
+    for ln, raw in enumerate(text.splitlines(), 1):
+        for needle, label in M1_PATTERNS:
+            if needle in raw:
+                kinds.add(label)
+                linenos.append(ln)
+                break
+    for ln in sorted(set(linenos)):
+        finding(f"{rel}:{ln}: Migration hängt an aktuellen Entities/Repositories "
+                f"({', '.join(sorted(kinds))}) und bricht, sobald sich diese "
+                f"ändern; nur SQL bzw. DBAL verwenden")
+    if _none_since(snap):
+        note(f"{rel}: keine Entities/Repositories in der Migration")
+
+
+def addsql_calls(text: str):
+    """Liste (start_line, sql_string) für jede $this->addSql(...)."""
+    out = []
+    for m in re.finditer(r"\$this\s*->\s*addSql\s*\(", text, re.IGNORECASE):
+        arg = extract_string(text, m.end())
+        if arg is None:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        out.append((line, arg))
+    return out
+
+
+def extract_string(text: str, start_idx: int):
+    """Ersten Anführungsstring ab start_idx; (Inhalt, pos) oder None."""
+    i = start_idx
+    while i < len(text) and text[i] not in ("'", '"'):
+        i += 1
+    if i >= len(text):
+        return None
+    quote = text[i]
+    j = i + 1
+    buf = []
+    while j < len(text):
+        c = text[j]
+        if c == "\\" and j + 1 < len(text):
+            buf.append(text[j + 1])
+            j += 2
+            continue
+        if c == quote:
+            break
+        buf.append(c)
+        j += 1
+    return "".join(buf)
+
+
+def database_engine(project: str):
+    """"postgresql", "mysql" oder None – aus DATABASE_URL in .env/.env.local."""
+    for name in (".env.local", ".env"):
+        text = read_file(os.path.join(project, name)) or ""
+        for raw in text.splitlines():
+            m = re.match(r"\s*(?:export\s+)?DATABASE_URL\s*=\s*[\"']?(\w+)", raw)
+            if m:
+                scheme = m.group(1).lower()
+                if scheme.startswith(("postgres", "pgsql")):
+                    return "postgresql"
+                if scheme.startswith(("mysql", "mariadb")):
+                    return "mysql"
+    return None
+
+
+def up_calls(text: str):
+    """addSql-Aufrufe innerhalb von up(). down() kehrt up() um; ein DROP oder
+    DELETE dort ist gewollt und kein Befund."""
+    m = re.search(r"function\s+up\s*\(", text, re.IGNORECASE)
+    if not m:
+        return addsql_calls(text)
+    start = text.find("{", m.end())
+    if start == -1:
+        return addsql_calls(text)
+    depth, end = 0, len(text)
+    for j in range(start, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                end = j
+                break
+    first = text.count("\n", 0, start) + 1
+    last = text.count("\n", 0, end) + 1
+    return [(ln, sql) for ln, sql in addsql_calls(text) if first <= ln <= last]
+
+
+def check_m2(rel: str, text: str, engine) -> None:
+    """ADD … NOT NULL ohne DEFAULT. PostgreSQL bricht auf einer Tabelle mit
+    Bestandszeilen ab (Befund); MySQL/MariaDB füllen still einen impliziten
+    Wert wie 0 oder '' ein (Hinweis: gewollt?)."""
+    snap = len(results)
+    for line, sql in up_calls(text):
+        for stmt in sql.split(";"):
+            s = strip_sql_comments(stmt).strip()
+            if not re.match(r"alter\s+table\b", s, re.IGNORECASE):
+                continue
+            # Doctrine schreibt mehrere Spalten in eine Anweisung: ADD a …, ADD b …
+            for clause in re.split(r",\s*(?=add\b)", s, flags=re.IGNORECASE):
+                m = re.search(r"\badd\s+(?:column\s+)?(\S+)", clause, re.IGNORECASE)
+                if not m:
+                    continue
+                if re.match(r"(constraint|primary|foreign|unique|index|key|check)\b",
+                            m.group(1), re.IGNORECASE):
+                    continue
+                low = clause.lower()
+                if "not null" not in low or "default" in low:
+                    continue
+                spalte = m.group(1).strip("`\"")
+                if engine == "postgresql":
+                    finding(f"{rel}:{line}: Spalte {spalte} NOT NULL ohne DEFAULT — "
+                            f"scheitert unter PostgreSQL auf einer Tabelle mit "
+                            f"Bestandszeilen; DEFAULT setzen oder in zwei Schritten")
+                else:
+                    hint(f"{rel}:{line}: Spalte {spalte} NOT NULL ohne DEFAULT — "
+                         f"MySQL/MariaDB füllen Bestandszeilen still mit 0 bzw. ''; "
+                         f"gewollt? Sonst DEFAULT setzen oder befüllen")
+    if _none_since(snap):
+        note(f"{rel}: keine NOT-NULL-Spalte ohne DEFAULT")
+
+
+def check_m3(rel: str, text: str) -> None:
+    snap = len(results)
+    linenos = set()
+    for line, sql in up_calls(text):
+        for pat, _label in M3_PATTERNS:
+            hit = (pat in sql) if isinstance(pat, str) else (pat.search(sql) is not None)
+            if hit:
+                linenos.add(line)
+                break
+    for ln in sorted(linenos):
+        hint(f"{rel}:{ln}: DROP/Umbenennung einer Spalte oder Tabelle — alter "
+             f"Code nutzt die Spalte während des Deploys ggf. noch "
+             f"(Expand-Contract); Backup und Reihenfolge prüfen")
+    if _none_since(snap):
+        note(f"{rel}: keine DROP/Umbenennung in der Migration")
+
+
+def function_body(text: str, pattern: str):
+    """Körper (Zwischen den {}) der ersten Funktion zu pattern, oder None."""
+    m = re.search(pattern, text, re.IGNORECASE)
+    if not m:
+        return None
+    i = text.find("{", m.end())
+    if i == -1:
+        return ""
+    depth = 0
+    j = i
+    while j < len(text):
+        c = text[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i + 1:j]
+        j += 1
+    return text[i + 1:]
+
+
+def check_m4(rel: str, text: str) -> None:
+    snap = len(results)
+    down = re.search(r"function\s+down\s*\(", text, re.IGNORECASE)
+    up = re.search(r"function\s+up\s*\(", text, re.IGNORECASE)
+    line = text.count("\n", 0, down.start()) + 1 if down else \
+        (text.count("\n", 0, up.start()) + 1 if up else 1)
+
+    if down is None:
+        hint(f"{rel}:{line}: public function down() fehlt — Migration nicht "
+             f"umkehrbar; bewusst so?")
+        return
+
+    body = function_body(text, r"function\s+down\s*\(") or ""
+    clean = strip_sql_comments(body)
+    clean = re.sub(r"\bthrow\b[^\n]*;", "", clean)
+    clean = re.sub(r"\$\w*->throwIrreversibleMigrationException\([^)]*\);?",
+                   "", clean)
+    if clean.strip() == "":
+        hint(f"{rel}:{line}: down() ist leer oder nur throw — Migration nicht "
+             f"umkehrbar; bewusst so?")
+    else:
+        note(f"{rel}: down() ist umkehrbar")
+
+
+def check_m5(rel: str, text: str) -> None:
+    """DELETE/UPDATE ohne WHERE – je SQL-Anweisung, nicht je Zeile: Doctrine-
+    Migrationen verteilen eine Anweisung oft über mehrere Zeilen."""
+    snap = len(results)
+    for line, sql in up_calls(text):
+        for stmt in sql.split(";"):
+            s = strip_sql_comments(stmt)
+            for pat, label in M5_PATTERNS:
+                if pat.search(s) and not re.search(r"\bwhere\b", s, re.IGNORECASE):
+                    finding(f"{rel}:{line}: {label} ohne WHERE — verändert alle Zeilen")
+                    break
+    if _none_since(snap):
+        note(f"{rel}: keine DELETE/UPDATE ohne WHERE")
+
+
+# --- Hauptprogramm -------------------------------------------------------
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(
+            "Verwendung: check-migrations <projektverzeichnis> <basis-ref>",
+            file=sys.stderr,
+        )
+        return 2
+
+    project = os.path.abspath(sys.argv[1])
+    basis = sys.argv[2]
+
+    if not os.path.isdir(project):
+        print(f"{project}: Verzeichnis existiert nicht", file=sys.stderr)
+        return 2
+
+    if not basis:
+        print("basis-ref ist leer — nicht messbar.", file=sys.stderr)
+        return 77
+
+    verify = subprocess.run(
+        ["git", "rev-parse", "--verify", basis],
+        cwd=project,
+        capture_output=True,
+        text=True,
+    )
+    if verify.returncode != 0:
+        print(
+            f"{basis}: nicht messbar (kein Git-Repo oder Ref fehlt)",
+            file=sys.stderr,
+        )
+        return 77
+
+    base_out = git_run(project, ["merge-base", basis, "HEAD"]).strip()
+    if not base_out:
+        print("merge-base nicht bestimmbar — nicht messbar.", file=sys.stderr)
+        return 77
+    base = base_out
+
+    tracked = git_run(project, ["ls-files", "migrations"]).splitlines()
+    unversioned = git_run(
+        project, ["ls-files", "--others", "--exclude-standard", "migrations"]
+    ).splitlines()
+    tracked = [x.strip() for x in tracked if x.strip()]
+    unversioned = [x.strip() for x in unversioned if x.strip()]
+    if (
+        not tracked
+        and not unversioned
+        and not os.path.isdir(os.path.join(project, "migrations"))
+    ):
+        print("kein Ordner migrations/ — nicht messbar.", file=sys.stderr)
+        return 77
+
+    new_files = new_migrations(project, base)
+    if not new_files:
+        print("ok       keine neuen Migrationen")
+        return 0
+
+    engine = database_engine(project)
+    for path, _unv, text in new_files:
+        snap = len(results)
+        check_m1(path, text)
+        check_m2(path, text, engine)
+        check_m3(path, text)
+        check_m4(path, text)
+        check_m5(path, text)
+        if _none_since(snap):
+            note(f"{path}: Migration ohne Befund")
+
+    nfind = sum(1 for t, _ in results if t == "finding")
+
+    for typ, msg in results:
+        if typ == "finding":
+            print(f"BEFUND   {msg}")
+        elif typ == "ok":
+            print(f"ok       {msg}")
+        else:
+            print(f"Hinweis  {msg}")
+    print()
+    if nfind:
+        print(f"{nfind} Befund(e).")
+        return 1
+    print("Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,5 @@
+security:
+    session_fixation_strategy: none
+    firewalls:
+        main:
+            session_fixation_strategy: none

@@ -11,6 +11,8 @@ Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert conf
     S2 CSRF-Schutz (ASVS 3.5.1)
     S3 Datei-Uploads mit Größen- und Typbegrenzung (ASVS 5.2.1, 5.2.2)
     S4 .dockerignore beim ganzen Projekt-COPY (ASVS 13.4.1)
+    S5 gefährliche Produktions-/Debug-Konfiguration (Session-Fixation,
+       Profiler/Debug-Bundle, Debug-Modus in Produktion)
 
 Hinweise (kein Einfluss auf den Exit):
     H1 Rohes SQL mit eingesetzter Variable (ASVS 1.2.4)
@@ -79,11 +81,21 @@ def load_top_level_yaml(path: str):
         return None
 
 
+def load_top_level_json(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _read_text(path: str):
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Binaer- oder Latin-1-Dateien sind fuer keine Regel relevant; ein
+        # Absturz saehe im Guard aus wie ein Befund.
         return None
 
 
@@ -298,6 +310,171 @@ def part_s4_dockerignore(project_path: str) -> None:
         ok(".dockerignore schließt .git und .env.local aus")
 
 
+# --- S5: Gefährliche Produktions-/Debug-Konfiguration ------------------
+
+def _require_dev_psr4_prefixes(project_path: str) -> dict:
+    """Zu jedem require-dev-Paket die psr-4-Klassenpräfixe aus composer.lock.
+
+    Gibt ein Dict {paketname: [präfixe]} zurück; ohne composer.lock leer.
+    """
+    composer = load_top_level_json(os.path.join(project_path, "composer.json"))
+    dev_packages = []
+    if isinstance(composer, dict):
+        dev = composer.get("require-dev")
+        if isinstance(dev, dict):
+            dev_packages = list(dev.keys())
+    if not dev_packages:
+        return {}
+    lock = load_top_level_json(os.path.join(project_path, "composer.lock"))
+    if not isinstance(lock, dict):
+        return {}
+    result = {}
+    for pkg in lock.get("packages-dev", []) or []:
+        if not isinstance(pkg, dict):
+            continue
+        name = pkg.get("name")
+        if name not in dev_packages:
+            continue
+        prefixes = []
+        autoload = pkg.get("autoload")
+        if isinstance(autoload, dict):
+            psr4 = autoload.get("psr-4")
+            if isinstance(psr4, dict):
+                for prefix in psr4.keys():
+                    if isinstance(prefix, str):
+                        prefixes.append(prefix)
+        result[name] = prefixes
+    return result
+
+
+def _env_file_debug_in_prod(text: str) -> bool:
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = re.match(r"APP_ENV\s*=\s*(\S+)", s)
+        if m and m.group(1).lower() == "dev":
+            return True
+        m = re.match(r"APP_DEBUG\s*=\s*(\S+)", s)
+        if m and m.group(1) in ("1", "true", "True", "TRUE"):
+            return True
+    return False
+
+
+def _dockerfile_debug_in_prod(text: str) -> bool:
+    stages = []
+    current = None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.upper().startswith("FROM "):
+            current = {"prod_named": False, "env": []}
+            stages.append(current)
+            m = re.search(r"FROM\s+\S+\s+AS\s+(\S+)", s, re.IGNORECASE)
+            if m and "prod" in m.group(1).lower():
+                current["prod_named"] = True
+        elif current is not None:
+            current["env"].append(s)
+    if not stages:
+        return False
+    if len(stages) == 1:
+        prod_envs = stages[0]["env"]
+    else:
+        prod_envs = [env for st in stages if st["prod_named"] for env in st["env"]]
+    for env in prod_envs:
+        body = re.sub(r"^ENV\s+", "", env, flags=re.IGNORECASE)
+        if re.match(r"APP_ENV\s*=\s*dev\b", body, re.IGNORECASE):
+            return True
+        if re.match(r"APP_DEBUG\s*=\s*(1|true)\b", body, re.IGNORECASE):
+            return True
+    return False
+
+
+def part_s5_prod_config(project_path: str) -> None:
+    here = []
+
+    # 1. Session-Fixation (nur Top-Level security:, nicht when@…)
+    sec = load_top_level_yaml(os.path.join(project_path, "config", "packages", "security.yaml"))
+    secroot = sec.get("security") if isinstance(sec, dict) else None
+    if isinstance(secroot, dict):
+        if "session_fixation_strategy" in secroot \
+                and secroot["session_fixation_strategy"] in (None, "none"):
+            here.append(
+                "Session-ID wird beim Login nicht erneuert (Session Fixation); "
+                "Standard migrate verwenden"
+            )
+        firewalls = secroot.get("firewalls")
+        if isinstance(firewalls, dict):
+            for name, fw in firewalls.items():
+                if not isinstance(fw, dict) or name.startswith("when@") \
+                        or "session_fixation_strategy" not in fw:
+                    continue
+                if fw["session_fixation_strategy"] in (None, "none"):
+                    here.append(
+                        f"Firewall {name}: Session-ID wird beim Login nicht "
+                        f"erneuert (Session Fixation); Standard migrate verwenden"
+                    )
+
+    # 2 + 3. Profiler/Debug- und require-dev-Bundles in bundles.php
+    prefixes_by_package = _require_dev_psr4_prefixes(project_path)
+    bundles_text = _read_text(os.path.join(project_path, "config", "bundles.php"))
+    if bundles_text is not None:
+        for line in bundles_text.splitlines():
+            m = re.match(r"^\s*([A-Za-z0-9_\\]+)::class\s*=>\s*\[(.*)\]", line)
+            if not m:
+                continue
+            bundle = m.group(1)
+            options = m.group(2)
+            is_all = re.search(r"['\"]all['\"]\s*=>\s*true", options) is not None
+            is_prod = re.search(r"['\"]prod['\"]\s*=>\s*true", options) is not None
+            if not (is_all or is_prod):
+                continue
+            if "WebProfilerBundle" in bundle or "DebugBundle" in bundle:
+                here.append(
+                    f"Profiler/Debug in Produktion aktiv ({bundle})"
+                )
+            if is_all and prefixes_by_package:
+                for package, prefixes in prefixes_by_package.items():
+                    for prefix in prefixes:
+                        if bundle.startswith(prefix):
+                            here.append(
+                                f"{bundle} kommt aus require-dev ({package}), "
+                                f"ist aber für all aktiv — die App startet mit "
+                                f"composer install --no-dev nicht; auf "
+                                f"['dev' => true, 'test' => true] beschränken"
+                            )
+
+    # 4. Debug-Modus in Produktion (.env.prod oder Produktionsstufe)
+    debug_source = None
+    prod_env_path = os.path.join(project_path, ".env.prod")
+    if os.path.isfile(prod_env_path):
+        env_text = _read_text(prod_env_path)
+        if env_text is not None and _env_file_debug_in_prod(env_text):
+            debug_source = relative(project_path, prod_env_path)
+    dockerfiles = []
+    root_dockerfile = os.path.join(project_path, "Dockerfile")
+    if os.path.isfile(root_dockerfile):
+        dockerfiles.append(root_dockerfile)
+    dockerfiles += glob.glob(
+        os.path.join(project_path, "docker", "**", "Dockerfile*"), recursive=True
+    )
+    for df in dockerfiles:
+        df_text = _read_text(df)
+        if df_text is not None and _dockerfile_debug_in_prod(df_text):
+            debug_source = relative(project_path, df)
+            break
+    if debug_source is not None:
+        here.append(
+            f"Produktion läuft im Debug-Modus (Stacktraces, Profiler) — "
+            f"{debug_source}"
+        )
+
+    if here:
+        for m in here:
+            finding(m)
+    else:
+        ok("Produktions-Konfiguration: kein Debug, Session-Fixation-Schutz aktiv")
+
+
 # --- H1: Rohes SQL -----------------------------------------------------
 
 SQL_RE = re.compile(r'''(executeQuery|executeStatement|->query|->exec|createNativeQuery)\(.*("[^"]*\$\w|['"]\s*\.\s*\$\w)''')
@@ -369,7 +546,7 @@ def part_h3_crypto(project_path: str) -> None:
                     f"random_bytes/password_hash/hash('sha256') verwenden"
                 )
                 continue
-            m = re.search(r"\b(?:rand|mt_rand)\s*\(", low)
+            m = re.search(r"\b(rand|mt_rand)\s*\(", low)
             if m and any(k in low for k in ("token", "code", "secret", "password")):
                 hint(
                     f"{rel}:{i}: {m.group(1)} für Sicherheitszwecke — "
@@ -484,6 +661,7 @@ def main() -> int:
         part_s2_csrf(project_path)
         part_s3_uploads(project_path)
         part_s4_dockerignore(project_path)
+        part_s5_prod_config(project_path)
 
     part_h1_sql(project_path)
     part_h2_raw_twig(project_path)
