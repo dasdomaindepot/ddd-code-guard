@@ -49,6 +49,13 @@ deployment: symfony-docker
 # Pfade, die eine öffentliche API bilden (Vertrag mit Dritten)
 oeffentliche_api: [/api/v1]
 
+# Fremde Hosts, die beim ersten Seitenaufruf laden DÜRFEN (Check third-party).
+# Hausstandard ist: nichts Fremdes vor einem Klick. Jede Freigabe braucht einen
+# Grund, sonst zählt sie nicht.
+externe_quellen:
+  - host: js.zahlungsanbieter.example
+    grund: Zahlungsformular muss laut Anbieter von dessen Server geladen werden.
+
 # Externe Dienste, an die geschrieben wird (Zahlung, Versand, Mail, Webhooks)
 externe_dienste: [Stripe, DHL]
 

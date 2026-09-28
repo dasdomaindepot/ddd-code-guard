@@ -129,15 +129,18 @@ Geheimniswerte werden nie ausgegeben. Versionierte Build-Artefakte (`vendor/`,
 `node_modules/`, `var/cache/`, `var/log/`, `public/build/`) sind je Verzeichnis ein Befund,
 persönlicher IDE-Zustand und `.DS_Store` Hinweise. Einzeln fahrbar: `bin/check-secrets .`.
 
-**Drittanbieter** (`third-party`, seit 28.09.2026, **blockierend**): Lädt die lokale
-Instanz beim ersten Aufruf Google Fonts, Google Maps, YouTube ohne
-`youtube-nocookie.com`, Google Analytics/Tag Manager, Meta-Pixel oder Hotjar? Geprüft
-werden `<link>`, `<script>`, `<iframe>`, `<img>`, Inline-Skripte sowie `@import` in
-Stylesheets derselben Herkunft. Google Fonts sind immer ein Befund (selbst hosten); die
-übrigen mit erkennbarem Consent-Tool (Usercentrics, Cookiebot, Borlabs, Klaro …) nur ein
-Hinweis. Ein von einem Consent-Tool blockiertes Element (`type="text/plain"`, `data-src`)
-gilt als nicht geladen. Externe CDNs sind Hinweise. Einzeln fahrbar:
-`bin/check-third-party https://test.de`.
+**Drittanbieter** (`third-party`, seit 28.09.2026, verschärft in 1.20.0, **blockierend**):
+Hausstandard ist, dass beim ersten Aufruf einer Seite **keine Anfrage an einen fremden Host**
+geht. Geprüft wird die ausgelieferte Seite (Startseite plus Sitemap): Scripts, Stylesheets,
+Schriften, `preconnect`/`preload`, iframes, Bilder inkl. `srcset`, Video/Audio, `@import` und
+`url()` in Stylesheets eigener Herkunft. Jeder fremde Host ist ein Befund (`third-party/T1`),
+nicht nur bekannte Anbieter – also auch jQuery von `code.jquery.com` oder ein CDN.
+Ein Consent-Tool mildert nicht ab, und auch `youtube-nocookie.com` zählt, wenn es direkt
+eingebunden ist. In Ordnung sind Einbettungen als Platzhalter, die erst per Klick laden
+(`data-src`, `type="text/plain"`, lokales Vorschaubild) – die Zwei-Klick-Lösung. Eigene
+Subdomains derselben Domain gelten als eigen. Bewusste Ausnahmen je Host mit Pflicht-Grund
+in `.ai/guard-profile.yml` unter `externe_quellen` (siehe `references/project-profile.md`).
+Einzeln fahrbar: `bin/check-third-party https://test.de [projektverzeichnis]`.
 
 **Läuft die Instanz?** Vor allen Web-Checks fragt der Guard die lokale URL einmal ab.
 Kommt kein 200 zurück oder landet die Anfrage nach Weiterleitungen auf einem anderen

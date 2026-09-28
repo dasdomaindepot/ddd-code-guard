@@ -12,6 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "$HERE/../.." && pwd)"
 SCRIPT="$BASE_DIR/claude/skills/code-quality/bin/check-third-party"
+FIX="$HERE/fixtures"
 
 if [ ! -x "$SCRIPT" ]; then
     echo "FEHLER: Script nicht gefunden oder nicht ausführbar: $SCRIPT" >&2
@@ -82,53 +83,92 @@ expect() {
 }
 
 expect_not() {
-    local kw
+    local exp_rc="$1"; shift
+    local ok=1 kw
+    if [ "$RC" -ne "$exp_rc" ]; then
+        echo "FEHLER: erwarteter Exit $exp_rc, aber $RC" >&2
+        printf '%s\n' "$OUT" >&2
+        ok=0
+    fi
     for kw in "$@"; do
         if printf '%s' "$OUT" | grep -qF -- "$kw"; then
-            echo "FEHLER: Stichwort „$kw“ unerwartet in der Ausgabe" >&2
-            fail=1
+            echo "FEHLER: Stichwort „$kw” nicht erwartet" >&2
+            ok=0
         fi
     done
+    [ "$ok" -eq 1 ] || fail=1
 }
 
-# --- guter Fall: youtube-nocookie, selbst gehosteter Schrift, kein Tracker ----------
-port="$(start_server "$HERE/fixtures/gut")"
+# --- guter Fall: selbst gehosteter Schrift, kein Tracker -----------------------------
+port="$(start_server "$FIX/gut")"
 run_script "http://127.0.0.1:$port"
-expect 0 "keine Drittanbieter beim ersten Aufruf"
+expect 0 "keine fremden Quellen beim ersten Aufruf"
 
 # --- Google Fonts direkt über <link> ------------------------------------------------
-port="$(start_server "$HERE/fixtures/fonts")"
+port="$(start_server "$FIX/fonts")"
 run_script "http://127.0.0.1:$port"
 expect 1 "Google Fonts"
 
 # --- Google Fonts über verlinktes Stylesheet (@import) ------------------------------
-port="$(start_server "$HERE/fixtures/fonts-css")"
+port="$(start_server "$FIX/fonts-css")"
 run_script "http://127.0.0.1:$port"
 expect 1 "über /app.css"
 
-# --- Tracker ohne Consent: Analytics, YouTube, Maps ---------------------------------
-port="$(start_server "$HERE/fixtures/tracker")"
+# --- Tracker ohne Consent: Analytics, Maps, YouTube ---------------------------------
+port="$(start_server "$FIX/tracker")"
 run_script "http://127.0.0.1:$port"
 expect 1 \
     "Google Analytics/Tag Manager" \
-    "YouTube ohne youtube-nocookie.com" \
-    "Google Maps"
+    "Google Maps" \
+    "YouTube"
 
-# --- Consent-Tool erkannt: alle zu Hinweisen, kein Befund ---------------------------
-port="$(start_server "$HERE/fixtures/consent")"
+# --- Consent-Tool mildert NICHT ab: Script + YouTube werden gemeldet -----------------
+port="$(start_server "$FIX/consent")"
 run_script "http://127.0.0.1:$port"
-expect 0 "Consent-Tool erkannt"
-expect_not "ohne Einwilligung"
+expect 1 \
+    "app.usercentrics.eu" \
+    "YouTube"
+
+# --- CDN-Bibliothek ohne bekannten Anbieter: Befund, lokal ausliefern ----------------
+port="$(start_server "$FIX/cdn")"
+run_script "http://127.0.0.1:$port"
+expect 1 "code.jquery.com"
+
+# --- iframe ohne youtube-nocookie: lädt beim ersten Aufruf, Zwei-Klick --------------
+port="$(start_server "$FIX/nocookie")"
+run_script "http://127.0.0.1:$port"
+expect 1 "youtube-nocookie"
+
+# --- srcset: fremde Bild-URL wird gemeldet ------------------------------------------
+port="$(start_server "$FIX/srcset")"
+run_script "http://127.0.0.1:$port"
+expect 1 "bilder.fremd.example"
 
 # --- blockiert (data-src / type=text/plain): nichts wird geladen ---------------------
-port="$(start_server "$HERE/fixtures/blockiert")"
+port="$(start_server "$FIX/blockiert")"
 run_script "http://127.0.0.1:$port"
 expect 0
 
-# --- externes CDN: nur Hinweis, kein Befund -----------------------------------------
-port="$(start_server "$HERE/fixtures/cdn")"
+# --- JSON-LD mit Links auf fremde Profile: Strukturdaten laden nichts --------------
+port="$(start_server "$FIX/jsonld")"
 run_script "http://127.0.0.1:$port"
-expect 0 "externes CDN"
+expect 0 "keine fremden Quellen"
+expect_not 0 "youtube.com" "instagram.com"
+
+# --- mehrere Seiten über sitemap: Formatierungsregel für >3 Seiten ------------------
+port="$(start_server "$FIX/mehrerer-seiten")"
+run_script "http://127.0.0.1:$port"
+expect 1 "und 3 weiteren Seiten"
+
+# --- Freigabe aus dem Projektprofil: statt Befund eine `ok … freigegeben …` ----------
+port="$(start_server "$FIX/allowlist")"
+run_script "http://127.0.0.1:$port" "$FIX/allowlist"
+expect 0 "freigegeben"
+
+# --- Freigabe ohne Grund: Hinweis, der Eintrag wird nicht berücksichtigt -------------
+port="$(start_server "$FIX/no-grund")"
+run_script "http://127.0.0.1:$port" "$FIX/no-grund"
+expect 1 "ohne Grund"
 
 # --- nicht erreichbar: Port ohne Server ----------------------------------------------
 dead_port="$(free_port)"

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://localhost/</loc></url>
+  <url><loc>http://localhost/seite-1.html</loc></url>
+  <url><loc>http://localhost/seite-2.html</loc></url>
+  <url><loc>http://localhost/seite-3.html</loc></url>
+  <url><loc>http://localhost/seite-4.html</loc></url>
+  <url><loc>http://localhost/seite-5.html</loc></url>
+</urlset>

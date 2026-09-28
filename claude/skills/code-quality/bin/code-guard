@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.19.1"
+VERSION="1.20.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -406,7 +406,7 @@ CHECK_DEFS=(
   "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
   "favicon|Favicons|frontend|normal|$SCRIPT_DIR/check-favicon $WEB_URL|web-url,bin:python3"
   "web-resources|Links und Bilder|frontend|normal|$SCRIPT_DIR/check-web-resources $WEB_URL|web-url,bin:python3"
-  "third-party|Drittanbieter|legal|normal|$SCRIPT_DIR/check-third-party $WEB_URL|web-url,bin:python3"
+  "third-party|Drittanbieter|legal|normal|$SCRIPT_DIR/check-third-party $WEB_URL .|web-url,bin:python3"
   "browser-audit|Browser-Audit|frontend|expensive|$SCRIPT_DIR/check-browser-audit $WEB_URL|web-url,bin:node"
 )
 
@@ -485,9 +485,11 @@ CHECK_DEFS=(
 # migrations (seit 1.15.0) blockiert: nur neue Migrationen -- Entities in
 # Migrationen, NOT NULL ohne DEFAULT, DELETE/UPDATE ohne WHERE.
 #
-# third-party (seit 1.16.0) blockiert: Drittanbieter, die beim ersten Aufruf ohne
-# Einwilligung laden -- Google Fonts immer, Maps/YouTube/Analytics/Pixel ohne
-# erkennbares Consent-Tool. Mit Consent-Tool und bei externen CDNs: Hinweis.
+# third-party (seit 1.16.0, verschaerft in 1.20.0) blockiert: Beim ersten Aufruf
+# darf keine Anfrage an einen fremden Host gehen -- jeder fremde Host, nicht nur
+# bekannte Anbieter; ein Consent-Tool mildert nicht ab. Einbettungen laden erst
+# nach Klick (Zwei-Klick-Loesung), Bibliotheken und Schriften kommen lokal.
+# Bewusste Ausnahmen je Host mit Grund in .ai/guard-profile.yml (externe_quellen).
 #
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.
