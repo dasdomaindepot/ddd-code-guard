@@ -21,7 +21,12 @@ Prüfpunkte (Stand der Rechtslage: September 2026):
      Verweis kann als irreführend gelten.
   6. Datenschutzerklärung vorhanden, kein TTDSG (seit 14.05.2024 TDDDG) und kein
      „Privacy Shield" als Grundlage (vom EuGH am 16.07.2020 gekippt, Nachfolger ist
-     seit 10.07.2023 das EU-US Data Privacy Framework).
+      seit 10.07.2023 das EU-US Data Privacy Framework).
+   7. Impressum- und Datenschutz-Link auf jeder Seite (Startseite plus URLs aus
+      sitemap.xml, höchstens 30): jede HTML-Seite muss auf beide Rechtstexte
+      verlinken.
+   8. Barrierefreiheitserklärung (BFSG): bei erkennbarem Shop/Buchung/Registrierung
+      ohne Link zur Barrierefreiheitserklärung ein Hinweis.
 
 Nicht automatisch prüfbar und deshalb nur ein Hinweis: ob ALLE Vertretungsberechtigten
 genannt sind (§ 5 Abs. 1 Nr. 1 DDG — bei einer GmbH jeder Geschäftsführer).
@@ -51,6 +56,7 @@ CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE  # lokale Instanzen mit mkcert/selbstsignierten Zertifikaten
 
 findings = 0
+MAX_SEITEN = 30
 
 
 def finding(msg: str) -> None:
@@ -67,16 +73,17 @@ def hint(msg: str) -> None:
     print(f"Hinweis  {msg}")
 
 
-def fetch(url: str) -> tuple[int, str, str]:
-    """(Status, finale URL, Body). Folgt Weiterleitungen."""
+def fetch(url: str) -> tuple[int, str, str, str]:
+    """(Status, Content-Type, finale URL, Body). Folgt Weiterleitungen."""
     req = urllib.request.Request(url, headers={"User-Agent": "code-guard-legal"})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
-            return r.status, r.geturl(), r.read().decode("utf-8", "replace")
+            ct = r.headers.get("Content-Type", "")
+            return r.status, ct, r.geturl(), r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        return e.code, url, ""
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
-        return 0, url, ""
+        return e.code, "", url, ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, UnicodeDecodeError):
+        return 0, "", url, ""
 
 
 def visible_text(body: str) -> str:
@@ -91,9 +98,97 @@ def visible_text(body: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(body))
 
 
+def anchor_targets(body: str) -> list[str]:
+    """Alle href-Werte aller <a>-Elemente (Reihenfolge wie im Quelltext)."""
+    return re.findall(r'(?is)<a\b[^>]*href="([^"]*)"', body)
+
+
+def anchor_texts(body: str) -> list[tuple[str, str]]:
+    """(href, sichtbarer Text) aller <a>-Elemente."""
+    return re.findall(r'(?is)<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>', body)
+
+
+def href_path(href: str) -> str:
+    """Ziel-Path eines Links, kleingeschrieben (Groß/Klein bleibt egal)."""
+    return urllib.parse.urlparse(href).path.lower()
+
+
+def has_link_to(body: str, *words: str) -> bool:
+    """Gibt es einen <a>, dessen Ziel-Path eines der words enthält?"""
+    return any(w in href_path(h) for h in anchor_targets(body) for w in words)
+
+
+SHOP_WORTER = ("warenkorb", "cart", "checkout", "kasse", "shop",
+               "buchen", "booking", "registrier", "register")
+
+
+# Ganze Wörter bzw. Pfadteile – sonst trifft „shop“ auch „Workshop“.
+SHOP_RE = re.compile(r"(?<![a-zäöüß])(warenkorb|cart|checkout|kasse|shop|buchen|booking|"
+                     r"registrier\w*|register)(?![a-zäöüß])")
+
+
+def wirkt_shop(path: str, body: str) -> bool:
+    """Zeigt die Seite auf einen Shop oder Buchung (eigener Path oder ein Link)?"""
+    if SHOP_RE.search(path.lower()):
+        return True
+    for href, text in anchor_texts(body):
+        hay = (href + " " + re.sub(r"<[^>]+>", "", text)).lower()
+        if SHOP_RE.search(hay):
+            return True
+    return False
+
+
+def hat_barrierefreiheit(body: str) -> bool:
+    """Gibt es einen <a>, dessen Ziel oder Text die Barrierefreiheitserklärung meint?"""
+    for href, text in anchor_texts(body):
+        hay = (href + " " + re.sub(r"<[^>]+>", "", text)).lower()
+        if "barrierefreiheit" in hay or "accessibility" in hay:
+            return True
+    return False
+
+
+def report_fehlend(label: str, seiten: list[str]) -> None:
+    """Meldet fehlende Links; ab mehr als drei Seiten nur die ersten drei plus Summe.
+    label trägt den Artikel mit („das Impressum“, „die Datenschutzerklärung“)."""
+    for p in seiten[:3]:
+        finding(f"{p}: kein Link auf {label}")
+    if len(seiten) > 3:
+        hint(f"… und auf {len(seiten) - 3} weiteren Seiten kein Link auf {label}")
+
+
+def normalize_path(path: str) -> str:
+    """Schreibt Pfade normalisiert: kein abschließender Slash (außer Wurzel)."""
+    if len(path) > 1:
+        return path.rstrip("/") or "/"
+    return path or "/"
+
+
+def collect_paths(base: str) -> tuple[list[str], int]:
+    """Startseite plus URLs aus sitemap.xml, auf MAX_SEITEN begrenzt.
+
+    Gibt die Pfade und die Gesamtzahl (vor Begrenzung) zurück. Der Host in den
+    <loc>-Werten wird ignoriert, nur der Path zählt — die lokale Instanz ist
+    sonst nicht erreichbar.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    add("/")
+    status, _ct, _final, sitemap = fetch(base + "/sitemap.xml")
+    if status == 200 and "sitemapindex" not in sitemap.lower():
+        for loc in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", sitemap):
+            add(normalize_path(urllib.parse.urlparse(loc.strip()).path or "/"))
+    return paths[:MAX_SEITEN], len(paths)
+
+
 def find_page(base: str, home: str, paths: list[str], words: list[str]) -> tuple[str, str] | None:
     for p in paths:
-        status, final, body = fetch(base + p)
+        status, _ct, final, body = fetch(base + p)
         if status == 200 and body:
             return final, body
     # Sonst: Link auf der Startseite, dessen Ziel oder Text passt.
@@ -103,7 +198,7 @@ def find_page(base: str, home: str, paths: list[str], words: list[str]) -> tuple
             url = urllib.parse.urljoin(base + "/", href)
             if urllib.parse.urlparse(url).netloc != urllib.parse.urlparse(base).netloc:
                 continue
-            status, final, body = fetch(url)
+            status, _ct, final, body = fetch(url)
             if status == 200 and body:
                 return final, body
     return None
@@ -136,7 +231,7 @@ def main() -> int:
         return 2
     base = sys.argv[1].rstrip("/")
 
-    status, _, home = fetch(base + "/")
+    status, _ct, _final, home = fetch(base + "/")
     if status != 200:
         print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
         return 77
@@ -167,6 +262,40 @@ def main() -> int:
         url, body = agb
         if check_common("AGB", visible_text(body)) == 0:
             ok(f"AGB ({urllib.parse.urlparse(url).path}) ohne veraltete Verweise")
+
+    # 7. Impressum- und Datenschutz-Link auf jeder Seite. 8. Barrierefreiheitserklärung.
+    # Beide laufen über dieselben Seiten (Startseite plus Sitemap), deshalb hier gemeinsam.
+    paths, total = collect_paths(base)
+    if total > len(paths):
+        hint(f"{len(paths)} von {total} Seiten geprüft (MAX_SEITEN)")
+
+    impressum_fehlend: list[str] = []
+    datenschutz_fehlend: list[str] = []
+    shop_seiten: list[str] = []
+    for path in paths:
+        status, ct, _final, body = fetch(base + path)
+        if status != 200 or "text/html" not in ct.lower():
+            continue
+        if not has_link_to(body, "impressum", "imprint"):
+            impressum_fehlend.append(path)
+        if not has_link_to(body, "datenschutz", "privacy"):
+            datenschutz_fehlend.append(path)
+        if wirkt_shop(path, body) and not hat_barrierefreiheit(body):
+            shop_seiten.append(path)
+
+    # Einmal pro Lauf, nicht pro Seite: Es geht um das Angebot, nicht um jede Seite.
+    if shop_seiten:
+        beispiele = ", ".join(shop_seiten[:3])
+        mehr = f" und {len(shop_seiten) - 3} weitere" if len(shop_seiten) > 3 else ""
+        hint(f"Seiten wirken wie ein Angebot für Verbraucher (Shop/Buchung/Registrierung): "
+             f"{beispiele}{mehr} — nach BFSG ist dann eine Erklärung zur Barrierefreiheit "
+             "nötig; ob die Pflicht greift, ist nicht automatisch feststellbar")
+
+    if impressum_fehlend or datenschutz_fehlend:
+        report_fehlend("das Impressum", impressum_fehlend)
+        report_fehlend("die Datenschutzerklärung", datenschutz_fehlend)
+    else:
+        ok("Impressum- und Datenschutz-Link auf jeder Seite vorhanden")
 
     print()
     if findings:

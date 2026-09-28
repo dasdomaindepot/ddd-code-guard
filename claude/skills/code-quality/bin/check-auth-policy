@@ -31,6 +31,16 @@ trifft, und ist nicht durch weitere Einschränkungen verfeinert), ohne dass sich
 die Rollen unterscheiden, wird sie als nie wirksam gemeldet. Fehlt eine
 abschließende Regel für ^/, sind nicht erfasste Pfade öffentlich (Hinweis).
 
+Teil 5: Passwort-Zurücksetzung (ASVS 6.4.1). Liegt symfonycasts/reset-password-
+bundle in composer.lock (packages), wird config/packages/reset_password.yaml
+gelesen; ein symfonycasts_reset_password.lifetime größer als 3600 Sekunden ist ein
+Befund. Ist das Bundle nicht vorhanden, wird in src/**/*.php nach
+Eigenschaften/Spalten mit resetToken, reset_token, passwordResetToken oder
+confirmationToken gesucht. Wird ein solcher Token auf einer Zeile mit uniqid, md5,
+sha1, rand, mt_rand oder time erzeugt, ist das ein Befund; fehlt der Eigenschaft
+eine Ablaufzeit (resetTokenExpiresAt, tokenExpiresAt, expiresAt, resetRequestedAt),
+ist es ein Hinweis.
+
 Die Grenzwerte stammen aus .ai/guard-policy.yml des Projekts oder, falls nicht
 vorhanden, aus der zentralen guard-policy.yml eine Ebene über dem Script.
 
@@ -42,6 +52,7 @@ Exit-Codes:
 """
 
 import glob
+import json
 import os
 import re
 import sys
@@ -662,6 +673,128 @@ def part4_access_control(sec: dict) -> None:
         ok("security.access_control: Reihenfolge plausibel")
 
 
+# --- Teil 5: Passwort-Zurücksetzung --------------------------------------
+
+RESET_TOKEN_SUBSTRINGS = (
+    "resettoken",
+    "reset_token",
+    "passwordresettoken",
+    "confirmationtoken",
+)
+EXPIRY_SUBSTRINGS = (
+    "resettokenexpiresat",
+    "tokenexpiresat",
+    "expiresat",
+    "resetrequestedat",
+)
+WEAK_TOKEN_GEN_RE = re.compile(
+    r"\b(?:uniqid\(|md5\(|sha1\(|rand\(|mt_rand\(|time\()", re.I
+)
+
+
+def _read_text(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _read_json(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _has_token_name(text: str) -> bool:
+    low = text.lower()
+    return any(s in low for s in RESET_TOKEN_SUBSTRINGS)
+
+
+def _has_expiry_name(text: str) -> bool:
+    low = text.lower()
+    return any(s in low for s in EXPIRY_SUBSTRINGS)
+
+
+def _symfonycasts_bundle_present(project_path: str) -> bool:
+    data = _read_json(os.path.join(project_path, "composer.lock"))
+    if not isinstance(data, dict):
+        return False
+    for pkg in data.get("packages", []) or []:
+        if (
+            isinstance(pkg, dict)
+            and pkg.get("name") == "symfonycasts/reset-password-bundle"
+        ):
+            return True
+    return False
+
+
+def _check_bundle_lifetime(project_path: str) -> None:
+    path = os.path.join(project_path, "config", "packages", "reset_password.yaml")
+    doc = load_top_level_yaml(path)
+    lifetime = 3600
+    if isinstance(doc, dict):
+        scope = doc.get("symfonycasts_reset_password")
+        if isinstance(scope, dict):
+            value = scope.get("lifetime")
+            if isinstance(value, int) and not isinstance(value, bool):
+                lifetime = value
+    if lifetime > 3600:
+        finding(f"Reset-Link gilt {lifetime} Sekunden — höchstens eine Stunde (ASVS 6.4.1)")
+    else:
+        ok(f"Reset-Link Lebensdauer {lifetime} Sekunden, höchstens eine Stunde (ASVS 6.4.1)")
+
+
+def part5_reset_tokens(project_path: str) -> None:
+    """Teil 5: Passwort-Zurücksetzung (ASVS 6.4.1).
+
+    Liegt symfonycasts/reset-password-bundle in composer.lock vor, wird die
+    Lebensdauer der Reset-Links aus config/packages/reset_password.yaml geprüft;
+    ein lifetime größer als eine Stunde ist ein Befund. Ist das Bundle nicht
+    vorhanden, wird in src/**/*.php nach Eigenschaften/Spalten mit resetToken,
+    reset_token, passwordResetToken oder confirmationToken gesucht. Wird ein
+    solcher Token mit einer schwachen Funktion (uniqid, md5, sha1, rand,
+    mt_rand, time) erzeugt, ist das ein Befund; fehlt der Eigenschaft eine
+    Ablaufzeit (resetTokenExpiresAt, tokenExpiresAt, expiresAt, resetRequestedAt),
+    ist es ein Hinweis.
+    """
+    if _symfonycasts_bundle_present(project_path):
+        _check_bundle_lifetime(project_path)
+        return
+
+    files = php_files_under_src(project_path)
+    file_text: dict[str, str] = {}
+    for path in files:
+        text = _read_text(path)
+        if text is not None:
+            file_text[path] = text
+
+    for path, text in file_text.items():
+        rel = relative(project_path, path)
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if _has_token_name(line) and WEAK_TOKEN_GEN_RE.search(line):
+                finding(
+                    f"{rel}:{line_no}: Reset-Token aus uniqid/md5 — "
+                    "vorhersagbar; random_bytes/bin2hex verwenden"
+                )
+
+    has_reset_token = False
+    for path, text in file_text.items():
+        segments = os.path.relpath(path, project_path).split(os.sep)
+        if "Entity" in segments and _has_token_name(text):
+            has_reset_token = True
+            if not _has_expiry_name(text):
+                hint(
+                    "Reset-Token ohne Ablaufzeit erkennbar — Ablauf und "
+                    "Einmaligkeit im semantischen Review prüfen"
+                )
+
+    if not has_reset_token:
+        ok("keine Passwort-Zurücksetzung erkannt")
+
+
 def main() -> int:
     if len(sys.argv) > 2:
         print("Verwendung: check-auth-policy [projektverzeichnis]", file=sys.stderr)
@@ -694,6 +827,7 @@ def main() -> int:
     part2_password_rules(sec, project_path)
     part3_password_hashers(sec)
     part4_access_control(sec)
+    part5_reset_tokens(project_path)
 
     print()
     if findings:

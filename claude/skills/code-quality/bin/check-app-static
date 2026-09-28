@@ -13,9 +13,16 @@ Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert conf
     S4 .dockerignore beim ganzen Projekt-COPY (ASVS 13.4.1)
      S5 gefährliche Produktions-/Debug-Konfiguration (Session-Fixation,
         Profiler/Debug-Bundle, Debug-Modus in Produktion)
-      S6 Geldbeträge, die als float gespeichert sind (Rundungsfehler)
-      S7 öffentlich cachebare Antwort in geschütztem Controller (ASVS 5.4)
- 
+       S6 Geldbeträge, die als float gespeichert sind (Rundungsfehler)
+       S7 öffentlich cachebare Antwort in geschütztem Controller (ASVS 5.4)
+     S8 Docker-Images: feste Image-Versionen, keine Secrets in ENV/ARG,
+        kein Lauf als root (außerhalb des Symfony-Blocks, immer geprüft)
+      S9 nginx-Config unter docker/ (server_tokens, Upload-Verzeichnisse,
+         client_max_body_size) (außerhalb des Symfony-Blocks, immer geprüft)
+     S10 Platzhalter in Übersetzungsdateien (.yaml/.yml): weichen die
+        Platzhalter einer Sprache von der Referenzsprache ab (de/en, sonst
+        erste Locale alphabetisch)
+    
 
 
 Hinweise (kein Einfluss auf den Exit):
@@ -630,6 +637,436 @@ def part_s7_public_cache(project_path: str) -> None:
         ok("Öffentlich cachebare Antworten: keine in geschützten Controllern")
 
 
+# --- S10: Platzhalter in Übersetzungsdateien -----------------------------
+
+# %name% — Symfony-Platzhalter in Prozentzeichen (kein %s/%d von sprintf: die
+# tragen kein abschließendes %).
+PCT_PLACEHOLDER_RE = re.compile(r"%([A-Za-z_][A-Za-z0-9_]*)%")
+# {name} (einfacher Platzhalter) oder {name, …} (ICU-Argument). Gefangen wird
+# nur der Name direkt nach der öffnenden Klammer, gefolgt von } oder , — damit
+# Wörter innerhalb von Zweigen wie „one {# Eintrag}” nicht erfasst werden; die
+# # markiert eine ICU-Zahl und ist kein Platzhalter.
+BRACE_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)[},]")
+
+
+def _flatten_yaml(data: dict, prefix: str = "", out: dict = None) -> dict:
+    """Verschachtelte Schlüssel zu a.b.c flach machen; nur String-Werte."""
+    if out is None:
+        out = {}
+    for key, value in data.items():
+        if not isinstance(key, str):
+            continue
+        full = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            _flatten_yaml(value, full, out)
+        elif isinstance(value, str):
+            out[full] = value
+    return out
+
+
+def _extract_placeholders(value: str) -> list:
+    """Menge der Platzhalter eines Wertes als Liste (Literal wie %name% / {name})."""
+    result = []
+    for m in PCT_PLACEHOLDER_RE.finditer(value):
+        result.append(f"%{m.group(1)}%")
+    for m in BRACE_PLACEHOLDER_RE.finditer(value):
+        result.append(f"{{{m.group(1)}}}")
+    return result
+
+
+def _domain_locale(filename: str):
+    """(Domain, Locale) aus <domain>.<locale>.yaml bzw. <domain>+intl-icu.<locale>.yaml."""
+    name = os.path.basename(filename)
+    base = name[:-5] if name.endswith(".yaml") else name[:-4]
+    if "+intl-icu" in base:
+        domain, _, locale = base.partition("+intl-icu")
+    else:
+        domain, _, locale = base.rpartition(".")
+    if not domain or not locale:
+        return None, None
+    return domain, locale
+
+
+def part_s10_translation_placeholders(project_path: str) -> None:
+    translations_dir = os.path.join(project_path, "translations")
+    if not os.path.isdir(translations_dir):
+        ok("keine Übersetzungsdateien (.yaml/.yml) — S10 entfällt")
+        return
+    files = [
+        os.path.join(translations_dir, name)
+        for name in sorted(os.listdir(translations_dir))
+        if name.endswith((".yaml", ".yml"))
+    ]
+
+    # {domain: {locale: {key: value}}} plus rel-Pfad je (domain, locale).
+    data = {}
+    paths = {}
+    for path in files:
+        domain, locale = _domain_locale(path)
+        if domain is None or locale is None:
+            continue
+        doc = load_top_level_yaml(path)
+        if not isinstance(doc, dict):
+            continue
+        data.setdefault(domain, {})[locale] = _flatten_yaml(doc)
+        paths[(domain, locale)] = relative(project_path, path)
+
+    if not data:
+        ok("keine gültigen Übersetzungsdateien (.yaml/.yml) — S10 entfällt")
+        return
+
+    all_findings = []
+    for domain in sorted(data):
+        locales = data[domain]
+        if "de" in locales:
+            ref_locale = "de"
+        elif "en" in locales:
+            ref_locale = "en"
+        else:
+            ref_locale = sorted(locales)[0]
+        ref = locales[ref_locale]
+        for other_locale in sorted(locales):
+            if other_locale == ref_locale:
+                continue
+            other = locales[other_locale]
+            rel = paths[(domain, other_locale)]
+            for key in sorted(ref):
+                if key not in other:
+                    continue
+                ref_ph = set(_extract_placeholders(ref[key]))
+                other_ph = set(_extract_placeholders(other[key]))
+                if ref_ph == other_ph:
+                    continue
+                extra = sorted(other_ph - ref_ph)
+                missing = sorted(ref_ph - other_ph)
+                if extra and missing:
+                    msg = (
+                        f"{rel}: {key} hat {', '.join(extra)} "
+                        f"statt {', '.join(missing)} (Referenz {ref_locale})"
+                    )
+                elif extra:
+                    msg = (
+                        f"{rel}: {key} hat {', '.join(extra)} "
+                        f"(Referenz {ref_locale})"
+                    )
+                else:
+                    msg = (
+                        f"{rel}: {key} fehlt "
+                        f"{', '.join(missing)} (Referenz {ref_locale})"
+                    )
+                all_findings.append(msg)
+
+    if all_findings:
+        for msg in all_findings[:15]:
+            finding(msg)
+        if len(all_findings) > 15:
+            hint(f"… und {len(all_findings) - 15} weitere")
+    else:
+        ok("Übersetzungen: keine Platzhalter-Abweichungen zwischen den Sprachen")
+
+
+# --- S8: Docker-Images hartnen -----------------------------------------
+
+# Namen, die auf ein im Image verstecktes Geheimnis hinweisen.
+SECRET_KEYWORDS = ("PASSWORD", "PASSWD", "SECRET", "TOKEN", "API_KEY", "PRIVATE_KEY")
+
+
+def _is_dockerfile_name(name: str) -> bool:
+    """Wahr, wenn „Dockerfile“ ein eigener Bestandteil des Namens ist
+    (Dockerfile, Dockerfile.dev, dev.Dockerfile, ...)."""
+    parts = re.split(r"[._-]", name)
+    return "Dockerfile" in parts
+
+
+def _is_dev_dockerfile(name: str) -> bool:
+    """Dockerfiles mit .dev-Suffix oder „dev“ als Namensteil überspringen."""
+    if name.endswith(".dev"):
+        return True
+    parts = [p.lower() for p in re.split(r"[._-]", name)]
+    return "dev" in parts
+
+
+def _is_named_prod(name: str) -> bool:
+    n = name.lower()
+    return n in ("prod", "production") or n.endswith("_prod")
+
+
+def _dockerfiles_for_hardening(project_path: str) -> list:
+    results = []
+    if not os.path.isdir(project_path):
+        return results
+    root_df = os.path.join(project_path, "Dockerfile")
+    if os.path.isfile(root_df):
+        results.append(root_df)
+    docker_dir = os.path.join(project_path, "docker")
+    if os.path.isdir(docker_dir):
+        skip = ("node_modules", "vendor", "public", "var", ".git")
+        for root, dirs, files in os.walk(docker_dir):
+            dirs[:] = [d for d in dirs if d not in skip]
+            for f in files:
+                if _is_dockerfile_name(f):
+                    results.append(os.path.join(root, f))
+    return results
+
+
+def _dockerfile_tag(image: str):
+    """Tag aus dem Image-Ref (nach dem letzten Slash); None, wenn keiner."""
+    last = image.rsplit("/", 1)[-1]
+    if ":" in last:
+        return last.split(":", 1)[1]
+    return None
+
+
+def _dockerfile_name(image: str) -> str:
+    """Image-Name ohne Tag zur Ausgabe."""
+    last = image.rsplit("/", 1)[-1]
+    return last.split(":", 1)[0]
+
+
+def _parse_env_arg(line: str):
+    """(Verb, Name, Wert) aus einer ENV-/ARG-Zeile; bei leerem Wert Wert = ''."""
+    m = re.match(r"(ENV|ARG)\s+(.*)", line, re.IGNORECASE)
+    if not m:
+        return (None, None, None)
+    verb = m.group(1).upper()
+    body = m.group(2).strip()
+    if not body:
+        return (verb, None, None)
+    if "=" in body:
+        name, value = body.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+    else:
+        parts = body.split(None, 1)
+        name = parts[0].strip()
+        value = parts[1].strip() if len(parts) > 1 else ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    return (verb, name, value)
+
+
+def _check_one_dockerfile(project_path: str, path: str) -> None:
+    text = _read_text(path)
+    if text is None:
+        return
+    rel = relative(project_path, path)
+    stages = []
+    current = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if re.match(r"FROM\s", s, re.IGNORECASE):
+            current = {"name": None, "image": None, "line": lineno,
+                       "env": [], "users": []}
+            stages.append(current)
+            m = re.match(r"FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?",
+                         s, re.IGNORECASE)
+            if m:
+                current["image"] = m.group(1)
+                current["name"] = m.group(2)
+        elif current is not None:
+            if re.match(r"(ENV|ARG)\b", s, re.IGNORECASE):
+                current["env"].append((lineno, s))
+            elif re.match(r"USER\b", s, re.IGNORECASE):
+                um = re.match(r"USER\s+(\S+)", s)
+                if um:
+                    current["users"].append(um.group(1))
+    if not stages:
+        ok(f"{rel}: kein FROM — Image nicht prüfbar")
+        return
+
+    # 1. Basis-Image ohne feste Version (außer scratch / frühere Stufe).
+    prev = set()
+    for st in stages:
+        img = st["image"]
+        if img is not None and img.lower() != "scratch" and img not in prev:
+            tag = _dockerfile_tag(img)
+            if tag == "latest" or tag is None:
+                reason = "latest" if tag == "latest" else "kein Tag"
+                finding(
+                    f"{rel}:{st['line']}: Basis-Image "
+                    f"{_dockerfile_name(img)} ohne feste Version ({reason}) "
+                    f"— Builds sind nicht reproduzierbar"
+                )
+        if st["name"]:
+            prev.add(st["name"])
+
+    # 2. Feste Secrets in ENV/ARG irgendeiner Stufe.
+    for st in stages:
+        for lineno, eline in st["env"]:
+            verb, name, value = _parse_env_arg(eline)
+            if name is None or value == "":
+                continue
+            if not any(k in name.upper() for k in SECRET_KEYWORDS):
+                continue
+            if value.startswith("$"):
+                continue
+            finding(
+                f"{rel}:{lineno}: {verb} {name} mit festem Wert im Image — "
+                f"landet in jeder Kopie des Images; zur Laufzeit übergeben"
+            )
+
+    # 3. Produktionsstufe ohne USER oder als root.
+    prod_index = len(stages) - 1
+    for i, st in enumerate(stages):
+        if st["name"] and _is_named_prod(st["name"]):
+            prod_index = i
+            break
+    users = stages[prod_index]["users"]
+    if not users or users[-1].split(":")[0] in ("root", "0"):
+        hint("Container läuft als root; USER www-data "
+             "(bzw. nicht privilegierter Benutzer) setzen")
+
+
+def part_s8_docker_hardening(project_path: str) -> None:
+    candidates = [
+        d for d in _dockerfiles_for_hardening(project_path)
+        if not _is_dev_dockerfile(os.path.basename(d))
+    ]
+    if not candidates:
+        ok("kein Dockerfile: S8 entfällt")
+        return
+    for df in candidates:
+        _check_one_dockerfile(project_path, df)
+
+
+# --- S9: nginx-Serverkonfiguration -------------------------------------
+
+# Upload-Verzeichnisse: Namen unter public/, die typischerweise hochgeladene
+# Dateien enthalten und nicht nach PHP durchsucht werden sollen.
+UPLOAD_DIR_NAMES = ("upload", "uploads", "media", "files")
+# server_tokens off; mit beliebigemwhitespace vor dem Semikolon.
+SERVER_TOKENS_OFF_RE = re.compile(r"server_tokens\s+off\s*;")
+# client_max_body_size 20M; — mit einem Wert dazwischen.
+CLIENT_MAX_BODY_SIZE_RE = re.compile(r"client_max_body_size\s+\S+;")
+# Eine location-Zeile: „location" am Zeilenanfang (nach Whitespace).
+LOCATION_LINE_RE = re.compile(r"\s*location\s")
+# Front-Controller: das location-Muster verweist auf index.php.
+FRONT_CONTROLLER_RE = re.compile(r"index", re.IGNORECASE)
+
+
+def _read_nginx_configs(project_path: str) -> list:
+    """Alle *.conf und nginx.conf*-Dateien unter docker/ (rekursiv), mit
+    Zeilenkommentaren (# bis Zeilenende) entfernt. Liest unlesbare Dateien als
+    leer und stürzt nicht ab."""
+    docker_dir = os.path.join(project_path, "docker")
+    if not os.path.isdir(docker_dir):
+        return []
+    skip = ("node_modules", "vendor", "public", "var", ".git")
+    texts = []
+    for root, dirs, files in os.walk(docker_dir):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in sorted(files):
+            if not (name.endswith(".conf") or name.startswith("nginx.conf")):
+                continue
+            raw = _read_text(os.path.join(root, name))
+            if raw is None:
+                continue
+            cleaned = []
+            for line in raw.splitlines():
+                hash_pos = line.find("#")
+                if hash_pos != -1:
+                    line = line[:hash_pos]
+                cleaned.append(line)
+            texts.append("\n".join(cleaned))
+    return texts
+
+
+def _nginx_location_blocks(text: str) -> list:
+    """Komplette location-Blöcke (Kopf bis zur schließenden Klammer)."""
+    blocks = []
+    for m in re.finditer(r"location\b[^\{]*\{", text):
+        brace = m.end() - 1
+        depth = 0
+        for i in range(brace, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[m.start():i + 1])
+                    break
+    return blocks
+
+
+def _has_general_php_location(config_texts: list) -> bool:
+    """Wahr, wenn fastcgi_pass in einem location steht, der kein Front-
+    Controller (index.php) ist und damit beliebige .php-Dateien ausführen kann."""
+    for t in config_texts:
+        for block in _nginx_location_blocks(t):
+            if "fastcgi_pass" in block and FRONT_CONTROLLER_RE.search(block) is None:
+                return True
+    return False
+
+
+def _is_upload_protected(config_text: str, dir_name: str) -> bool:
+    """Wahr, wenn der Verzeichnisname in einer location-Zeile vorkommt und in
+    derselben oder den nächsten 5 Zeilen „deny all“ oder „return 40“ steht."""
+    lines = config_text.splitlines()
+    dir_re = re.compile(re.escape(dir_name))
+    for i, line in enumerate(lines):
+        if LOCATION_LINE_RE.match(line) and dir_re.search(line):
+            window = lines[i:i + 6]
+            if any(("deny all" in w) or ("return 40" in w) for w in window):
+                return True
+    return False
+
+
+def _upload_dir_names(project_path: str) -> list:
+    """Aufzählung existierender Upload-Verzeichnisse unter public/."""
+    public_dir = os.path.join(project_path, "public")
+    if not os.path.isdir(public_dir):
+        return []
+    names = []
+    for entry in sorted(os.listdir(public_dir)):
+        if entry in UPLOAD_DIR_NAMES \
+                and os.path.isdir(os.path.join(public_dir, entry)):
+            names.append(entry)
+    return names
+
+
+def _project_has_filetype(project_path: str) -> bool:
+    for path in php_files_under_src(project_path):
+        text = _read_text(path)
+        if text is not None and "FileType::class" in text:
+            return True
+    return False
+
+
+def part_s9_nginx(project_path: str) -> None:
+    config_texts = _read_nginx_configs(project_path)
+    if not config_texts:
+        ok("keine nginx-Konfiguration: S9 entfällt")
+        return
+    produced = False
+
+    if not any(SERVER_TOKENS_OFF_RE.search(t) for t in config_texts):
+        hint("nginx verrät seine Version (server_tokens off setzen)")
+        produced = True
+
+    if _has_general_php_location(config_texts):
+        combined = "\n".join(config_texts)
+        for name in _upload_dir_names(project_path):
+            if not _is_upload_protected(combined, name):
+                finding(
+                    f"public/{name}: PHP-Dateien darin würden ausgeführt "
+                    f"(ASVS 5.3.1) — location-Block mit deny für *.php"
+                )
+                produced = True
+
+    client_has = any(CLIENT_MAX_BODY_SIZE_RE.search(t) for t in config_texts)
+    if _project_has_filetype(project_path) and not client_has:
+        hint(
+            "nginx begrenzt Uploads auf 1 MB (Standard); "
+            "client_max_body_size passend zu den maxSize-Constraints setzen"
+        )
+        produced = True
+
+    if not produced:
+        ok("nginx-Konfiguration: geprüft, keine Schwächen erkannt")
+
+
 # --- H1: Rohes SQL -----------------------------------------------------
 
 # Alle DBAL-/PDO-Aufrufe, die SQL als ersten Parameter nehmen. Geprüft wird der
@@ -993,6 +1430,11 @@ def main() -> int:
         part_s5_prod_config(project_path)
         part_s6_money_float(project_path)
         part_s7_public_cache(project_path)
+        part_s10_translation_placeholders(project_path)
+
+    part_s8_docker_hardening(project_path)
+
+    part_s9_nginx(project_path)
 
     part_h1_sql(project_path)
     part_h2_raw_twig(project_path)

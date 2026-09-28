@@ -1,0 +1,23 @@
+{
+    "content-hash": "00000000000000000000000000000000",
+    "packages": [
+        {
+            "name": "symfony/framework-bundle",
+            "version": "7.1.4",
+            "requirements": {
+                "php": ">=8.2"
+            }
+        },
+        {
+            "name": "symfonycasts/reset-password-bundle",
+            "version": "1.7.0",
+            "requirements": {
+                "php": ">=8.2",
+                "symfony/form": "^7.0",
+                "symfony/security-bundle": "^7.0"
+            }
+        }
+    ],
+    "aliases": [],
+    "dev": false
+}

@@ -81,6 +81,24 @@ run_script "$HERE/fixtures/schlecht"
 expect 1 "cookie_secure" "csrf_protection" "enable_csrf: false" "ohne File-Constraint" "schließt .git nicht aus"
 expect 1 "OhneCsrfType.php:7: Formular schaltet csrf_protection ab"
 
+# --- S8: Docker-Hardening — feste Version fehlt, Secret in ENV, prod-Stufe
+#     ohne USER. Der feste ARG ohne Wert liefert keinen Befund.
+run_script "$HERE/fixtures/docker-hart"
+expect 1 "ohne feste Version" "API_TOKEN" "Container läuft als root"
+expect_not 1 "abc123geheim"
+expect_not 1 "DB_PASSWORD"
+
+# --- S9: nginx-offen — server_tokens fehlt, general PHP location ohne
+#     Schutz von public/uploads, Uploads aber ohne client_max_body_size.
+run_script "$HERE/fixtures/nginx-offen"
+expect 1 "server_tokens off" "public/uploads: PHP-Dateien" "client_max_body_size"
+
+# --- S9: nginx-gut — Front-Controller, server_tokens off, client_max_body_size
+#     gesetzt: kein S9-Befund, kein S9-Hinweis.
+run_script "$HERE/fixtures/nginx-gut"
+expect 0 "Keine Befunde."
+expect_not 0 "verrät seine Version" "PHP-Dateien darin" "client_max_body_size passend"
+
 # --- Geldbetrag als float: genau ein Befund (totalPrice), netto und taxRate nicht
 run_script "$HERE/fixtures/geld-float"
 expect 1 "Geldbetrag totalPrice als float"
@@ -95,6 +113,22 @@ expect_not 1 "Geldbetrag taxRate"
 run_script "$HERE/fixtures/cache-public"
 expect 1 "KontoController.php" "Reverse-Proxy liefert sie an andere Nutzer aus"
 expect_not 1 "StartController.php"
+befunde=$(printf '%s' "$OUT" | grep -cF "BEFUND   " || true)
+if [ "$befunde" -ne 1 ]; then
+    echo "FEHLER: erwartet genau 1 Befund, aber $befunde" >&2
+    printf '%s\n' "$OUT" >&2
+    fail=1
+fi
+
+# --- S10: Platzhalter in Übersetzungsdateien. en hat %nom% statt %name% in
+#     gruss (ein Befund); anzahl (ICU-Plural, # ignoriert, Wort im Zweig kein
+#     Platzhalter) und ok stimmen überein und werden nicht gemeldet.
+run_script "$HERE/fixtures/translations"
+expect 1 "gruss hat %nom% statt %name%" "(Referenz de)"
+expect_not 1 "anzahl"
+expect_not 1 "messages.en.yaml: ok"
+expect_not 1 "Eintrag"
+expect_not 1 "entries"
 befunde=$(printf '%s' "$OUT" | grep -cF "BEFUND   " || true)
 if [ "$befunde" -ne 1 ]; then
     echo "FEHLER: erwartet genau 1 Befund, aber $befunde" >&2

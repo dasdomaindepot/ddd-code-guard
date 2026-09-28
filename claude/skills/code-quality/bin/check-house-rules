@@ -8,7 +8,8 @@ Geprüft werden nur Dateien; es wird nichts gestartet oder aufgerufen.
 
 Hausregeln, die aus Betriebserfahrung stammen. Bisher: R1 (phpcs-Regelwerk),
 R2 (.env-Interpolation), R3 (Zeitzone Europe/Berlin), R4 (trusted_proxies
-hinter Traefik + nginx) und R5 (Deploy wartet auf die Prüf-Jobs).
+hinter Traefik + nginx), R9 (root in der DATABASE_URL) und R10 (healthcheck und
+Volumes in docker-compose).
 
 R6: Composer soll stets für die Laufzeitumgebung auflösen. Liegt `composer.lock`
 vor, muss es sich im Git befinden — Anwendungen installieren sonst je nach Stand
@@ -81,6 +82,21 @@ bewusst nicht geprüft. Der Benutzer ist der Teil zwischen `://` und dem nächst
 `:` oder `@`. Ist er `root`, gibt es einen Befund. In `.env` und `.env.local`
 reicht ein Hinweis (lokale Entwicklung). Das Passwort und der Rest der URL
 werden nie ausgegeben, nur Datei, Zeile und „root“.
+
+R10: Docker-Compose und die Kontainer-Lebensdauer. Ein `healthcheck` sagt dem
+Orchestrator, wann ein Dienst startbereit ist; ohne ihn greifen `depends_on` mit
+`condition: service_healthy` und ein smarter Neustart nicht — der Dienst wird als
+bereit gemeldet, bevor es Anfragen verarbeiten kann. R10 prüft in den
+docker-compose- und compose-Dateien im Wurzelverzeichnis (kein `override`, kein
+`prod`), ob die Dienste `php` und `nginx` einen `healthcheck` führen oder per
+`HEALTHCHECK` im zugehörigen Dockerfile (`build.dockerfile`, `build.context` +
+`Dockerfile` oder `build` als String). Fehlt beides, ist das ein Hinweis. Auch
+Upload- und Speicherverzeichnisse (`public/uploads`, `public/media`, `var/storage`,
+`var/uploads`) sind betroffen: Liegt keines davon in einem benannten Volume oder
+einem Bind-Mount außerhalb des Projektordners, ist der Inhalt beim nächsten
+Container-Neuanlegen weg; R10 meldet das als Hinweis. Liegt das Projekt lokal über
+`.:/var/www/html` gemountet, ergänzt der Hinweis, dass das nur die lokale
+Entwicklung ist und in Produktion geprüft werden muss.
 
 Exit-Codes:
     0  keine Befunde
@@ -1379,6 +1395,180 @@ def part_r9_db_root(project_path: str) -> None:
         ok("DATABASE_URL verbindet nicht als root")
 
 
+# --- R10: healthcheck und Volumes in docker-compose ---------------------
+
+R10_COMPOSE_FILES = (
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+)
+
+R10_STORAGE_DIRS = (
+    "public/uploads",
+    "public/media",
+    "var/storage",
+    "var/uploads",
+)
+
+
+def _r10_build_dockerfiles(service: dict, project_path: str) -> list[str]:
+    """Mögliche Dockerfile-Pfade eines Dienstes aus seiner build-Konfiguration.
+
+    `build` als String ist der Build-Kontext, `build.context` + `build.dockerfile`
+    der explizite Pfad. Gibt die möglichen Pfade zurück, existiert keines, leer.
+    """
+
+    build = service.get("build")
+    if isinstance(build, str):
+        return [os.path.join(project_path, build, "Dockerfile")]
+    if isinstance(build, dict):
+        context = build.get("context", ".")
+        dockerfile = build.get("dockerfile", "Dockerfile")
+        return [os.path.join(project_path, context, dockerfile)]
+    return []
+
+
+def _r10_service_healthcheck(service: dict, project_path: str) -> bool:
+    """Prüft healthcheck im Dienst oder HEALTHCHECK im zugehörigen Dockerfile."""
+
+    hc = service.get("healthcheck")
+    if isinstance(hc, dict) and hc.get("disable") is not True:
+        return True
+    for dockerfile in _r10_build_dockerfiles(service, project_path):
+        text = _read_text(dockerfile)
+        if text is not None and re.search(r"(?m)^\s*HEALTHCHECK\b", text):
+            return True
+    return False
+
+
+def _r10_volume_entries(service: dict) -> list:
+    """Volumes eines Dienstes als (quelle, ziel)-Tupel.
+
+    Strings werden nach `quelle: ziel` geteilt (optionale Optionen dahinter),
+    Dicts lesen sich aus `source` und `target`.
+    """
+
+    vols = service.get("volumes")
+    if not isinstance(vols, list):
+        return []
+    entries = []
+    for v in vols:
+        if isinstance(v, str):
+            parts = v.split(":")
+            if len(parts) == 1:
+                entries.append((None, parts[0]))
+            else:
+                entries.append((parts[0], parts[1]))
+        elif isinstance(v, dict):
+            entries.append((v.get("source"), v.get("target")))
+    return entries
+
+
+def _r10_source_persistent(source, project_path: str) -> bool:
+    """Ist die Quelle eines Volumes dauerhaft: benantes Volume oder absoluter
+    Pfad außerhalb des Projektordners. Relative Pfade (`.`) zählen nicht.
+    """
+
+    if not isinstance(source, str):
+        return False
+    if source.startswith("."):
+        return False
+    if source.startswith("/"):
+        norm = os.path.normpath(source)
+        proj = os.path.normpath(project_path)
+        return not (norm == proj or norm.startswith(proj + os.sep))
+    return True
+
+
+def part_r10_compose(project_path: str) -> None:
+    before = findings
+
+    # Nur die Basis-Compose-Dateien im Wurzelverzeichnis — kein override, kein
+    # prod (siehe R9).
+    compose_paths = [
+        os.path.join(project_path, name)
+        for name in R10_COMPOSE_FILES
+        if os.path.isfile(os.path.join(project_path, name))
+    ]
+    if not compose_paths:
+        ok("kein docker-compose: Regel R10 entfällt")
+        return
+
+    if yaml is None:
+        hint("PyYAML fehlt — Regel R10 nicht gemessen")
+        return
+
+    services = {}
+    try:
+        for path in compose_paths:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.load(f, Loader=_R4Loader)
+            if isinstance(data, dict):
+                svc = data.get("services")
+                if isinstance(svc, dict):
+                    services.update(svc)
+    except (OSError, yaml.YAMLError):
+        hint("docker-compose konnte nicht geparst werden — Regel R10 nicht gemessen")
+        return
+
+    had_hint = False
+
+    # Volumes aller Dienste zusammenfassen (Code-Mount und Zielzuordnung).
+    all_volumes = []
+    for service in services.values():
+        if isinstance(service, dict):
+            all_volumes.extend(_r10_volume_entries(service))
+
+    # Ganzes Projekt als Code-Mount (`./:/var/www/html`)? Dann nur lokale
+    # Entwicklung; der Hinweis wird entsprechend ergänzt.
+    local_code_mount = any(
+        (source in (".", "./")) and (target == "/var/www/html")
+        for source, target in all_volumes
+    )
+
+    # healthcheck für php und nginx (sofern vorhanden).
+    for name in ("php", "nginx"):
+        service = services.get(name)
+        if isinstance(service, dict) and _r10_service_healthcheck(service, project_path):
+            continue
+        had_hint = True
+        hint(
+            f"Dienst {name} ohne healthcheck — Neustart und depends_on "
+            "(condition: service_healthy) greifen nicht"
+        )
+
+    # Upload-/Speicherverzeichnisse sind nur dauerhaft gespeichert, wenn ein
+    # Volume mit benanntem Volume oder absolutem Pfad außerhalb des
+    # Projektordners auf das Verzeichnis zeigt.
+    for storage in R10_STORAGE_DIRS:
+        if not os.path.exists(os.path.join(project_path, storage)):
+            continue
+        matched = False
+        storage_normed = storage.replace("\\", "/")
+        for source, target in all_volumes:
+            if not target:
+                continue
+            target_rel = os.path.normpath(target).lstrip("/").replace("\\", "/")
+            if target_rel != storage_normed and not target_rel.endswith("/" + storage_normed):
+                continue
+            if _r10_source_persistent(source, project_path):
+                matched = True
+                break
+        if not matched:
+            had_hint = True
+            suffix = ""
+            if local_code_mount:
+                suffix = " (lokal über den Code-Mount vorhanden, in Produktion prüfen)"
+            hint(
+                f"{storage} liegt nur im Container-Dateisystem bzw. im Code-Mount "
+                f"— bei neuem Container weg; eigenes Volume{suffix}"
+            )
+
+    if findings == before and not had_hint:
+        ok("docker-compose: healthcheck und Volumes in Ordnung")
+
+
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
@@ -1404,6 +1594,7 @@ def main() -> int:
     part_r7_messenger(project_path)
     part_r8_cron_overlap(project_path)
     part_r9_db_root(project_path)
+    part_r10_compose(project_path)
 
     print()
     if findings:

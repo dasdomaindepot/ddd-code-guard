@@ -1,0 +1,8 @@
+{
+    "name": "example/aktuell-app",
+    "description": "Test fixture: aktuelle PHP- und Symfony-Version",
+    "require": {
+        "php": "^8.3",
+        "symfony/framework-bundle": "7.3.*"
+    }
+}

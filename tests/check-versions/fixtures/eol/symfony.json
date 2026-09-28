@@ -1,0 +1,11 @@
+{
+  "message": "Symfony end-of-life data (test fixture)",
+  "result": {
+    "releases": [
+      {"name": "6.4", "eolFrom": "2027-10", "isEol": false},
+      {"name": "7.1", "eolFrom": "2026-11-30", "isEol": false},
+      {"name": "7.2", "eolFrom": "2026-11-30", "isEol": false},
+      {"name": "7.3", "eolFrom": "2027-01-31", "isEol": false}
+    ]
+  }
+}

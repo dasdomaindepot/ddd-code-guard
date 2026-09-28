@@ -176,8 +176,14 @@ brauchen denselben Beleg (Mapping oder Migration) wie eine Entity-Änderung.
 5. **N+1**: eine Schleife über eine Collection, die je Durchlauf einen
    Lazy-Load auslöst. Beleg ist die Schleife plus der fehlende `JOIN`/`fetch` →
    `MEDIUM`, in einer Liste ohne Obergrenze `HIGH`.
-6. **Datenverändernde Migration ohne Backup-Hinweis** bei `DELETE`, `UPDATE`
-   oder `DROP COLUMN` → `BLOCKER`.
+6. **Datenverändernde Migration**: `DELETE`, `DROP COLUMN`/`DROP TABLE` oder ein
+   `UPDATE`, das Werte überschreibt, ohne dass `down()` sie wiederherstellen kann
+   (der alte Wert ist danach weg) → `BLOCKER`, wenn kein Backup-Hinweis dabei ist.
+   Ein `UPDATE`, das `down()` exakt umkehrt (etwa ein Statuswechsel zwischen zwei
+   festen Werten), ist höchstens `LOW` („Backup vor dem Deploy trotzdem ratsam“).
+   Prüfe außerdem, **welche Zeilen** ein `UPDATE` trifft: Ändert es Daten, die
+   fachlich unveränderlich sein sollen (unterschriebene Verträge, versandte
+   Rechnungen, abgeschlossene Buchungen), ist das `HIGH` — unabhängig von `down()`.
 
 ## Achse 5 — Architektur
 

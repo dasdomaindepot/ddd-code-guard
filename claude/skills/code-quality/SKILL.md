@@ -81,7 +81,12 @@ Geldbeträge als `float` in Entities, öffentlich cachebare Antworten (`#[Cache(
 POST-Formular sind Befunde. Weitere Hinweise: HTTP-Client ohne Timeout (bei direkter
 Abhängigkeit von `symfony/http-client`), Guzzle ohne `timeout`, `file_get_contents('http…')`,
 `@`-Fehlerunterdrückung, `json_decode` ohne `JSON_THROW_ON_ERROR`, Typcasts direkt auf
-Request-Werten. Nur Hinweise,
+Request-Werten. Außerdem: Basis-Images mit `:latest` oder ohne Tag und Geheimnisse in
+`ENV`/`ARG` (Befunde, Werte werden nie ausgegeben), Produktionsstufe als root (Hinweis);
+nginx mit Upload-Verzeichnis unter `public/`, in dem PHP ausgeführt würde (Befund),
+ohne `server_tokens off` oder ohne `client_max_body_size` bei Uploads (Hinweise);
+Übersetzungen, deren Platzhalter (`%name%`, `{count}`) von der Referenzsprache abweichen
+(Befund – DeepL übersetzt Platzhalter gern mit). Nur Hinweise,
 weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw` in Twig,
 `md5`/`sha1`/`rand` für Sicherheitszwecke, `eval`/`exec`/`shell_exec` und `unserialize`
 ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
@@ -109,6 +114,8 @@ R7: Messenger mit `failure_transport` (Befund), `retry_strategy.max_retries` und
 `--limit`/`--memory-limit`/`--time-limit` (Hinweise). R8: Cron-Befehle ohne Lock (Hinweis;
 auch „Klasse nicht gefunden“ für Befehle, die es im Projekt nicht gibt). R9: `DATABASE_URL`
 als `root` in Produktionsdateien (Befund; lokal Hinweis, Passwort wird nie ausgegeben).
+R10: `php`/`nginx` in docker-compose ohne Healthcheck, Upload-Verzeichnisse ohne eigenes
+Volume (Hinweise).
 Einzeln fahrbar: `bin/check-house-rules .`.
 
 **Geheimnisse im Repo** (`secrets`, seit 27.09.2026, **blockierend**): Liest nur die
@@ -142,6 +149,14 @@ prüfen und das Projekt fälschlich rot zu melden.
 `.ai/guard-profile.yml` aus dem Code ab (Datenbank, Anmeldung, Messenger, Mandanten-
 Kandidaten, Geldbeträge, Deployment) und gibt ihn mit Quellenangaben aus. Er schreibt
 nichts; die Datei legt ein Mensch nach Prüfung an.
+
+**Supportende und Updates** (`versions`, seit 28.09.2026, **blockierend**): PHP-Version aus
+dem Dockerfile (sonst `config.platform.php`) und Symfony-Version aus `composer.lock` gegen
+endoflife.date. Ohne Sicherheitsupdates ist ein Befund, Supportende in unter 183 Tagen ein
+Hinweis. Die Antwort liegt 7 Tage unter `~/.cache/code-guard/`; ohne Netz gilt der ältere
+Cache bzw. ein Hinweis, nie Rot. Läuft der php-Container, meldet `composer outdated
+--direct --major-only` neue Hauptversionen als Hinweise. Einzeln fahrbar:
+`bin/check-versions .`.
 
 **Abgeschwächte Gates** (`gate-integrity`, seit 27.09.2026, **blockierend**): Vergleicht
 den Stand mit der Vergleichsbasis (`--base`, sonst automatisch). Befunde: gesenktes
@@ -192,7 +207,10 @@ richtig sind Art. 4–8 DSA über § 7 Abs. 1 DDG), RStV (seit 2020 § 18 Abs. 2
 MStV), Hinweise auf die zum 20.07.2025 eingestellte OS/ODR-Plattform, TTDSG
 (jetzt TDDDG) und „Privacy Shield". Fehlt Impressum oder Datenschutzerklärung,
 ist das ein Befund. Ob alle Geschäftsführer genannt sind, kann kein Script
-wissen — das bleibt ein Hinweis. Keine Rechtsberatung. Einzeln fahrbar:
+wissen — das bleibt ein Hinweis. Jede geprüfte Seite (Startseite plus Sitemap) muss
+Impressum und Datenschutzerklärung verlinken. Wirkt die Seite wie ein Angebot für
+Verbraucher (Shop, Buchung, Registrierung), gibt es einen Hinweis auf die
+Barrierefreiheitserklärung nach BFSG. Keine Rechtsberatung. Einzeln fahrbar:
 `bin/check-legal https://test.de`.
 
 **Seiteninhalt** (`web-content`, seit 26.09.2026, **blockierend**): Prüft auf
@@ -229,7 +247,9 @@ mit `PasswordCredentials`) braucht eine temporäre Sperre nach Fehlversuchen —
 die kleinste Passwort-`Length(min: …)` die Mindestlänge aus `guard-policy.yml`
 erreichen (Hausstandard **12**). `password_hashers` darf nur `auto`, `bcrypt`,
 `argon2i`/`argon2id`, `sodium` oder `native` nutzen, `plaintext`, `md5`, `sha1` und
-`sha256`/`sha512` sind ein Befund (ASVS 11.4.2). In `access_control` ist eine Regel, die eine frühere, allgemeinere Regel mit anderer Rolle nie zum Zug kommen lässt, ein Befund. Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
+`sha256`/`sha512` sind ein Befund (ASVS 11.4.2). In `access_control` ist eine Regel, die eine frühere, allgemeinere Regel mit anderer Rolle nie zum Zug kommen lässt, ein Befund. Passwort-Reset:
+mit `symfonycasts/reset-password-bundle` höchstens 3600 Sekunden `lifetime`, bei eigener
+Umsetzung kein Token aus `uniqid`/`md5`/`rand` (Befunde); fehlende Ablaufzeit ist ein Hinweis. Nur Hinweise: unter 15 Zeichen (NIST SP 800-63B-4
 für Passwort als einzigen Faktor), Höchstlänge unter 64, kein
 `NotCompromisedPassword` (BSI ORP.4.A8), ein Formular zum Passwortändern ohne Abfrage des
 bisherigen Passworts (ASVS 6.2.3; Erstpasswort- und Token-Wege sehen gleich aus), Anmeldung per SSO/OIDC (Sperre gehört dann

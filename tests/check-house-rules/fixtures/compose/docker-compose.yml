@@ -1,0 +1,7 @@
+services:
+    php:
+        build: ./docker/php
+        volumes:
+            - .:/var/www/html
+    nginx:
+        image: nginx:1.27-alpine

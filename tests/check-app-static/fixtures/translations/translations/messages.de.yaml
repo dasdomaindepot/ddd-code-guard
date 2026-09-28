@@ -1,0 +1,3 @@
+gruss: 'Hallo %name%'
+anzahl: '{count, plural, one {# Eintrag} other {# Einträge}}'
+ok: 'Fertig'

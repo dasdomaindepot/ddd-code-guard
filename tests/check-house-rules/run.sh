@@ -226,6 +226,20 @@ expect 1 "1 Befund(e)." "BEFUND" ".env.prod:1:" ".env:1:"
 expect 1 "Hinweis  .env:1: DATABASE_URL verbindet als root"
 expect_not 1 "geheim123" "prodgeheim"
 
+# --- R10: healthcheck und Volumes in docker-compose — nur Hinweise
+# --- php und nginx ohne healthcheck, public/uploads nur über Code-Mount
+run_script "$HERE/fixtures/compose"
+expect 0 "Keine Befunde."
+expect 0 "Hinweis  Dienst php ohne healthcheck"
+expect 0 "Hinweis  Dienst nginx ohne healthcheck"
+expect 0 "Hinweis  public/uploads liegt nur"
+expect 0 "in Produktion prüfen"
+expect_not 0 "BEFUND"
+
+# --- R10: kein Compose — Regel R10 entfällt
+run_script "$HERE/fixtures/gut"
+expect 0 "Regel R10 entfällt"
+
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"
     exit 0

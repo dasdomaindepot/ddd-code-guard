@@ -1,0 +1,8 @@
+{
+    "name": "example/alt-app",
+    "description": "Test fixture: alte PHP- und Symfony-Version",
+    "require": {
+        "php": "^8.1",
+        "symfony/framework-bundle": "7.2.*"
+    }
+}

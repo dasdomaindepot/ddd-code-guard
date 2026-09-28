@@ -1,0 +1,23 @@
+{
+    "packages": [
+        {
+            "name": "symfony/framework-bundle",
+            "version": "v7.2.9",
+            "require": {
+                "php": ">=8.2",
+                "symfony/config": "^7.2",
+                "symfony/dependency-injection": "^7.2"
+            }
+        },
+        {
+            "name": "symfony/twig-bundle",
+            "version": "v7.2.5",
+            "require": {
+                "php": ">=8.2"
+            }
+        }
+    ],
+    "packages-dev": [],
+    "content-hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "dev": false
+}

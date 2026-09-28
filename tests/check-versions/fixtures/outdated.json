@@ -1,0 +1,10 @@
+{
+    "installed": [
+        {
+            "name": "symfony/framework-bundle",
+            "version": "6.4.34",
+            "latest": "7.3.4",
+            "description": "Core function of the Symfony framework"
+        }
+    ]
+}

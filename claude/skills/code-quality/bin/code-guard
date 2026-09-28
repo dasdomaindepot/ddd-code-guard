@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.17.0"
+VERSION="1.18.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -363,6 +363,7 @@ CHANGED_COUNT=$(grep -c . "$CHANGED_LIST" 2>/dev/null || echo 0)
 CHECK_DEFS=(
   "composer-validate|Composer-Metadaten|dependencies|cheap|$COMPOSER_BIN validate --no-check-publish --no-interaction|composer,file:composer.json"
   "composer-audit|Composer-Sicherheit|security|cheap|$COMPOSER_BIN audit --locked --abandoned=report --no-interaction|composer,file:composer.lock"
+  "versions|Supportende und Updates|dependencies|normal|$SCRIPT_DIR/check-versions .|file:composer.json,bin:python3"
   "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
   "auth-policy|Login und Passwoerter|security|cheap|$SCRIPT_DIR/check-auth-policy .|file:config/packages/security.yaml,bin:python3"
   "app-static|Statische Regeln|security|cheap|$SCRIPT_DIR/check-app-static .|bin:python3"
@@ -436,7 +437,14 @@ CHECK_DEFS=(
 # phpcs mit Exit 16 abbrechen). R2: kein $NAME in .env-Werten. R3: Zeitzone
 # Europe/Berlin in Container und PHP. R4: trusted_proxies hinter nginx mit
 # real_ip_header. R5: Deploy-Jobs, deren needs die Pruef-Jobs ueberspringen.
-# R6: composer.lock/Plattform, R7: Messenger, R8: Cron ohne Lock, R9: DB-root.
+# R6: composer.lock/Plattform, R7: Messenger, R8: Cron ohne Lock, R9: DB-root,
+# R10: Compose ohne Healthcheck bzw. Upload-Volume (Hinweise).
+#
+# versions (seit 1.18.0) blockiert: PHP- oder Symfony-Version ohne
+# Sicherheitsupdates laut endoflife.date (Antwort 7 Tage im Cache unter
+# ~/.cache/code-guard; ohne Netz nur ein Hinweis). Supportende in unter einem
+# halben Jahr und neue Hauptversionen direkter Abhaengigkeiten (composer
+# outdated im laufenden php-Container) sind Hinweise.
 #
 # secrets (seit 1.14.0) blockiert: versionierte .env.local-Dateien und
 # gitleaks-Treffer in den versionierten Dateien (gitleaks lokal oder als bereits

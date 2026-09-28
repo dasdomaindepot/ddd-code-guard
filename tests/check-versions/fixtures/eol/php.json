@@ -1,0 +1,11 @@
+{
+  "message": "PHP end-of-life data (test fixture)",
+  "result": {
+    "releases": [
+      {"name": "8.0", "eolFrom": "2023-11-26", "isEol": true},
+      {"name": "8.1", "eolFrom": "2025-12-31", "isEol": true},
+      {"name": "8.2", "eolFrom": "2026-12-08", "isEol": false},
+      {"name": "8.3", "eolFrom": "2027-12-31", "isEol": false}
+    ]
+  }
+}

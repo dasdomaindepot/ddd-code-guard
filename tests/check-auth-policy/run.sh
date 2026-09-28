@@ -173,6 +173,18 @@ expect 2
 run_script "$HERE/fixtures/dies-existiert-nicht"
 expect 2
 
+# --- Reset über symfonycasts, lifetime 86400 s (> 1 Stunde) — Befund
+run_script "$HERE/fixtures/reset-bundle-lang"
+expect 1 "86400 Sekunden"
+
+# --- eigener Reset-Token aus md5/uniqid ohne Ablaufzeit — Befund + Hinweis
+run_script "$HERE/fixtures/reset-eigen"
+expect 1 "vorhersagbar" "ohne Ablaufzeit"
+
+# --- gut erkannt als Reset ohne Schwachstelle? gut bleibt ohne Befunde (kein Token)
+run_script "$HERE/fixtures/gut"
+expect 0 "keine Passwort-Zurücksetzung erkannt"
+
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"
     exit 0
