@@ -77,7 +77,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-opener = urllib.request.build_opener(NoRedirect)
+# Der Kontext muss ausdruecklich an den Opener: build_opener() baut sonst einen
+# eigenen HTTPS-Handler mit Zertifikatspruefung, und ohne vertraute mkcert-CA
+# (etwa auf einem zweiten Rechner) endet jede Anfrage als "HTTP 0".
+opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=CTX))
 
 
 def request(url: str, headers: dict | None = None, timeout: int = TIMEOUT):

@@ -32,12 +32,13 @@
 #   13  abgebrochen: Umgebung liess sich nicht starten
 #   14  abgebrochen: der Agent hat keinen Report geschrieben
 #   15  abgebrochen: nach dem Lauf lagen fremde Aenderungen im Worktree
+#   16  Todo-Modus: Vikunja nicht erreichbar oder ohne Zugangsdaten
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_GUARD="$SCRIPT_DIR/code-guard"
+CODE_GUARD="${GUARD_WEEKLY_CODE_GUARD:-$SCRIPT_DIR/code-guard}"
 
 PROJECT_DIR="$PWD"
 TARGET_BRANCH="develop"
@@ -62,6 +63,9 @@ AGENT_TIMEOUT=1800
 FULL=0
 EXPENSIVE_TIMEOUT=14400
 GUARD_TIMEOUT_SET=0
+# Todo-Modus (--vikunja-project): Befunde werden Vikunja-Tasks statt eines
+# committeten Reports.
+VIKUNJA_PROJECT=""
 
 # Dateien, die dauerhaft vom committeten Stand abweichen duerfen, ohne dass der
 # Worktree als "in Arbeit" gilt. Auf jedem Rechner steht eine eigene .env --
@@ -98,6 +102,10 @@ Verwendung: guard-weekly --project DIR [OPTIONEN]
                     (Vorgabe: 14400 = 4 h; 0 = unbegrenzt)
   --guard-timeout N Sekunden fuer den ganzen code-guard-Lauf
                     (Vorgabe: 1800, mit --full unbegrenzt; 0 = unbegrenzt)
+  --vikunja-project ID
+                    Todo-Modus: je Befund (FAIL/TIMEOUT/MISSING/WARN) ein Task
+                    im Vikunja-Projekt ID, offene Dubletten bekommen nur einen
+                    Kommentar. Der Report wird weder committet noch gepusht.
   --boot-timeout N  Sekunden auf den Docker-Stack warten (Vorgabe: 180)
   --agent-timeout N Sekunden fuer den Agentenlauf (Vorgabe: 1800)
   -h, --help        diese Hilfe
@@ -120,10 +128,18 @@ while [ $# -gt 0 ]; do
         --full)          FULL=1; shift ;;
         --expensive-timeout) EXPENSIVE_TIMEOUT="${2:-14400}"; shift 2 ;;
         --guard-timeout) GUARD_TIMEOUT="${2:-1800}"; GUARD_TIMEOUT_SET=1; shift 2 ;;
+        --vikunja-project) VIKUNJA_PROJECT="${2:-}"; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [ -n "$VIKUNJA_PROJECT" ]; then
+    case "$VIKUNJA_PROJECT" in
+        *[!0-9]*) echo "--vikunja-project erwartet eine Projekt-ID: $VIKUNJA_PROJECT" >&2; exit 2 ;;
+    esac
+    NO_COMMIT=1
+fi
 
 cd "$PROJECT_DIR" 2>/dev/null || { echo "Verzeichnis nicht gefunden: $PROJECT_DIR" >&2; exit 2; }
 PROJECT_DIR="$PWD"
@@ -264,6 +280,8 @@ if [ "$DO_STATUS" -eq 1 ]; then
     echo "Projekt:      $PROJECT_NAME ($PROJECT_DIR)"
     echo "Branch:       $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     echo "Zielbranch:   $TARGET_BRANCH"
+    [ -z "$VIKUNJA_PROJECT" ] \
+        || echo "Todo-Modus:   Befunde werden Tasks in Vikunja-Projekt $VIKUNJA_PROJECT, kein Commit"
     # Massgeblich ist der Report auf dem Zielbranch. Liegt der Branch nur
     # entfernt vor, wird dieser gelesen.
     ref="$TARGET_BRANCH"
@@ -503,7 +521,8 @@ if [ "$DO_ACKNOWLEDGE" -eq 1 ]; then
     exit $?
 fi
 
-if [ "$STATUS" = "open" ] && [ "$FORCE" -eq 0 ]; then
+# Im Todo-Modus wird der Report nie committet, sein Zustand steuert also nichts.
+if [ "$STATUS" = "open" ] && [ "$FORCE" -eq 0 ] && [ -z "$VIKUNJA_PROJECT" ]; then
     since="$(frontmatter_value generated_at)"
     fail "Der Report auf $TARGET_BRANCH ist seit ${since:-unbekannt} offen und noch nicht abgehakt."
     echo "    Abhaken mit: guard-weekly --acknowledge --project $PROJECT_DIR" >&2
@@ -527,10 +546,31 @@ fi
 timeout "$GUARD_TIMEOUT" "$CODE_GUARD" "${GUARD_ARGS[@]}"
 GUARD_EXIT=$?
 
+SIDE_EFFECT_FILES=""
 case "$GUARD_EXIT" in
     0|1)  log "code-guard fertig (Exit $GUARD_EXIT)." ;;
-    3)    fail "code-guard meldet UNSAFE SIDE EFFECT — der Lauf hat den Worktree veraendert. Nichts wird committed."
-          exit 15 ;;
+    3)    if [ -n "$VIKUNJA_PROJECT" ]; then
+              # Im Todo-Modus wird nichts committet. Der Seiteneffekt wird selbst
+              # ein Todo, und die veraenderten getrackten Dateien gehen zurueck
+              # auf den committeten Stand -- sonst bliebe jeder weitere Lauf an
+              # der Dirty-Sperre haengen, ohne dass es jemand merkt. Der
+              # Worktree war vor dem Lauf sauber, alles jetzt Abweichende
+              # stammt also aus dem Lauf. Neue, ungetrackte Dateien bleiben
+              # liegen: loeschen ist hier nicht Sache des Turnus.
+              SIDE_EFFECT_FILES="$(dirty_paths | grep -vx -- "$REPORT" || true)"
+              log "code-guard meldet UNSAFE SIDE EFFECT — Todo-Modus: wird ein Todo, getrackte Dateien werden zurueckgesetzt."
+              while IFS= read -r se_path; do
+                  [ -n "$se_path" ] || continue
+                  if git ls-files --error-unmatch -- "$se_path" >/dev/null 2>&1; then
+                      git checkout --quiet -- "$se_path" && log "Zurueckgesetzt: $se_path"
+                  else
+                      log "Bleibt liegen (ungetrackt): $se_path"
+                  fi
+              done <<<"$SIDE_EFFECT_FILES"
+          else
+              fail "code-guard meldet UNSAFE SIDE EFFECT — der Lauf hat den Worktree veraendert. Nichts wird committed."
+              exit 15
+          fi ;;
     4)    fail "Die Umgebung liess sich nicht starten."
           exit 13 ;;
     124)  fail "code-guard lief in den Timeout (${GUARD_TIMEOUT}s)."
@@ -608,6 +648,200 @@ case "$AGENT" in
         fail "Unbekannter Agent: $AGENT (opencode|claude|none)"
         exit 2 ;;
 esac
+
+# ------------------------------------------------------------- Todo-Modus -----
+#
+# Statt eines committeten Reports wird jeder Befund ein Vikunja-Task. Ein
+# Befund, der schon offen im Projekt steht, bekommt nur einen Kommentar --
+# sonst stuende nach ein paar Wochen derselbe Task zehnmal da.
+
+vikunja_load_credentials() {
+    if [ -z "${VIKUNJA_BASE_URL:-}" ] || [ -z "${VIKUNJA_API_TOKEN:-}" ]; then
+        local env_file="$HOME/.claude/config/api-credentials.env"
+        # shellcheck disable=SC1090 -- Pfad ist erst zur Laufzeit bekannt
+        [ -f "$env_file" ] && . "$env_file"
+    fi
+    [ -n "${VIKUNJA_BASE_URL:-}" ] && [ -n "${VIKUNJA_API_TOKEN:-}" ]
+}
+
+# vikunja_call METHODE PFAD [JSON] -> Antwort auf stdout, Exit 1 bei HTTP-Fehler.
+vikunja_call() {
+    local method="$1" path="$2" body="${3:-}" out code
+    out="$(mktemp)"
+    local args=(-sS -o "$out" -w '%{http_code}' -X "$method"
+        -H "Authorization: Bearer $VIKUNJA_API_TOKEN" -H "Content-Type: application/json")
+    [ -z "$body" ] || args+=(--data-binary "$body")
+    code="$(curl "${args[@]}" "${VIKUNJA_BASE_URL%/}$path" 2>/dev/null)"
+    cat "$out"; rm -f "$out"
+    case "$code" in 2??) return 0 ;; *) return 1 ;; esac
+}
+
+# Titel aller offenen Tasks des Projekts als "id<TAB>titel", alle Seiten.
+vikunja_open_tasks() {
+    local page=1 resp n
+    while :; do
+        resp="$(vikunja_call GET "/tasks?filter=$(jq -rn --arg f "project_id = $VIKUNJA_PROJECT && done = false" '$f|@uri')&per_page=50&page=$page")" \
+            || return 1
+        n="$(printf '%s' "$resp" | jq 'if type == "array" then length else -1 end' 2>/dev/null)"
+        [ "$n" != "-1" ] && [ -n "$n" ] || return 1
+        [ "$n" -gt 0 ] || break
+        printf '%s' "$resp" | jq -r '.[] | "\(.id)\t\(.title)"'
+        page=$((page + 1))
+        [ "$page" -le 40 ] || break
+    done
+}
+
+html_escape() { jq -rn --arg s "$1" '$s | @html'; }
+
+# Check-ID aus einem Guard-Titel: "[Guard] <projekt>: <label> (<id>)", aeltere
+# Titel tragen noch den Status dahinter ("... (<id>) FAIL"). Die ID ist der
+# Schluessel, nicht der Titel -- sonst entstuende bei jedem Statuswechsel
+# (MISSING -> FAIL) ein neuer Task und der alte bliebe offen.
+guard_check_id() {
+    local prefix="[Guard] $PROJECT_NAME: "
+    case "$1" in "$prefix"*) ;; *) return 1 ;; esac
+    printf '%s\n' "$1" | sed -nE 's/^.* \(([a-z0-9][a-z0-9-]*)\)( [A-Z]+)?$/\1/p'
+}
+
+# Schliesst einen Task. Vikunja ersetzt beim Update den kompletten Datensatz:
+# deshalb erst vollstaendig holen, nur `done` setzen, zurueckschicken und
+# nachpruefen.
+vikunja_close_task() {
+    local id="$1" task resp
+    task="$(vikunja_call GET "/tasks/$id")" || return 1
+    resp="$(vikunja_call POST "/tasks/$id" "$(printf '%s' "$task" | jq -c '.done = true')")" || return 1
+    [ "$(printf '%s' "$resp" | jq -r '.done' 2>/dev/null)" = "true" ]
+}
+
+comment_task() {
+    vikunja_call PUT "/tasks/$1/comments" "$(jq -n --arg c "$2" '{comment: $c}')" >/dev/null
+}
+
+create_todos() {
+    if ! vikunja_load_credentials; then
+        fail "Todo-Modus: VIKUNJA_BASE_URL/VIKUNJA_API_TOKEN fehlen (auch nicht in ~/.claude/config/api-credentials.env)."
+        return 16
+    fi
+
+    local findings
+    findings="$(jq -c '.checks[] | select(.status == "FAIL" or .status == "TIMEOUT" or .status == "MISSING" or .status == "WARN")' "$RESULTS")"
+    if [ -n "$SIDE_EFFECT_FILES" ]; then
+        # Als Pseudo-Check in dieselbe Schleife: gleiche Dubletten-Logik.
+        local nl=$'\n'
+        findings+="${findings:+$nl}$(jq -cn --arg files "$SIDE_EFFECT_FILES" '{
+            id: "side-effect", label: "Seiteneffekt im Worktree", status: "UNSAFE",
+            command: "code-guard", log: "",
+            note: ("Der Lauf hat getrackte Dateien veraendert (danach zurueckgesetzt): " + ($files | split("\n") | join(", ")) + ". Meist eine generierte Datei, die im Repo veraltet ist -- neu erzeugen und committen.")}')"
+    fi
+
+    local open_tasks
+    if ! open_tasks="$(vikunja_open_tasks)"; then
+        fail "Todo-Modus: offene Tasks von Vikunja-Projekt $VIKUNJA_PROJECT liessen sich nicht lesen."
+        return 16
+    fi
+
+    # Offene Guard-Tasks dieses Projekts je Check-ID (der erste gewinnt).
+    local -A open_by_check=()
+    local tline tid ttitle cid
+    while IFS=$'\t' read -r tid ttitle; do
+        [ -n "$tid" ] || continue
+        cid="$(guard_check_id "$ttitle")" || continue
+        [ -n "$cid" ] || continue
+        [ -n "${open_by_check[$cid]:-}" ] || open_by_check[$cid]="$tid"
+    done <<<"$open_tasks"
+
+    local commit branch today host created=0 commented=0 closed=0 errors=0 line
+    commit="$(git rev-parse --short HEAD 2>/dev/null)"
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    today="$(date '+%d.%m.%Y %H:%M')"
+    host="$(hostname 2>/dev/null || echo '?')"
+    local run_info
+    run_info="im Guard-Lauf vom $(html_escape "$today") (Commit <code>$(html_escape "$commit")</code>, Host $(html_escape "$host"))"
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        local id label status command note logf title existing tail_txt desc body
+        id="$(jq -r '.id' <<<"$line")"
+        label="$(jq -r '.label // .id' <<<"$line")"
+        status="$(jq -r '.status' <<<"$line")"
+        command="$(jq -r '.command // ""' <<<"$line")"
+        note="$(jq -r '.note // ""' <<<"$line")"
+        logf="$(jq -r '.log // ""' <<<"$line")"
+        title="[Guard] $PROJECT_NAME: $label ($id)"
+
+        existing="${open_by_check[$id]:-}"
+        if [ -n "$existing" ]; then
+            if comment_task "$existing" "<p>Weiterhin offen $run_info, Status <strong>$(html_escape "$status")</strong>.</p>${note:+<p>$(html_escape "$note")</p>}"; then
+                commented=$((commented + 1))
+            else
+                fail "Kommentar an Task #$existing fehlgeschlagen."; errors=$((errors + 1))
+            fi
+            continue
+        fi
+
+        tail_txt=""
+        [ -n "$logf" ] && [ -f "$logf" ] && tail_txt="$(tail -n 40 "$logf")"
+        desc="<p><strong>Projekt:</strong> $(html_escape "$PROJECT_NAME")<br>"
+        desc+="<strong>Lauf:</strong> $(html_escape "$today") auf $(html_escape "$host")<br>"
+        desc+="<strong>Branch/Commit:</strong> $(html_escape "$branch") @ <code>$(html_escape "$commit")</code><br>"
+        desc+="<strong>Status:</strong> $(html_escape "$status")<br>"
+        desc+="<strong>Befehl:</strong> <code>$(html_escape "$command")</code></p>"
+        [ -z "$note" ] || desc+="<p><strong>Hinweis:</strong> $(html_escape "$note")</p>"
+        [ -z "$logf" ] || desc+="<p><strong>Log:</strong> <code>$(html_escape "$host:$PROJECT_DIR/$logf")</code></p>"
+        [ -z "$tail_txt" ] || desc+="<pre>$(html_escape "$tail_txt")</pre>"
+        [ -f "$REPORT" ] && desc+="<p>Der volle Report liegt auf <code>$(html_escape "$host:$PROJECT_DIR/docs/.guard/quality-report.md")</code> (bis zum naechsten Lauf).</p>"
+        desc+="<p>Wird automatisch geschlossen, sobald der Check in einem Guard-Lauf wieder PASS ist.</p>"
+
+        body="$(jq -n --arg t "$title" --arg d "$desc" '{title: $t, description: $d}')"
+        if vikunja_call PUT "/projects/$VIKUNJA_PROJECT/tasks" "$body" >/dev/null; then
+            created=$((created + 1))
+        else
+            fail "Anlegen von \"$title\" fehlgeschlagen."; errors=$((errors + 1))
+        fi
+    done <<<"$findings"
+
+    # Behoben = der Check lief in diesem Lauf und ist PASS. SKIPPED oder ein
+    # fehlender Check sagt nichts darueber, ob der Befund weg ist.
+    local passed
+    passed="$(jq -r '.checks[] | select(.status == "PASS") | .id' "$RESULTS")"
+    [ -n "$SIDE_EFFECT_FILES" ] || passed+=$'\n'"side-effect"
+    while IFS= read -r cid; do
+        [ -n "$cid" ] || continue
+        tid="${open_by_check[$cid]:-}"
+        [ -n "$tid" ] || continue
+        if comment_task "$tid" "<p>Behoben $run_info: Check ist wieder PASS. Automatisch geschlossen.</p>" \
+            && vikunja_close_task "$tid"; then
+            closed=$((closed + 1))
+            log "Geschlossen: #$tid ($cid)"
+        else
+            fail "Schliessen von Task #$tid ($cid) fehlgeschlagen."; errors=$((errors + 1))
+        fi
+    done <<<"$passed"
+
+    log "Todo-Modus: $created Tasks angelegt, $commented kommentiert, $closed geschlossen (Vikunja-Projekt $VIKUNJA_PROJECT)."
+    [ "$errors" -eq 0 ] || return 16
+    return 0
+}
+
+# Der Report bleibt im Todo-Modus nie im Baum stehen: der naechste Lauf
+# verlangt einen sauberen Worktree. Bis dahin liegt eine Kopie neben den Logs.
+discard_report() {
+    [ -f "$REPORT" ] || return 0
+    mkdir -p docs/.guard
+    cp -p "$REPORT" docs/.guard/quality-report.md 2>/dev/null
+    if git ls-files --error-unmatch -- "$REPORT" >/dev/null 2>&1; then
+        git checkout --quiet -- "$REPORT"
+    else
+        rm -f "$REPORT"
+    fi
+}
+
+if [ -n "$VIKUNJA_PROJECT" ]; then
+    create_todos
+    todo_exit=$?
+    discard_report
+    exit "$todo_exit"
+fi
 
 if [ ! -f "$REPORT" ]; then
     fail "Es liegt kein $REPORT vor — der Agent hat nichts geschrieben."

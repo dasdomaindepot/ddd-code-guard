@@ -463,6 +463,21 @@ Entwicklungsbranch her (anlegen, Fast-Forward, bei Divergenz Abbruch statt
 Merge), fährt `code-guard --boot`, ruft **dich** für den Reporttext und
 committet anschließend nur `docs/quality-report.md`.
 
+Umgebungsarbeit gehört nicht in den Guard, sondern in den Cron-Job, der ihn
+aufruft: `main` nach `develop` holen, Abhängigkeiten installieren, Migrationen,
+Assets bauen und warten, bis die App unter ihrer URL antwortet.
+
+**Todo-Modus** (`--vikunja-project ID`): Statt eines Commits wird jeder Befund
+(`FAIL`, `TIMEOUT`, `MISSING`, `WARN`) ein Vikunja-Task; steht für dieselbe
+Check-ID schon ein Task offen, bekommt er nur einen Kommentar. Ist ein Check in
+einem Lauf wieder `PASS` (oder tritt der Seiteneffekt nicht mehr auf), wird sein
+offener Task kommentiert und geschlossen — `SKIPPED` schließt nichts. Der Report wird nicht
+committet, sondern nach `docs/.guard/quality-report.md` beiseitegelegt. Meldet
+`code-guard` einen Seiteneffekt, wird der ein eigenes Todo und die veränderten
+getrackten Dateien gehen auf den committeten Stand zurück. Zugangsdaten kommen
+aus `VIKUNJA_BASE_URL`/`VIKUNJA_API_TOKEN` oder
+`~/.claude/config/api-credentials.env`; Vikunja-Fehler enden mit Exit 16.
+
 Für einen Komplett-Lauf (etwa nachts) gibt es `--full`: Dann laufen auch
 Coverage, Mutation-Testing, E2E, Asset-Build und Browser-Audit. Jeder teure Check
 darf bis zu 4 Stunden brauchen (`--expensive-timeout N`, `0` = unbegrenzt); die
