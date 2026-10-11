@@ -169,6 +169,25 @@ fi
 run_script "$HERE/fixtures/http-client"
 expect 0 "default_options ohne timeout"
 
+# --- XSS-/Eingabe-Hinweise; validierte Zugriffe und Ausnahmen bleiben still.
+run_script "$HERE/fixtures/xss"
+expect 0 "[app-static/H9]" "pagerLimit" "Zahl-/Listenparameter" "[app-static/H10]" "DTO ohne Validierung: MissingRules" "DTO ohne Validierung: OtherRules" "[app-static/H11]" "v-html" "[app-static/H12]" "echo/print/printf" "[app-static/H2]" "autoescape false" "<script>" "on*-Attribut" "Markup"
+expect_not 0 "rohe Request-Eingabe known" "rohe Request-Eingabe knownToo" "DTO ohne Validierung: ExternalData" "DTO ohne Validierung: ValidatedData"
+expect_not 0 "SafeController.php"
+expect 0 "weitere rohe Request-Eingaben"
+if [ "$(printf '%s' "$OUT" | grep -cF 'validieren statt casten' || true)" -ne 1 ]; then
+    echo "FEHLER: Request-Typcast soll nur unter H8 erscheinen" >&2
+    fail=1
+fi
+
+# --- H2/H9: nur ausführbarer JS-Kontext und alle Request-Namen/Argumentarten.
+run_script "$HERE/fixtures/xss-regression"
+expect 0 "contexts.html.twig:3: <script>" "contexts.html.twig:4: <script>" "contexts.html.twig:13: on*-Attribut" "contexts.html.twig:14: on*-Attribut"
+expect_not 0 "contexts.html.twig:1: <script>" "contexts.html.twig:2: <script>" "contexts.html.twig:5: <script>" "contexts.html.twig:6: <script>" "contexts.html.twig:7: <script>" "contexts.html.twig:8: <script>" "contexts.html.twig:9: <script>" "contexts.html.twig:10: <script>"
+expect_not 0 "contexts.html.twig:11: on*-Attribut" "contexts.html.twig:12: on*-Attribut" "contexts.html.twig:15: on*-Attribut" "contexts.html.twig:16: on*-Attribut"
+expect 0 "rohe Request-Eingabe limit" "rohe Request-Eingabe page" "rohe Request-Eingabe sort" "rohe Request-Eingabe self::COOKIE_NAME" "rohe Request-Eingabe \$key" "rohe Request-Eingabe query->all()" "rohe Request-Eingabe request->all()"
+expect_not 0 "rohe Request-Eingabe x-token" "getInt("
+
 # --- S5: gefährliche Produktions-Konfiguration (Fixture war angelegt, aber nie geprüft)
 run_script "$HERE/fixtures/prod-debug"
 expect 1 "[app-static/S5]" "Session Fixation" "Profiler/Debug in Produktion" "FooDevBundle kommt aus require-dev" "Debug-Modus"

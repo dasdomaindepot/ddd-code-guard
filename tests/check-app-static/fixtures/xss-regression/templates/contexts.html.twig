@@ -1,0 +1,16 @@
+<script nonce="{{ csp_nonce() }}" src="{{ asset('app.js') }}">const safe = '{{ value }}';</script>
+<script>const safe = "{{ value }}";</script>
+<script>const unsafe = {{ value }};</script>
+<script>const unsafe = `${{ value }}`;</script>
+<script>const safe = {{ value|json_ld }};</script>
+<script>const safe = {{ value|escape('js') }};</script>
+<script>const safe = {{ value|e('js') }};</script>
+<script type="application/ld+json">{{ value }}</script>
+<script type="text/template">{{ value }}</script>
+<script type="application/json">{{ value }}</script>
+<button onclick="show('{{ value }}')">Safe</button>
+<button onclick='show("{{ value }}")'>Safe</button>
+<button onclick="show({{ value }})">Unsafe</button>
+<button onclick="show(`${{ value }}`)">Unsafe</button>
+<button onclick="show({{ value|json_ld }})">Safe</button>
+<button onclick="show({{ value|escape('js') }})">Safe</button>

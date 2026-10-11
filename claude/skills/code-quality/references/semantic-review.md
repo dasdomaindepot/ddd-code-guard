@@ -239,6 +239,11 @@ unvertrauenswürdig:
 | HTTP-Aufruf | die Ziel-URL oder der Host aus der Eingabe stammt, ohne Positivliste (SSRF auf interne Dienste, Metadaten-Endpunkte) | `HIGH` |
 | Dateisystem | ein vom Nutzer gelieferter Dateiname Pfadbestandteil wird (`../`) | `HIGH` |
 | Weiterleitung | eine Ziel-URL aus der Eingabe kommt (Open Redirect) | `MEDIUM` |
+| HTML-/JS-Ausgabe (XSS) | ein Eingabewert ohne kontextgerechtes Escaping in der Antwort landet: `|raw`, `Markup`, `echo`, String-HTML, `<script>`, `on*`-/`href`-/`src`-/`style`-Attribute, `v-html`/`innerHTML` oder `javascript:`-URLs in `href` | `HIGH`; bei Admin-/Kundendaten-Kontext `BLOCKER` |
+| Klar typisierter Parameter | Limit, Seite, Sortierung, ID oder Enum ohne Validierung oder Positivliste verwendet wird | `MEDIUM` |
+
+Validierung mit einer Positivliste pro Feld und Output-Escaping sind zwei getrennte
+Schutzschichten. Sperrlisten für `<script` oder `onerror` schützen nicht vor XSS.
 
 **Mass Assignment:** Ein Formular, das direkt an eine Entity gebunden ist, oder
 ein Deserializer ohne Gruppen darf keine Felder beschreibbar machen, die der

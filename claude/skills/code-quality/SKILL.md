@@ -66,6 +66,10 @@ genauso wie auf den Servern. Läuft die
 Instanz nicht, steht der Check auf `MISSING`. Einzeln fahrbar:
 `bin/check-web-hardening https://test.de`.
 
+Eine fehlende Content-Security-Policy oder eine `script-src`/`default-src` mit
+`'unsafe-inline'` erscheint als Opt-in-Hinweis. Eine wirksame Skript-Policy
+ergänzt die Eingabevalidierung und das Escaping.
+
 **Statische Regeln** (`app-static`, seit 27.09.2026, **blockierend**): Liest
 Konfiguration und Quellen, ohne laufende Instanz. Befunde: `framework.session`
 mit `cookie_secure: false` oder `cookie_samesite: none` (ASVS 3.3.1), abgeschaltetes CSRF
@@ -92,6 +96,14 @@ weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw
 ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
 `prefers-reduced-motion`, `tsconfig.json` ohne `strict`. Einzeln fahrbar:
 `bin/check-app-static .`.
+
+Zusätzliche XSS-Hinweise: H2 meldet `|raw`, `autoescape false`, ungeschützte
+Twig-Ausgaben in `<script>` und `on*`-Attributen sowie PHP-`Markup`. H9 meldet
+rohe Request-Eingaben, besonders Zahl-/Listenparameter; ein begründeter
+`// guard: roh – <grund>`-Kommentar in derselben oder vorherigen Zeile nimmt
+eine Stelle aus. H10 meldet gemappte DTOs ohne `Assert`-Constraints. H11 meldet
+HTML-Sinks in Vue/JS/TS, H12 direkte PHP-Ausgaben und HTML-Strings in Responses.
+Diese Regeln sind Hinweise und ändern den Exit-Code nicht.
 
 **Hausregeln** (`house-rules`, seit 27.09.2026, **blockierend**): Regeln aus der
 Betriebserfahrung, ohne laufende Instanz. R1: Das phpcs-Regelwerk passt nicht zu

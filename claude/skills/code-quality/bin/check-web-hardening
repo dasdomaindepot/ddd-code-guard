@@ -83,6 +83,17 @@ fi
 xfo="$(header X-Frame-Options)"; csp="$(header Content-Security-Policy)"
 if [ -n "$xfo" ] || [[ "$csp" == *frame-ancestors* ]]; then ok "Clickjacking-Schutz vorhanden"; else hint "kein X-Frame-Options/frame-ancestors — Opt-in: security-headers-strict@docker, sofern die Seite nicht eingebettet wird"; fi
 [ -n "$(header Permissions-Policy)" ] || hint "keine Permissions-Policy — Opt-in wie oben"
+if [ -z "$csp" ]; then
+    hint "Content-Security-Policy fehlt — Opt-in: script-src oder default-src ohne 'unsafe-inline' setzen"
+else
+    script_directive="$(printf '%s' "$csp" | tr ';' '\n' | grep -iE '^[[:space:]]*script-src[[:space:]]+' | head -1)"
+    [ -n "$script_directive" ] || script_directive="$(printf '%s' "$csp" | tr ';' '\n' | grep -iE '^[[:space:]]*default-src[[:space:]]+' | head -1)"
+    if [ -z "$script_directive" ]; then
+        hint "Content-Security-Policy ohne script-src/default-src — Opt-in: Skripte begrenzen"
+    elif [[ "${script_directive,,}" == *"'unsafe-inline'"* ]]; then
+        hint "Content-Security-Policy erlaubt 'unsafe-inline' für Skripte — Opt-in: Inline-Skripte vermeiden"
+    fi
+fi
 
 # --------------------------------------------------------------- robots.txt --
 

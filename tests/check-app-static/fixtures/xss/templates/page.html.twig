@@ -1,0 +1,8 @@
+{{ name|raw }}
+{% autoescape false %}{{ name }}{% endautoescape %}
+<script>const name = '{{ name }}';</script>
+<button onclick="show('{{ name }}')">Show</button>
+<script>const safe = {{ name|json_encode|raw }};</script>
+<button onclick="show('{{ name|e('js') }}')">Safe</button>
+<script>const unsafe = {{ name }};</script>
+<button onclick="show({{ name }})">Unsafe</button>

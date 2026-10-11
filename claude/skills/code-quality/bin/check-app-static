@@ -27,7 +27,7 @@ Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert conf
 
 Hinweise (kein Einfluss auf den Exit):
     H1 Rohes SQL mit eingesetzter Variable (ASVS 1.2.4)
-    H2 |raw in Twig (ASVS 1.2.1)
+    H2 Unsichere Twig-/PHP-Ausgabe (ASVS 1.2.1)
     H3 Schwache Kryptografie (ASVS 11.4.1, 11.3.1)
     H4 Gefährliche Funktionen (ASVS 1.2.5, 1.3.2)
     H5 Fokus und Bewegung in CSS (WCAG 2.4.7, 2.3.3)
@@ -36,6 +36,10 @@ Hinweise (kein Einfluss auf den Exit):
          file_get_contents)
       H8 PHP-Sicherheits-Patzer: @-Fehlerunterdrückung, json_decode ohne
          JSON_THROW_ON_ERROR, Typcast auf Request-Eingaben
+      H9 Rohe Request-Eingaben (ASVS 1.2.x, 2.2.1)
+     H10 DTO ohne Validierung
+     H11 Unsichere HTML-Sinks im Frontend
+     H12 Ungeescapte PHP-Ausgabe und HTML-Responses
  
 
 Exit-Codes:
@@ -1148,14 +1152,44 @@ def part_h1_sql(project_path: str) -> None:
 # --- H2: |raw in Twig --------------------------------------------------
 
 RAW_RE = re.compile(r"\| ?raw\b")
+TWIG_JS_SAFE_RE = re.compile(r"\|\s*(?:json\w*\b|(?:e|escape)\s*\(\s*['\"]js['\"]\s*\))", re.I)
+SCRIPT_BLOCK_RE = re.compile(r"<script\b(?P<attrs>(?:[^>'\"]|'[^']*'|\"[^\"]*\")*)>(?P<body>.*?)</script\s*>", re.I | re.S)
+
+
+def _js_output_offsets(text: str):
+    """Twig-Ausgaben ohne JS-String-Quotes oder in Backticks liefern."""
+    quote = None
+    cursor = 0
+    for output in re.finditer(r"{{(.*?)}}", text, re.S):
+        fragment = text[cursor:output.start()]
+        i = 0
+        while i < len(fragment):
+            ch = fragment[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if quote is None and ch in "'\"`":
+                quote = ch
+            elif ch == quote:
+                quote = None
+            i += 1
+        if quote not in ("'", '"') and not TWIG_JS_SAFE_RE.search(output.group()):
+            yield output.start()
+        cursor = output.end()
+
+
+def _script_is_javascript(attrs: str) -> bool:
+    m = re.search(r"\btype\s*=\s*(['\"])(.*?)\1", attrs, re.I | re.S)
+    if not m:
+        return True
+    script_type = m.group(2).strip().lower().split(";", 1)[0]
+    return script_type in ("module", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript")
 
 
 def part_h2_raw_twig(project_path: str) -> None:
     global RULE
     RULE = "H2"
     templates = os.path.join(project_path, "templates")
-    if not os.path.isdir(templates):
-        return
     twigs = glob.glob(os.path.join(templates, "**", "*.twig"), recursive=True)
     total = 0
     templ_count = 0
@@ -1168,14 +1202,37 @@ def part_h2_raw_twig(project_path: str) -> None:
         for i, line in enumerate(text.splitlines(), 1):
             for _ in RAW_RE.finditer(line):
                 total += 1
-                hits.append((relative(project_path, path), i))
+                hits.append((relative(project_path, path), i, "|raw"))
     if total > 0:
         hint(
             f"{total}× |raw in {templ_count} Templates — jede Stelle braucht "
             f"bereinigtes HTML (z. B. html_sanitizer)"
         )
-        for rel, i in hits[:5]:
+        for rel, i, _ in hits[:5]:
             hint(f"{rel}:{i}: |raw — unsicheres HTML, bereinigtes verwenden (z. B. html_sanitizer)")
+
+    extra = []
+    for path in twigs:
+        text = _read_text(path) or ""
+        for m in re.finditer(r"{%\s*autoescape\s+false\b", text):
+            extra.append((path, text.count("\n", 0, m.start()) + 1, "autoescape false"))
+        for block in SCRIPT_BLOCK_RE.finditer(text):
+            if not _script_is_javascript(block.group("attrs")):
+                continue
+            for offset in _js_output_offsets(block.group("body")):
+                position = block.start("body") + offset
+                extra.append((path, text.count("\n", 0, position) + 1, "<script>"))
+        for m in re.finditer(r"\bon\w+\s*=\s*(['\"])(.*?)\1", text, re.I | re.S):
+            for offset in _js_output_offsets(m.group(2)):
+                extra.append((path, text.count("\n", 0, m.start(2) + offset) + 1, "on*-Attribut"))
+    for path in php_files_under_src(project_path):
+        text = _read_text(path) or ""
+        for m in re.finditer(r"\b(?:new\s+)?Markup\s*\(", text):
+            extra.append((path, text.count("\n", 0, m.start()) + 1, "Markup"))
+    for path, line, kind in extra[:5]:
+        hint(f"{relative(project_path, path)}:{line}: {kind} — Ausgabe kontextgerecht escapen")
+    if len(extra) > 5:
+        hint(f"… und {len(extra) - 5} weitere unsichere Ausgaben")
 
 
 # --- H3: Schwache Kryptografie -----------------------------------------
@@ -1464,6 +1521,146 @@ def part_h8_php_hints(project_path: str) -> None:
         hint(f"… und {cast_total - 5} weitere gecastete Eingaben")
 
 
+# --- H9: Rohe Request-Eingaben -----------------------------------------
+
+REQUEST_RAW_RE = re.compile(
+    r"->(?:query|request|cookies)->(?:get|all)\s*\(|"
+    r"(?:\$[A-Za-z_]\w*|getCurrentRequest\(\))->get\s*\(|"
+    r"\$_(?:GET|POST|REQUEST|COOKIE)\s*\[|\bfilter_input\s*\("
+)
+NUMERIC_LIST_RE = re.compile(
+    r"^(?:limit|pagerLimit|perPage|per_page|page|offset|sort|order|dir|id)$", re.I
+)
+RAW_EXCEPTION_RE = re.compile(r"//\s*guard:\s*roh\s*[–-]\s*\S")
+
+
+def _raw_request_hits(line: str):
+    code = _strip_strings(line)
+    for m in REQUEST_RAW_RE.finditer(code):
+        call = _split_call(line, m.end() - 1) if code[m.end() - 1] == "(" else line[m.start():]
+        prefix = code[:m.start()]
+        if re.search(r"\(\s*(?:int|float|bool|string)\s*\)\s*$", prefix):
+            continue  # H8 meldet diesen Typcast bereits.
+        if "FILTER_VALIDATE_" in line and ("filter_var(" in line or "->filter(" in line or "filter_input(" in line):
+            continue
+        if re.search(r"->all\s*\($", m.group()):
+            yield m.group().lstrip("->").replace(" ", "") + ")"
+            continue
+        if m.group().startswith("$_"):
+            argument = re.search(r"\[\s*(.*?)\s*]", call)
+            name = argument.group(1) if argument else call
+        else:
+            args = call[1:-1].split(",", 2)
+            name = args[1].strip() if m.group().startswith("filter_input") and len(args) > 1 else args[0].strip()
+        yield name[1:-1] if len(name) >= 2 and name[0] == name[-1] and name[0] in "'\"" else name
+
+
+def part_h9_raw_request(project_path: str) -> None:
+    global RULE
+    RULE = "H9"
+    hits = {"zahl": [], "allgemein": []}
+    for path in php_files_under_src(project_path):
+        if "Form" in os.path.relpath(path, project_path).split(os.sep):
+            continue
+        lines = (_read_text(path) or "").splitlines()
+        for i, line in enumerate(lines, 1):
+            if _is_comment_line(line) or RAW_EXCEPTION_RE.search(line) or (i > 1 and RAW_EXCEPTION_RE.search(lines[i - 2])):
+                continue
+            for name in _raw_request_hits(line):
+                kind = "zahl" if NUMERIC_LIST_RE.fullmatch(name) else "allgemein"
+                hits[kind].append((relative(project_path, path), i, name))
+    for kind, entries in hits.items():
+        for rel, line, name in entries[:5]:
+            detail = "Zahl-/Listenparameter: Positivliste oder Typvalidierung" if kind == "zahl" else "Eingabe validieren"
+            hint(f"{rel}:{line}: rohe Request-Eingabe {name} — {detail}")
+        if len(entries) > 5:
+            hint(f"… und {len(entries) - 5} weitere rohe Request-Eingaben ({kind})")
+
+
+# --- H10: DTO ohne Validierung -----------------------------------------
+
+MAP_DTO_RE = re.compile(r"#\[\s*(?:\\?[\w\\]+\\)?Map(?:QueryString|RequestPayload)\b[^]]*]\s*(?:\??)([\w\\]+)\s+\$", re.S)
+CLASS_RE = re.compile(r"\bclass\s+(\w+)\b")
+PUBLIC_PROPERTY_RE = re.compile(r"(?:#\[\s*Assert\\\w+[^]]*]\s*)*\bpublic\s+(?:(?:readonly|\??[\w\\|]+)\s+)*\$\w+")
+
+
+def part_h10_dto_validation(project_path: str) -> None:
+    global RULE
+    RULE = "H10"
+    classes = {}
+    for path in php_files_under_src(project_path):
+        text = _read_text(path) or ""
+        for m in CLASS_RE.finditer(text):
+            classes[m.group(1)] = (path, text[m.end():])
+    seen = set()
+    for path in php_files_under_src(project_path):
+        text = _read_text(path) or ""
+        for m in MAP_DTO_RE.finditer(text):
+            name = m.group(1).split("\\")[-1]
+            if name in seen or name not in classes:
+                continue
+            dto_path, body = classes[name]
+            # Auf die Klasse bis zur nächsten Deklaration begrenzen.
+            body = re.split(r"\bclass\s+\w+\b", body, maxsplit=1)[0]
+            properties = list(PUBLIC_PROPERTY_RE.finditer(body))
+            if properties and not any("Assert\\" in prop.group() for prop in properties):
+                line = text.count("\n", 0, m.start()) + 1
+                hint(f"{relative(project_path, path)}:{line}: DTO ohne Validierung: {name} ({relative(project_path, dto_path)})")
+                seen.add(name)
+
+
+# --- H11: HTML-Sinks im Frontend ---------------------------------------
+
+FRONTEND_HTML_RE = re.compile(r"\bv-html\s*=|\b(?:innerHTML|outerHTML)\s*=|\binsertAdjacentHTML\s*\(|\bdocument\.write\s*\(|\bdangerouslySetInnerHTML\b")
+
+
+def part_h11_frontend_html(project_path: str) -> None:
+    global RULE
+    RULE = "H11"
+    paths = _walk_skip(os.path.join(project_path, "assets"), (".js", ".ts", ".jsx", ".tsx", ".vue"))
+    if os.path.isfile(os.path.join(project_path, "package.json")):
+        paths += _walk_skip(os.path.join(project_path, "src"), (".js", ".ts", ".jsx", ".tsx", ".vue"))
+    else:
+        paths += _walk_skip(os.path.join(project_path, "src"), (".vue",))
+    hits = []
+    for path in sorted(set(paths)):
+        for i, line in enumerate((_read_text(path) or "").splitlines(), 1):
+            if _is_comment_line(line):
+                continue
+            for m in FRONTEND_HTML_RE.finditer(line):
+                hits.append((relative(project_path, path), i, m.group().split("=")[0].strip()))
+    for rel, line, kind in hits[:5]:
+        hint(f"{rel}:{line}: {kind} — HTML aus Eingaben vor Ausgabe bereinigen")
+    if len(hits) > 5:
+        hint(f"… und {len(hits) - 5} weitere HTML-Sinks im Frontend")
+
+
+# --- H12: PHP-Ausgabe ---------------------------------------------------
+
+PHP_OUTPUT_RE = re.compile(r"\b(echo|print|printf)\b\s*(.*?);", re.S)
+HTML_RESPONSE_RE = re.compile(r"\b(?:new\s+)?Response\s*\(")
+
+
+def part_h12_php_output(project_path: str) -> None:
+    global RULE
+    RULE = "H12"
+    hits = []
+    for path in php_files_under_src(project_path):
+        text = _read_text(path) or ""
+        for m in PHP_OUTPUT_RE.finditer(text):
+            expr = m.group(2)
+            if "$" in expr and not re.search(r"\b(?:htmlspecialchars|htmlentities|esc)\s*\(", expr):
+                hits.append((relative(project_path, path), text.count("\n", 0, m.start()) + 1, "echo/print/printf"))
+        for m in HTML_RESPONSE_RE.finditer(text):
+            call = _split_call(text, m.end() - 1)
+            if re.search(r"['\"][^'\"]*<[^'\"]*>[^'\"]*['\"]\s*\.\s*\$\w+", call) or re.search(r"\$\w+\s*\.\s*['\"][^'\"]*<[^'\"]*>[^'\"]*['\"]", call):
+                hits.append((relative(project_path, path), text.count("\n", 0, m.start()) + 1, "HTML-String in Response"))
+    for rel, line, kind in hits[:5]:
+        hint(f"{rel}:{line}: {kind} mit Variable — Ausgabe kontextgerecht escapen")
+    if len(hits) > 5:
+        hint(f"… und {len(hits) - 5} weitere PHP-Ausgaben")
+
+
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
@@ -1505,6 +1702,10 @@ def main() -> int:
     part_h6_typescript(project_path)
     part_h7_http_timeouts(project_path)
     part_h8_php_hints(project_path)
+    part_h9_raw_request(project_path)
+    part_h10_dto_validation(project_path)
+    part_h11_frontend_html(project_path)
+    part_h12_php_output(project_path)
 
     print()
     if findings:
