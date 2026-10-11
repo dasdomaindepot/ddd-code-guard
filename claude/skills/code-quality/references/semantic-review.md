@@ -11,14 +11,16 @@ Liste der geänderten Dateien stehen in `docs/.guard/results.json` unter
 `git.base_ref` und `git.changed_files`.
 
 Jeder Befund braucht Pfad, Zeile und eine Severity aus `guard-policy.yml`.
-Ohne Codebeleg ist es kein Befund, sondern eine Vermutung. Eine Vermutung steht
-höchstens als `LOW` im Report, mit dem Wort „Vermutung“ im Titel — oder sie
-entfällt. Sie hebt das Verdikt nie.
+Ohne Codebeleg für den behaupteten Fehler ist es kein Befund. Eine offene
+Prüffrage kann höchstens als `LOW` mit „Vermutung“ im Titel stehen; sie behauptet
+keine Ausnutzbarkeit und hebt das Verdikt nie.
 
 **Rangfolge der Severity:** Nennt eine Achse eine Severity ausdrücklich (etwa
 „Datenleck zwischen Mandanten bei Kundendaten: BLOCKER“), gilt sie vor den
-allgemeinen Beschreibungen in `guard-policy.yml`. Die Policy regelt Schwellen
-und Stufen, die Achse ist die speziellere Regel.
+allgemeinen Beschreibungen in `guard-policy.yml`, sofern der beschriebene
+Angriffsweg und die Wirkung belegt sind. Bei Sicherheitsbefunden prüfst du
+zusätzlich das Bewertungsraster unten. Die Policy regelt Schwellen und Stufen,
+die Achse ist die speziellere Regel.
 
 **Ein Defekt, ein Befund:** Trifft dieselbe Ursache mehrere Achsen (ein
 Mandant aus dem Request ist Achse 3 und 6), wird daraus **ein** Befund. Er
@@ -33,6 +35,69 @@ Idempotenz und ohne Payload-Prüfung sind drei Befunde — drei Änderungen.
 **Befunde außerhalb der Achsen** sind erlaubt, wenn sie belegt sind — etwa ein
 abgeschalteter CSRF-Schutz oder `flush()` ohne Validierung. Sie stehen unter
 „Sonstiges“, die Severity folgt den Beschreibungen in `guard-policy.yml`.
+
+## Gegenprüfung von Sicherheitsbefunden
+
+Wende diese Regeln im Diff-Review auf jeden behaupteten Angriffsweg an; sie
+gelten ebenso für eine spätere Tiefenprüfung. Beginne bei der Rolle des
+Angreifers, nicht bei der gefährlich aussehenden Senke. Halte für den Fund und
+**jeden Schritt einer Kette** fest:
+
+1. **Einstieg und Rechte:** Welche Rolle kann Route, API, Formular, Webhook oder
+   Befehl tatsächlich erreichen? Prüfe `security.access_control` in seiner
+   Reihenfolge, `#[IsGranted]`, Voter und vorgelagerte Prüfungen sowie Präfixe
+   wie `/crm` und `/admin`. Ein öffentlicher Methodenaufruf macht eine
+   geschützte Route nicht öffentlich.
+2. **Kontrolle über die Daten:** Wer kann den konkreten Wert schreiben oder
+   ändern, der zur nächsten Stufe und schließlich in die Senke fließt?
+   Unterscheide Request-Eingaben, eigene Datensätze, fremde Datensätze,
+   importierte Daten und Werte, die nur Admins oder Operatoren pflegen.
+3. **Durchgehender Weg:** Belege Übergabe, Prüfung und Wirkung bis zur Senke
+   mit Codepfaden. Benenne bei jedem Übergang die benötigten Rechte. Eine Kette
+   zählt nur, wenn **derselbe genannte Angreifer** alle Schritte ausführen oder
+   auslösen kann; ein unerreichbares Glied unterbricht sie.
+
+**Verwerfen statt aufblasen:** Melde keinen Sicherheitsbefund, wenn der
+nachvollzogene Weg nur eine abgewiesene Anfrage, ein DoS- oder Quote-Problem
+zeigt; wenn der Angreifer den wirksamen Wert nicht kontrolliert (etwa weil ihn
+nur Admins oder Operatoren setzen); wenn lediglich Code-Hygiene ohne konkrete
+Ausnutzbarkeit fehlt; oder wenn ein nötiger Schritt im Code nicht belegt ist.
+Ein eigenständiges Verfügbarkeitsproblem darf unter seiner passenden Achse
+bewertet werden, sofern dessen Wirkung belegt ist. Dokumentiere einen
+verworfenen Verdacht knapp mit dem entscheidenden Gegenbeleg, statt ihm eine
+Severity zu geben.
+
+**Bedingt gültig:** Hängt die Wirkung von Produktionsdaten oder der
+Deploy-Konfiguration ab, benenne die fehlende Voraussetzung ausdrücklich und
+kennzeichne den Fund als „bedingt gültig“. Belege den Codepfad, unterscheide
+nachgewiesene Voraussetzungen von Annahmen und fordere die gezielte Prüfung
+der offenen Voraussetzung an. Setze weder die ungünstigste Produktion still
+voraus noch mache aus einer unbelegten Voraussetzung einen sicheren `BLOCKER`.
+
+### Bewertungsraster
+
+Leite die Severity aus vier Fragen ab: Von welcher Position startet der
+Angreifer (anonym, angemeldet, privilegiert)? Welche zusätzlichen Rechte
+braucht er? Muss ein anderer Nutzer einen Link öffnen, Inhalte ansehen oder
+eine weitere Aktion ausführen? Welche **belegte** Wirkung tritt ein (etwa
+Datenzugriff, Rechtegewinn, Änderung oder bloßer Bedienfehler)? Notiere diese
+vier Antworten beim Befund. Die Severity-Beispiele der Achsen gelten für ihren
+jeweils ausnutzbaren Fall; fehlt dessen Voraussetzung, bewerte nur die
+nachgewiesene Wirkung.
+
+| Severity | Sicherheitswirkung und erreichbarer Angriffsweg |
+|---|---|
+| `BLOCKER` | Ohne hohe Vorrechte erreichbarer Weg zu besonders schwerem Schaden, etwa fremden Kundendaten, wirksamer Rechteübernahme oder Ausführung im Administrationskontext. Erforderliche Nutzerinteraktion und Datenkontrolle sind belegt. |
+| `HIGH` | Erreichbarer Weg zu erheblichem Datenzugriff oder wirksamer Manipulation; ein normal angemeldeter Nutzer oder ein plausibel erreichbares Opfer kann ihn auslösen. Auch XSS mit belegtem Opferpfad und erheblicher Wirkung fällt hierher. |
+| `MEDIUM` | Begrenzte, aber konkrete Wirkung mit zusätzlichen Rechten, Nutzerinteraktion oder eng begrenztem Ziel. Ein unvalidierter typisierter Parameter zählt nur, wenn seine tatsächliche Wirkung gezeigt ist. |
+| `LOW` | Kleine, belegte Wirkung ohne weiterreichende Ausnutzung; offene Prüffragen bleiben ausdrücklich Vermutungen und zählen nicht als Sicherheitsnachweis. |
+
+Für eine Kette bewerte jeden Übergang einzeln. Übernimm nicht die Severity der
+letzten Senke, wenn ein früherer Schritt nur unter engeren Rechten oder mit
+geringerer belegter Wirkung funktioniert: Die Gesamtkette darf nicht höher als
+ihr schwächstes **erreichbares** Glied eingestuft werden. Eigenständige,
+vollständig belegte Teilwege können eigene Befunde sein; dieselbe Ursache
+bleibt gemäß „Ein Defekt, ein Befund“ einmal gezählt.
 
 ## Schritt 0 — Projektprofil
 
@@ -244,6 +309,12 @@ unvertrauenswürdig:
 
 Validierung mit einer Positivliste pro Feld und Output-Escaping sind zwei getrennte
 Schutzschichten. Sperrlisten für `<script` oder `onerror` schützen nicht vor XSS.
+Bei XSS belege zusätzlich, wer den Inhalt schreiben kann, wer ihn in welchem
+HTML-/JS-Kontext sieht und ob dieser Nutzer die Ausgabe tatsächlich erreicht.
+Ein nur vom Admin gepflegter Wert im eigenen Admin-Browser ist ohne weiteren
+Angriffsweg kein fremdauslösbares XSS. Bei Limit, Seite, Sortierung, ID und
+Enum belege die Wirkung der fehlenden Validierung; ein bloßer Fehlerstatus oder
+ein höherer Ressourcenverbrauch wird nicht als Injection hochgestuft.
 
 **Mass Assignment:** Ein Formular, das direkt an eine Entity gebunden ist, oder
 ein Deserializer ohne Gruppen darf keine Felder beschreibbar machen, die der

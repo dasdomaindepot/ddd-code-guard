@@ -15,7 +15,9 @@ gates:
   # Ein Lauf, der den Worktree veraendert hat, blockiert immer.
   side_effect_is_blocker: true
 
-# Schwellen fuer die Befunde des semantischen Reviews.
+# Schwellen für die Befunde des semantischen Reviews. Sicherheitsbefunde
+# werden nach Erreichbarkeit, Datenkontrolle und Wirkung gemäß
+# references/semantic-review.md gegenprüft, bevor sie hier zählen.
 severity:
   blocker:
     allowed: 0
