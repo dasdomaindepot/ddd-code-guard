@@ -112,6 +112,32 @@ Achse selbst einen Grund nennt (Achse 5: keine niedergeschriebenen Regeln).
 Das Ergebnis von Schritt 0 steht im Report unter „Projektprofil“: gelesene
 Werte, abgeleitete Werte mit Quelle, offen gebliebene Werte.
 
+## Rückgriff auf Sicherheitswissen
+
+Liegt `docs/security/` im Projekt vor, lies die vorhandenen Dateien nach
+`references/security-knowledge.md`. Fehlt der Ordner oder eine einzelne Datei,
+läuft das normale Diff-Review ohne dieses Wissen weiter. Beziehe die Angaben
+auf `git.changed_files` und den tatsächlichen Diff, einschließlich umbenannter
+Dateien und neuer Aufrufpfade:
+
+1. Berührt die Änderung eine Vertrauensgrenze, einen kritischen Wert oder eine
+   heikle Stelle aus `threat-model.md`? Verfolge den betroffenen Datenfluss und
+   prüfe, ob die beschriebene Schutzmaßnahme noch greift.
+2. Vergleiche passende Einträge aus `history.jsonl` mit dem heutigen Code und
+   dem historischen Fix. Melde eine Regression nur, wenn der Diff die frühere
+   Fehlerursache tatsächlich zurückbringt; nenne Fix-Commit und aktuelle
+   Codezeile als Beleg.
+3. Vergleiche Funde aus der lokalen `findings.jsonl` anhand von Fingerabdruck,
+   Pfad und Ursache. `offen` und `erledigt` sind Prüfhinweise, keine automatischen
+   Befunde. Bei `verworfen` prüfe die Begründung gegen den aktuellen Code:
+   Trifft sie noch zu, melde denselben Fehlalarm nicht erneut. Bei geändertem
+   Datenfluss oder entfallener Schutzmaßnahme prüfe den Fund neu.
+
+Melde einen belegten Fehler unter der passenden Achse mit deren Regel-ID
+`review/A<achse>` und der Severity nach den obigen Regeln; dieselbe Ursache
+zählt nur einmal. Eine bloße Berührung einer heiklen Stelle ist noch kein
+Befund. Funddetails aus `findings.jsonl` gehören nicht in versionierte Dateien.
+
 ## Achse 1 — Anforderungsdeckung
 
 Die häufigste Art, wie KI-generierter Code scheitert: Er ist sauber, grün und

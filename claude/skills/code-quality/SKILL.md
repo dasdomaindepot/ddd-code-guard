@@ -420,6 +420,7 @@ Für die Einordnung der Script-Ergebnisse und die semantische Prüfung:
 6. Tests und Mutation-Testing → `references/tests.md`
 7. Die semantischen Achsen → `references/semantic-review.md`
 8. Projektprofil (welche Achsen laufen) → `references/project-profile.md`
+9. Sicherheitswissen des Projekts → `references/security-knowledge.md`
 
 Nach einem gewöhnlichen Qualitätsfehler machst du weiter, solange die folgenden
 Prüfungen unabhängig und sicher bleiben. Du hältst nur an bei unerwarteten
