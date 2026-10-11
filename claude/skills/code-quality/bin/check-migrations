@@ -28,6 +28,7 @@ Regeln je neuer Datei (Meldungen immer mit `<pfad>:<zeile>:`):
         umkehrbar.
     M5  Befund: DELETE FROM oder UPDATE … SET ohne WHERE — verändert alle
         Zeilen.
+    M6  Befund: Token/Hash aus md5(id), uniqid() oder ähnlichen Ableitungen.
 
 Exit-Codes:
       0  keine Befunde (nur Hinweise/ok)
@@ -387,6 +388,31 @@ def check_m5(rel: str, text: str) -> None:
         note(f"{rel}: keine DELETE/UPDATE ohne WHERE")
 
 
+def check_m6(rel: str, text: str) -> None:
+    global RULE
+    RULE = "M6"
+    reported = set()
+    for line, raw in enumerate(text.splitlines(), 1):
+        if raw.lstrip().startswith(("//", "#", "*")):
+            continue
+        assignment = re.search(r"\$(?:\w*(?:token|hash|secret|key)\w*)\s*=\s*(.+?);", raw, re.I)
+        setter = re.search(r"->\s*set(?:\w*Token|\w*Hash|\w*Secret|\w*Key)\s*\((.+)\)", raw, re.I)
+        expr = (assignment or setter)
+        if not expr:
+            continue
+        value = expr.group(1)
+        if re.search(r"\buniqid\s*\(", value, re.I) or re.search(
+            r"\bmd5\s*\(\s*(?:(?:\(string\))\s*)?\$\w*id\b", value, re.I
+        ) or re.search(r"\bhash\s*\(\s*['\"]md5['\"]\s*,\s*\$\w*id\b", value, re.I):
+            finding(f"{rel}:{line}: Token/Hash aus md5(id) oder uniqid() — kryptografisch zufällige Werte verwenden")
+            reported.add(line)
+    for line, sql in up_calls(text):
+        if line in reported:
+            continue
+        if re.search(r"\b(?:token|hash|secret|key)\b\s*=\s*MD5\s*\(\s*id\s*\)", sql, re.I):
+            finding(f"{rel}:{line}: Token/Hash aus MD5(id) im SQL — kryptografisch zufällige Werte verwenden")
+
+
 # --- Hauptprogramm -------------------------------------------------------
 
 def main() -> int:
@@ -454,6 +480,7 @@ def main() -> int:
         check_m3(path, text)
         check_m4(path, text)
         check_m5(path, text)
+        check_m6(path, text)
         if _none_since(snap):
             note(f"{path}: Migration ohne Befund")
 

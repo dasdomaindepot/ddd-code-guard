@@ -193,11 +193,73 @@ run_script "$HERE/fixtures/prod-debug"
 expect 1 "[app-static/S5]" "Session Fixation" "Profiler/Debug in Produktion" "FooDevBundle kommt aus require-dev" "Debug-Modus"
 
 # --- kein Projekt: nicht messbar
+SECURITY_DIR="$(mktemp -d)"
+trap 'rm -rf "$SECURITY_DIR"' EXIT
+git -C "$SECURITY_DIR" init -q -b main
+git -C "$SECURITY_DIR" config user.email test@example.invalid
+git -C "$SECURITY_DIR" config user.name Test
+mkdir -p "$SECURITY_DIR/src/Controller" "$SECURITY_DIR/assets" "$SECURITY_DIR/templates"
+printf '{}\n' > "$SECURITY_DIR/composer.json"
+cat > "$SECURITY_DIR/src/Controller/ExampleController.php" <<'EOF'
+<?php
+class ExampleController {
+    #[Route('/old')]
+    public function old() { $this->flush(); }
+    #[Route('/safe', methods: ['POST'])]
+    public function safe() { $this->flush(); }
+}
+EOF
+git -C "$SECURITY_DIR" add -A
+git -C "$SECURITY_DIR" commit -qm basis
+cat >> "$SECURITY_DIR/src/Controller/ExampleController.php" <<'EOF'
+#[Route('/change')]
+public function change() { $this->flush(); }
+#[Route('/public/{token}')]
+#[IsGranted('PUBLIC_ACCESS')]
+public function show(string $token) { return $this->repo->findOneBy(['token' => $token]); }
+EOF
+printf '{{ app.flashes|raw }}\n' > "$SECURITY_DIR/templates/messages.html.twig"
+printf '{%% for message in app.flashes("info") %%}{{ message|raw }}{%% endfor %%}\n' > "$SECURITY_DIR/templates/loop.html.twig"
+printf 'const fragment = button.dataset.content;\ntarget.innerHTML = fragment;\ntarget.innerHTML = safeHtml;\n' > "$SECURITY_DIR/assets/site.js"
+run_script "$SECURITY_DIR" main
+expect 1 "[app-static/S11]" "[app-static/H2]" "[app-static/H11]" "[app-static/H13]"
+expect 1 "old()" "Bestand"
+expect_not 1 "Route safe()" "site.js:3: HTML-Sink mit data-*"
+
+# --- H13: PUBLIC_ACCESS gilt nur fuer den zugehoerigen access_control-Eintrag.
+mkdir -p "$SECURITY_DIR/config/packages"
+cat > "$SECURITY_DIR/config/packages/security.yaml" <<'EOF'
+security:
+    access_control:
+        - path: ^/admin
+          roles: ROLE_ADMIN
+        - path: ^/login
+          roles: PUBLIC_ACCESS
+EOF
+cat > "$SECURITY_DIR/src/Controller/AdminController.php" <<'EOF'
+<?php
+class AdminController {
+    #[Route('/admin/{token}')]
+    public function showToken(string $token) { return $this->repo->findOneBy(['token' => $token]); }
+}
+EOF
+cat > "$SECURITY_DIR/src/Controller/LoginController.php" <<'EOF'
+<?php
+class LoginController {
+    #[Route('/login/{token}')]
+    public function showToken(string $token) { return $this->repo->findOneBy(['token' => $token]); }
+}
+EOF
+run_script "$SECURITY_DIR" main
+expect 1 "LoginController.php:3: öffentliche Token-Route"
+expect_not 1 "AdminController.php:3: öffentliche Token-Route"
+
+# --- kein Projekt: nicht messbar
 run_script "$HERE/fixtures/leer"
 expect 77 "nicht messbar"
 
 # --- Nutzungsfehler: zwei Argumente
-run_script "$HERE/fixtures/gut" "$HERE/fixtures/gut"
+run_script "$HERE/fixtures/gut" "$HERE/fixtures/gut" extra
 expect 2
 
 # --- Nutzungsfehler: Verzeichnis existiert nicht

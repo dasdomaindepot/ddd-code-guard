@@ -176,7 +176,7 @@ GUT2="$(new_project)"
     printf '{}\n' > composer.json
     git add -A
 )
-run_script "$GUT2" "$GUT2"
+run_script "$GUT2" "$GUT2" extra
 expect 2
 rm -rf "$GUT2"
 
@@ -230,6 +230,27 @@ run_script "$DSSTORE"
 expect 0 "DS_Store"
 expect_not 0 "BEFUND"
 rm -rf "$DSSTORE"
+
+SECURITY="$(new_project)"
+(
+    cd "$SECURITY"
+    git init -q -b main
+    git config user.email test@example.invalid
+    git config user.name Test
+    mkdir -p src fixtures
+    printf '<?php\n$user->setPassword("old-example");\n$user->setPassword($value);\n' > src/User.php
+    for n in 1 2 3 4 5 6 7 8 9 10; do printf 'INSERT INTO sample VALUES (%s);\n' "$n"; done > fixtures/sample.sql
+    git add -A
+    git commit -qm basis
+    printf '<?php\n$user->setPassword("old-example");\n$user->setPassword($value);\n$user->setPassword("fixed-example");\n' > src/User.php
+    for n in 1 2 3 4 5 6 7 8 9 10; do printf 'INSERT INTO sample VALUES (%s);\n' "$n"; done > dump.sql
+    git add -A
+)
+run_script "$SECURITY" main
+expect 1 "[secrets/S5]" "[secrets/S6]"
+expect 1 "(Bestand)" "mögliche Produktionsdaten prüfen"
+expect_not 1 "fixtures/sample.sql:"
+rm -rf "$SECURITY"
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"

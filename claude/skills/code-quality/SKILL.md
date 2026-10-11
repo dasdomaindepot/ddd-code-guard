@@ -95,7 +95,9 @@ weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw
 `md5`/`sha1`/`rand` für Sicherheitszwecke, `eval`/`exec`/`shell_exec` und `unserialize`
 ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
 `prefers-reduced-motion`, `tsconfig.json` ohne `strict`. Einzeln fahrbar:
-`bin/check-app-static .`.
+`bin/check-app-static . origin/develop`. S11 meldet neue Controller-Routen ohne
+`methods`, deren Aktion `remove()`, `persist()`, `flush()` oder Mailversand
+aufruft, als Befund. Bestand ist ein Hinweis.
 
 Zusätzliche XSS-Hinweise: H2 meldet `|raw`, `autoescape false`, ungeschützte
 Twig-Ausgaben in `<script>` und `on*`-Attributen sowie PHP-`Markup`. H9 meldet
@@ -103,7 +105,10 @@ rohe Request-Eingaben, besonders Zahl-/Listenparameter; ein begründeter
 `// guard: roh – <grund>`-Kommentar in derselben oder vorherigen Zeile nimmt
 eine Stelle aus. H10 meldet gemappte DTOs ohne `Assert`-Constraints. H11 meldet
 HTML-Sinks in Vue/JS/TS, H12 direkte PHP-Ausgaben und HTML-Strings in Responses.
-Diese Regeln sind Hinweise und ändern den Exit-Code nicht.
+H2 meldet `|raw` auf `app.flashes` in neuen Zeilen als Befund. H11 meldet
+`innerHTML` oder `.html()` mit Werten aus `data-*` in neuen Zeilen als Befund;
+sonstige HTML-Sinks bleiben Hinweise. H13 weist auf öffentliche Token-Routen
+mit Datensatzsuche hin. Bestand ist auch bei H2/H11 nur Hinweis.
 
 **Hausregeln** (`house-rules`, seit 27.09.2026, **blockierend**): Regeln aus der
 Betriebserfahrung, ohne laufende Instanz. R1: Das phpcs-Regelwerk passt nicht zu
@@ -139,7 +144,10 @@ sind `generic-api-key` und ein echter `APP_SECRET` in `.env`/`.env.dist`/`.env.p
 außen vor. Bewusste Ausnahmen trägt das Projekt per Fingerprint in `.gitleaksignore` ein.
 Geheimniswerte werden nie ausgegeben. Versionierte Build-Artefakte (`vendor/`,
 `node_modules/`, `var/cache/`, `var/log/`, `public/build/`) sind je Verzeichnis ein Befund,
-persönlicher IDE-Zustand und `.DS_Store` Hinweise. Einzeln fahrbar: `bin/check-secrets .`.
+persönlicher IDE-Zustand und `.DS_Store` Hinweise. S5 meldet neue feste
+String-Literale in `setPassword()` unter `src/` als Befund, Bestand als Hinweis.
+S6 weist auf versionierte SQL-Dateien mit mindestens zehn `INSERT`s außerhalb
+von Fixtures hin. Einzeln fahrbar: `bin/check-secrets . origin/develop`.
 
 **Drittanbieter** (`third-party`, seit 28.09.2026, verschärft in 1.20.0, **blockierend**):
 Hausstandard ist, dass beim ersten Aufruf einer Seite **keine Anfrage an einen fremden Host**
@@ -203,7 +211,8 @@ EntityManager in einer Migration (bricht, sobald sich die Entity ändert), `DELE
 `UPDATE` ohne `WHERE`, und unter PostgreSQL eine neue `NOT NULL`-Spalte ohne `DEFAULT`
 (MySQL/MariaDB füllen still einen impliziten Wert ein, dort nur Hinweis). Hinweise: DROP
 oder Umbenennung (Expand-Contract), nicht umkehrbares `down()`. Einzeln fahrbar:
-`bin/check-migrations . origin/main`.
+`bin/check-migrations . origin/main`. M6 meldet in neuen Migrationen Token- oder
+Hash-Ableitung aus `md5(id)`, `uniqid()` und Kombinationen davon als Befund.
 
 **Symfony-Selbstprüfung** (`symfony-lint`, seit 27.09.2026, **blockierend**): Fährt
 Symfonys eigene, rein lesende Prüfungen im **laufenden** php-Container (startet nichts,

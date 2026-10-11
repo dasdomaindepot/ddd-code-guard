@@ -6,7 +6,8 @@ Aufgerufen vom Code Guard (Check "app-static"), lässt sich aber auch allein fah
 
 Geprüft werden nur Dateien; es wird nichts gestartet oder aufgerufen.
 
-Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert config/packages/):
+Befunde (führen zu Exit 1); S1–S7 und S10 gelten für Symfony-Projekte
+(config/packages/), S8/S9/S11 auch ohne diesen Ordner:
     S1 Session-Cookie-Konfiguration (ASVS 3.3.1)
     S2 CSRF-Schutz (ASVS 3.5.1)
     S3 Datei-Uploads mit Größen- und Typbegrenzung (ASVS 5.2.1, 5.2.2)
@@ -19,15 +20,16 @@ Befunde (führen zu Exit 1) gibt es nur für Symfony-Projekte (es existiert conf
         kein Lauf als root (außerhalb des Symfony-Blocks, immer geprüft)
       S9 nginx-Config unter docker/ (server_tokens, Upload-Verzeichnisse,
          client_max_body_size) (außerhalb des Symfony-Blocks, immer geprüft)
-     S10 Platzhalter in Übersetzungsdateien (.yaml/.yml): weichen die
+    S10 Platzhalter in Übersetzungsdateien (.yaml/.yml): weichen die
         Platzhalter einer Sprache von der Referenzsprache ab (de/en, sonst
         erste Locale alphabetisch)
+    S11 Zustandsändernde Controller-Route ohne HTTP-Methodenbegrenzung
     
 
 
 Hinweise (kein Einfluss auf den Exit):
     H1 Rohes SQL mit eingesetzter Variable (ASVS 1.2.4)
-    H2 Unsichere Twig-/PHP-Ausgabe (ASVS 1.2.1)
+    H2 Unsichere Twig-/PHP-Ausgabe; Flash mit |raw ist bei neuem Code Befund
     H3 Schwache Kryptografie (ASVS 11.4.1, 11.3.1)
     H4 Gefährliche Funktionen (ASVS 1.2.5, 1.3.2)
     H5 Fokus und Bewegung in CSS (WCAG 2.4.7, 2.3.3)
@@ -38,8 +40,9 @@ Hinweise (kein Einfluss auf den Exit):
          JSON_THROW_ON_ERROR, Typcast auf Request-Eingaben
       H9 Rohe Request-Eingaben (ASVS 1.2.x, 2.2.1)
      H10 DTO ohne Validierung
-     H11 Unsichere HTML-Sinks im Frontend
+     H11 Unsichere HTML-Sinks im Frontend; data-* ist bei neuem Code Befund
      H12 Ungeescapte PHP-Ausgabe und HTML-Responses
+     H13 Öffentliche Token-Route mit Datensatzsuche
  
 
 Exit-Codes:
@@ -55,6 +58,7 @@ import json
 import os
 import re
 import sys
+from diff_lines import added_lines, base_commit
 
 try:
     import yaml
@@ -158,6 +162,18 @@ def php_files_under_src(project_path: str):
 
 def relative(project_path: str, path: str) -> str:
     return os.path.relpath(path, project_path)
+
+
+BASE = None
+
+
+def security_report(project_path: str, rel: str, line: int, message: str) -> None:
+    path = os.path.join(project_path, rel)
+    text = _read_text(path) or ""
+    if line in added_lines(project_path, BASE, rel, text):
+        finding(f"{rel}:{line}: {message}")
+    else:
+        hint(f"{rel}:{line}: {message} (Bestand)")
 
 
 def _split_call(text: str, open_index: int) -> str:
@@ -1149,9 +1165,53 @@ def part_h1_sql(project_path: str) -> None:
         hint(f"… und {total - 10} weitere")
 
 
+# --- S11: Zustandsänderung über GET -------------------------------------
+
+ROUTE_RE = re.compile(r"#\[\s*(?:\\?[\w\\]+\\)?Route\s*\(", re.I)
+METHOD_RE = re.compile(r"\bfunction\s+(\w+)\s*\([^)]*\)\s*(?::\s*[\w\\?|]+\s*)?\{", re.S)
+WRITE_RE = re.compile(r"->\s*(?:remove|persist|flush|send|sendEmail|sendMail)\s*\(", re.I)
+
+
+def part_s11_get_writes(project_path: str) -> None:
+    global RULE
+    RULE = "S11"
+    for path in php_files_under_src(project_path):
+        rel = relative(project_path, path)
+        if "Controller" not in rel.split(os.sep):
+            continue
+        text = _read_text(path) or ""
+        methods = list(METHOD_RE.finditer(text))
+        for route in ROUTE_RE.finditer(text):
+            attrs = _split_call(text, route.end() - 1)
+            if re.search(r"\bmethods\s*:", attrs):
+                continue
+            method = next((m for m in methods if m.start() >= route.end()), None)
+            if not method or method.start() - route.end() > 1000:
+                continue
+            if re.search(r"\bclass\s+\w+", text[route.end():method.start()]):
+                continue
+            body = _split_braces(text, method.end() - 1)
+            if WRITE_RE.search(body):
+                line = text.count("\n", 0, route.start()) + 1
+                security_report(project_path, rel, line,
+                                f"Route {method.group(1)}() ohne methods ändert Zustand — GET/CSRF prüfen")
+
+
+def _split_braces(text: str, start: int) -> str:
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
 # --- H2: |raw in Twig --------------------------------------------------
 
-RAW_RE = re.compile(r"\| ?raw\b")
+RAW_RE = re.compile(r"\|\s*raw\b")
 TWIG_JS_SAFE_RE = re.compile(r"\|\s*(?:json\w*\b|(?:e|escape)\s*\(\s*['\"]js['\"]\s*\))", re.I)
 SCRIPT_BLOCK_RE = re.compile(r"<script\b(?P<attrs>(?:[^>'\"]|'[^']*'|\"[^\"]*\")*)>(?P<body>.*?)</script\s*>", re.I | re.S)
 
@@ -1199,10 +1259,23 @@ def part_h2_raw_twig(project_path: str) -> None:
         if text is None:
             continue
         templ_count += 1
+        rel = relative(project_path, path)
+        flash_vars = set()
         for i, line in enumerate(text.splitlines(), 1):
-            for _ in RAW_RE.finditer(line):
+            flash_vars.update(re.findall(r"{%\s*for\s+(\w+)\s+in\s+app\.flashes\s*\(", line))
+            for raw in RAW_RE.finditer(line):
+                expr = line[max(0, line.rfind("{{", 0, raw.start())):raw.end()]
+                if re.search(r"\bapp\.flashes\b", expr) or any(
+                    re.search(r"{{\s*" + re.escape(var) + r"\s*\|\s*raw", expr)
+                    for var in flash_vars
+                ):
+                    security_report(project_path, rel, i,
+                                    "|raw auf app.flashes — Flash-Inhalt kann HTML einschleusen")
+                    continue
                 total += 1
-                hits.append((relative(project_path, path), i, "|raw"))
+                hits.append((rel, i, "|raw"))
+            if "{% endfor" in line:
+                flash_vars.clear()
     if total > 0:
         hint(
             f"{total}× |raw in {templ_count} Templates — jede Stelle braucht "
@@ -1611,28 +1684,86 @@ def part_h10_dto_validation(project_path: str) -> None:
 
 # --- H11: HTML-Sinks im Frontend ---------------------------------------
 
-FRONTEND_HTML_RE = re.compile(r"\bv-html\s*=|\b(?:innerHTML|outerHTML)\s*=|\binsertAdjacentHTML\s*\(|\bdocument\.write\s*\(|\bdangerouslySetInnerHTML\b")
+FRONTEND_HTML_RE = re.compile(r"\bv-html\s*=|\b(?:innerHTML|outerHTML)\s*=|\binsertAdjacentHTML\s*\(|\bdocument\.write\s*\(|\bdangerouslySetInnerHTML\b|\.html\s*\(")
+DATA_SOURCE_RE = re.compile(r"\b(?:dataset\.\w+|getAttribute\s*\(\s*['\"]data-[^'\"]+['\"]|\.attr\s*\(\s*['\"]data-[^'\"]+['\"]|\.data\s*\()")
 
 
 def part_h11_frontend_html(project_path: str) -> None:
     global RULE
     RULE = "H11"
     paths = _walk_skip(os.path.join(project_path, "assets"), (".js", ".ts", ".jsx", ".tsx", ".vue"))
+    paths += _walk_skip(os.path.join(project_path, "public", "js"), (".js", ".ts"))
     if os.path.isfile(os.path.join(project_path, "package.json")):
         paths += _walk_skip(os.path.join(project_path, "src"), (".js", ".ts", ".jsx", ".tsx", ".vue"))
     else:
         paths += _walk_skip(os.path.join(project_path, "src"), (".vue",))
     hits = []
     for path in sorted(set(paths)):
-        for i, line in enumerate((_read_text(path) or "").splitlines(), 1):
+        if path.endswith((".min.js", ".bundle.js")):
+            continue
+        rel = relative(project_path, path)
+        lines = (_read_text(path) or "").splitlines()
+        sourced = set()
+        for i, line in enumerate(lines, 1):
             if _is_comment_line(line):
                 continue
+            assignment = re.search(r"\b(?:const|let|var)\s+(\w+)\s*=\s*(.+)", line)
+            if assignment and DATA_SOURCE_RE.search(assignment.group(2)):
+                sourced.add(assignment.group(1))
             for m in FRONTEND_HTML_RE.finditer(line):
-                hits.append((relative(project_path, path), i, m.group().split("=")[0].strip()))
+                expr = line[m.end():]
+                if DATA_SOURCE_RE.search(expr) or any(re.search(r"\b" + re.escape(v) + r"\b", expr) for v in sourced):
+                    security_report(project_path, rel, i,
+                                    "HTML-Sink mit data-*-Wert — Eingabe vor Ausgabe bereinigen")
+                else:
+                    hits.append((rel, i, m.group().split("=")[0].strip()))
     for rel, line, kind in hits[:5]:
         hint(f"{rel}:{line}: {kind} — HTML aus Eingaben vor Ausgabe bereinigen")
     if len(hits) > 5:
         hint(f"… und {len(hits) - 5} weitere HTML-Sinks im Frontend")
+
+
+# --- H13: Öffentliche Token-Routen -------------------------------------
+
+def part_h13_public_token(project_path: str) -> None:
+    global RULE
+    RULE = "H13"
+    security = load_top_level_yaml(os.path.join(project_path, "config", "packages", "security.yaml"))
+    security_config = security.get("security") if isinstance(security, dict) else None
+    access_control = security_config.get("access_control", []) if isinstance(security_config, dict) else []
+    public_paths = []
+    if isinstance(access_control, list):
+        for entry in access_control:
+            if not isinstance(entry, dict):
+                continue
+            roles = entry.get("roles")
+            if isinstance(roles, str):
+                roles = [roles]
+            path = entry.get("path")
+            if isinstance(path, str) and isinstance(roles, list) and "PUBLIC_ACCESS" in roles:
+                public_paths.append(path)
+    for path in php_files_under_src(project_path):
+        rel = relative(project_path, path)
+        if "Controller" not in rel.split(os.sep):
+            continue
+        text = _read_text(path) or ""
+        for route in ROUTE_RE.finditer(text):
+            attrs = _split_call(text, route.end() - 1)
+            route_path = re.search(r"['\"]([^'\"]+)['\"]", attrs)
+            public = "PUBLIC_ACCESS" in text[max(0, route.start() - 150):route.start() + len(attrs) + 150]
+            if route_path:
+                public |= any(route_path.group(1).startswith(p.lstrip("^")) for p in public_paths)
+            if not public:
+                continue
+            method = METHOD_RE.search(text, route.end())
+            if not method:
+                continue
+            body = _split_braces(text, method.end() - 1)
+            if re.search(r"\btoken\b", attrs + text[method.start():method.end()], re.I) and re.search(
+                r"\b(?:findOneBy|findBy|find)\s*\(|->\s*getRepository\s*\(", body
+            ):
+                line = text.count("\n", 0, route.start()) + 1
+                hint(f"{rel}:{line}: öffentliche Token-Route lädt Datensatz — Token-Stärke, Ablauf und Zugriff prüfen")
 
 
 # --- H12: PHP-Ausgabe ---------------------------------------------------
@@ -1664,11 +1795,15 @@ def part_h12_php_output(project_path: str) -> None:
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
-    if len(sys.argv) > 2:
-        print("Verwendung: check-app-static [projektverzeichnis]", file=sys.stderr)
+    if len(sys.argv) > 3:
+        print("Verwendung: check-app-static [projektverzeichnis] [basis-ref]", file=sys.stderr)
         return 2
 
     project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    if len(sys.argv) == 3:
+        project_path = os.path.abspath(sys.argv[1])
+    global BASE
+    BASE = base_commit(project_path, sys.argv[2]) if len(sys.argv) == 3 else None
     if not os.path.isdir(project_path):
         print(f"{project_path}: Verzeichnis existiert nicht", file=sys.stderr)
         return 2
@@ -1693,6 +1828,7 @@ def main() -> int:
     part_s8_docker_hardening(project_path)
 
     part_s9_nginx(project_path)
+    part_s11_get_writes(project_path)
 
     part_h1_sql(project_path)
     part_h2_raw_twig(project_path)
@@ -1706,6 +1842,7 @@ def main() -> int:
     part_h10_dto_validation(project_path)
     part_h11_frontend_html(project_path)
     part_h12_php_output(project_path)
+    part_h13_public_token(project_path)
 
     print()
     if findings:

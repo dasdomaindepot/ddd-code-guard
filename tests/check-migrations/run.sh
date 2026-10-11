@@ -406,6 +406,28 @@ commit_base "$d" "Basis"
 run_script
 expect 2
 
+d="$(new_repo)"
+writef "$d" "README.md" "hello\n"
+commit_base "$d" "Basis"
+git -C "$d" checkout -q -b feature
+write_php "$d" "migrations/VersionToken.php" <<'EOF'
+<?php
+final class VersionToken {
+    public function up(): void {
+        $token = md5((string) $id);
+        $safe = bin2hex(random_bytes(32));
+        $this->addSql('UPDATE sample SET token = MD5(id) WHERE id > 0');
+    }
+    public function down(): void { $this->addSql('DROP TABLE sample'); }
+}
+EOF
+run_script "$d" main
+expect 1 "[migrations/M6]" "md5"
+if [ "$(printf '%s' "$OUT" | grep -cF '[migrations/M6]' || true)" -ne 2 ]; then
+    echo "FEHLER: M6 muss PHP- und SQL-Token-Ableitung finden" >&2
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"
     exit 0

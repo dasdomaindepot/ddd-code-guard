@@ -18,7 +18,7 @@
 #
 set -uo pipefail
 
-VERSION="1.21.0"
+VERSION="1.22.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- Optionen ---
@@ -380,9 +380,9 @@ CHECK_DEFS=(
   "versions|Supportende und Updates|dependencies|normal|$SCRIPT_DIR/check-versions .|file:composer.json,bin:python3"
   "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
   "auth-policy|Login und Passwoerter|security|cheap|$SCRIPT_DIR/check-auth-policy .|file:config/packages/security.yaml,bin:python3"
-  "app-static|Statische Regeln|security|cheap|$SCRIPT_DIR/check-app-static .|bin:python3"
+  "app-static|Statische Regeln|security|cheap|$SCRIPT_DIR/check-app-static . \"$BASE_REF\"|bin:python3"
   "house-rules|Hausregeln|config|cheap|$SCRIPT_DIR/check-house-rules .|file:composer.json,bin:python3"
-  "secrets|Geheimnisse im Repo|security|normal|$SCRIPT_DIR/check-secrets .|bin:python3,bin:git"
+  "secrets|Geheimnisse im Repo|security|normal|$SCRIPT_DIR/check-secrets . \"$BASE_REF\"|bin:python3,bin:git"
   "symfony-lint|Symfony-Selbstpruefung|static|normal|$SCRIPT_DIR/check-symfony-lint .|file:bin/console,bin:python3"
   "gate-integrity|Abgeschwaechte Gates|process|cheap|$SCRIPT_DIR/check-gate-integrity . \"$BASE_REF\"|bin:python3,bin:git"
   "error-visibility|Verschluckte Fehler|errors|cheap|$SCRIPT_DIR/check-error-visibility . \"$BASE_REF\"|bin:python3,bin:git"

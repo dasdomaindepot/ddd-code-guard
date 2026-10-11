@@ -46,6 +46,7 @@ import re
 import json
 import subprocess
 import sys
+from diff_lines import added_lines as shared_added_lines, base_commit
 
 EXCLUDED_PREFIXES = ("vendor/", "node_modules/", "var/", "docs/.guard/")
 
@@ -147,22 +148,8 @@ def is_excluded(path: str) -> bool:
 
 def added_from_diff(project: str, base: str, path: str):
     """Zeilennummern (1-gezählt, nachher) der hinzugefügten Zeilen eines Diffs."""
-    out = git_run(project, ["diff", "-U0", base, "--", path])
-    added = []
-    cur = None
-    for line in out.splitlines():
-        if line.startswith("@@"):
-            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-            cur = int(m.group(1)) if m else None
-            continue
-        if cur is None:
-            continue
-        if line.startswith("++") or line.startswith("--"):
-            continue
-        if line.startswith("+"):
-            added.append(cur)
-            cur += 1
-    return added
+    return sorted(shared_added_lines(project, base, path,
+                                     read_file(os.path.join(project, path)) or ""))
 
 
 def changed_files(project: str, base: str):
@@ -579,16 +566,7 @@ def main() -> int:
     # basis-ref auflösen; nicht auflösbar → alles Bestand (base = None).
     base = None
     if basis:
-        verify = subprocess.run(
-            ["git", "rev-parse", "--verify", basis],
-            cwd=project,
-            capture_output=True,
-            text=True,
-        )
-        if verify.returncode == 0:
-            base_out = git_run(project, ["merge-base", basis, "HEAD"]).strip()
-            if base_out:
-                base = base_out
+        base = base_commit(project, basis)
 
     if not os.path.isdir(os.path.join(project, "src")):
         print(f"{project}: kein src/ — nicht messbar", file=sys.stderr)
