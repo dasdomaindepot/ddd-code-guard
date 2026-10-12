@@ -13,6 +13,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../../claude/skills/code-quality/bin/guard-profile-draft"
 FIXTURES="$HERE/fixtures"
+ENV_LOCAL="$FIXTURES/include-liste/.env.local"
+trap 'rm -f "$ENV_LOCAL"' EXIT
 
 pass=0
 fail=0
@@ -107,6 +109,9 @@ fi
 
 echo
 # --- include mit project + file-Liste, DATABASE_URL leer in .env und gesetzt in .env.local
+# Eine versionierte .env.local löst check-secrets (S1) aus, daher zur Laufzeit
+# mit dem gleichen Inhalt anlegen und per trap (oben) am Ende wieder löschen.
+printf 'DATABASE_URL="postgresql://app:pw@db:5432/app"\n' > "$ENV_LOCAL"
 INC="$(python3 "$SCRIPT" "$FIXTURES/include-liste")"
 contains "$INC" "deployment: symfony-docker" "include-liste: deployment aus file-Liste"
 contains "$INC" "datenbank: postgresql" "include-liste: .env.local überschreibt leeres DATABASE_URL"
