@@ -41,10 +41,31 @@ OUT=""
 
 cat > "$WORK/code-guard-stub" <<'STUB'
 #!/usr/bin/env bash
+if [ -n "${STUB_LOG:-}" ]; then
+    printf 'code-guard-stub: %s\n' "$*" >> "$STUB_LOG"
+fi
 project=""
+security=0
 while [ $# -gt 0 ]; do
-    case "$1" in --project) project="$2"; shift 2 ;; *) shift ;; esac
+    case "$1" in
+        --project) project="$2"; shift 2 ;;
+        --security-audit) security=1; shift ;;
+        *) shift ;;
+    esac
 done
+if [ "$security" -eq 1 ]; then
+    mkdir -p "$project/docs/security"
+    if [ -n "${STUB_FINDINGS_FILE:-}" ] && [ -f "${STUB_FINDINGS_FILE:-}" ]; then
+        cp "$STUB_FINDINGS_FILE" "$project/docs/security/findings.jsonl"
+    fi
+    printf 'findings.jsonl\n' > "$project/docs/security/.gitignore"
+    {
+        echo "# Qualitaets-Report — Sicherheits-Audit"
+        echo
+        echo "**Verdikt:** RED"
+    } > "$project/docs/security/audit-report.md"
+    exit "${STUB_SECURITY_EXIT:-0}"
+fi
 mkdir -p "$project/docs/.guard/logs"
 printf 'Zeile 1\nPHPStan: 3 Fehler <b>kaputt</b>\n' > "$project/docs/.guard/logs/phpstan.log"
 cat > "$project/docs/.guard/results.json" <<'JSON'
@@ -63,13 +84,41 @@ STUB
 chmod +x "$WORK/code-guard-stub"
 export GUARD_WEEKLY_CODE_GUARD="$WORK/code-guard-stub"
 
+# Dummy-Agenten: im Sicherheits-Turnus genuegt die PATH-Pruefung, im Gate-Turnus
+# muss codex einen Report hinterlassen.
+mkdir -p "$WORK/bin"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/opencode"
+cat > "$WORK/bin/codex" <<'DUMMY'
+#!/bin/sh
+dir=""
+while [ $# -gt 0 ]; do
+    case "$1" in --cd) dir="$2"; shift 2 ;; *) shift ;; esac
+done
+[ -n "$dir" ] || exit 0
+mkdir -p "$dir/docs"
+{
+    echo "# Qualitaets-Report — via codex"
+    echo
+    echo "Report via codex"
+} > "$dir/docs/quality-report.md"
+exit 0
+DUMMY
+chmod +x "$WORK/bin/opencode" "$WORK/bin/codex"
+export PATH="$WORK/bin:$PATH"
+
 cat > "$WORK/vikunja-stub.py" <<'PY'
-import json, sys, urllib.parse
+import json, os, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 log_path, port_path = sys.argv[1], sys.argv[2]
 tasks = []
 seed_path = sys.argv[3] if len(sys.argv) > 3 else ""
 def load_seed():
+    reset = log_path.rsplit("/", 1)[0] + "/vikunja.reset"
+    try:
+        os.remove(reset)
+        tasks.clear()   # Fall verlangt leeren Zustand
+    except FileNotFoundError:
+        pass
     if seed_path:
         try:
             lines = [l for l in open(seed_path) if l.strip()]
@@ -277,6 +326,64 @@ expect "Exit 15" '[ "$RC" -eq 15 ]'
 echo "i) ungültige Projekt-ID -> Exit 2"
 R="$(new_repo)"
 run_weekly "$R" --vikunja-project abc
+expect "Exit 2" '[ "$RC" -eq 2 ]'
+
+echo "l) Sicherheits-Turnus mit Vikunja: Fund wird Task, verworfene Fingerabdrücke nicht"
+R="$(new_repo)"
+: > "$WORK/vikunja.log"
+touch "$WORK/vikunja.reset"
+: > "$WORK/guard-stub.log"
+FP_OFF="sha256:0000000000000000000000000000000000000000000000000000000000000001"
+FP_DIS="sha256:0000000000000000000000000000000000000000000000000000000000000002"
+printf '%s\n%s\n' \
+    "{\"fingerabdruck\":\"$FP_OFF\",\"status\":\"offen\",\"severity\":\"HIGH\",\"datei\":\"app.py\",\"zeile\":9,\"beschreibung\":\"Offener Fund\"}" \
+    "{\"fingerabdruck\":\"$FP_DIS\",\"status\":\"verworfen\",\"datei\":\"lib.py\",\"zeile\":3,\"beschreibung\":\"Verworfener Fund\"}" \
+    > "$WORK/sec.jsonl"
+export VIKUNJA_BASE_URL="$VIKUNJA_URL" VIKUNJA_API_TOKEN=testtoken
+STUB_FINDINGS_FILE="$WORK/sec.jsonl" STUB_LOG="$WORK/guard-stub.log" \
+    run_weekly "$R" --agent opencode --security-audit --vikunja-project 81
+expect "Exit 0" '[ "$RC" -eq 0 ]'
+expect "1 Task angelegt" 'grep -q "1 Tasks angelegt, 0 kommentiert, 0 geschlossen" <<<"$OUT"'
+expect "Task trägt Fingerabdruck" 'grep -qF "\"title\": \"[Guard] clone: Sicherheitsfund ($FP_OFF)\"" "$WORK/vikunja.log"'
+expect "verworfener Fund kein Task" '! grep -q "$FP_DIS" "$WORK/vikunja.log"'
+expect "Agent übergeben, nie --deep" 'grep -q -- "--agent opencode" "$WORK/guard-stub.log" && ! grep -q -- "--deep" "$WORK/guard-stub.log"'
+expect "Sicherheitsreport als offen committed" 'git -C "$R" show develop:docs/security/audit-report.md | grep -q "guard_status: open"'
+expect "Worktree sauber" 'clean "$R"'
+STUB_FINDINGS_FILE="$WORK/sec.jsonl" STUB_LOG="$WORK/guard-stub.log" \
+    run_weekly "$R" --agent opencode --security-audit --vikunja-project 81
+expect "offener Report blockiert" '[ "$RC" -eq 11 ]'
+expect "Monatsgrenze gemeldet" 'grep -q "Kalendermonat" <<<"$OUT"'
+run_weekly "$R" --agent opencode --security-audit --acknowledge
+expect "Abhaken Exit 0" '[ "$RC" -eq 0 ]'
+STUB_FINDINGS_FILE="$WORK/sec.jsonl" STUB_LOG="$WORK/guard-stub.log" \
+    run_weekly "$R" --agent opencode --security-audit --vikunja-project 81 --force
+expect "zweiter Lauf kommentiert" 'grep -q "0 Tasks angelegt, 1 kommentiert" <<<"$OUT"'
+expect "Kommentar an Task 100" 'grep -q "^PUT /tasks/100/comments" "$WORK/vikunja.log"'
+printf '%s\n%s\n' \
+    "{\"fingerabdruck\":\"$FP_OFF\",\"status\":\"erledigt\",\"datei\":\"app.py\",\"zeile\":9,\"beschreibung\":\"Behoben\"}" \
+    "{\"fingerabdruck\":\"$FP_DIS\",\"status\":\"verworfen\",\"datei\":\"lib.py\",\"zeile\":3,\"beschreibung\":\"Verworfen\"}" \
+    > "$WORK/sec.jsonl"
+run_weekly "$R" --agent opencode --security-audit --acknowledge
+STUB_FINDINGS_FILE="$WORK/sec.jsonl" STUB_LOG="$WORK/guard-stub.log" \
+    run_weekly "$R" --agent opencode --security-audit --vikunja-project 81 --force
+expect "behobener Fund geschlossen" 'grep -q "0 Tasks angelegt, 0 kommentiert, 1 geschlossen" <<<"$OUT"'
+expect "done gesetzt" 'grep -q "^POST /tasks/100 .*\"done\":true" "$WORK/vikunja.log"'
+printf '%s\n' "{\"fingerabdruck\":\"$FP_OFF\",\"status\":\"offen\",\"severity\":\"HIGH\",\"datei\":\"app.py\",\"zeile\":9,\"beschreibung\":\"Wieder gemeldet\"}" > "$WORK/sec.jsonl"
+STUB_FINDINGS_FILE="$WORK/sec.jsonl" run_weekly "$R" --agent opencode --security-audit --vikunja-project 81 --force
+expect "bekannter Fingerabdruck ohne neuen Task" 'grep -q "0 Tasks angelegt, 0 kommentiert, 0 geschlossen" <<<"$OUT"'
+unset VIKUNJA_BASE_URL VIKUNJA_API_TOKEN
+
+echo "m) codex als Report-Agent im Gate-Turnus"
+R="$(new_repo)"
+run_weekly "$R" --agent codex
+expect "Exit 0" '[ "$RC" -eq 0 ]'
+expect "Uebergebe an codex" 'grep -q "Uebergebe an codex" <<<"$OUT"'
+expect "Report via codex" 'git -C "$R" show develop:docs/quality-report.md | grep -q "Report via codex"'
+expect "Committed auf develop" 'grep -q "Committed auf develop" <<<"$OUT"'
+
+echo "n) Sicherheits-Turnus ohne Agent -> Exit 2"
+R="$(new_repo)"
+run_weekly "$R" --security-audit --agent none
 expect "Exit 2" '[ "$RC" -eq 2 ]'
 
 if [ "$fail" -eq 0 ]; then

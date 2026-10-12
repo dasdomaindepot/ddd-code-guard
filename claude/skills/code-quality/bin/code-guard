@@ -19,7 +19,7 @@
 #
 set -uo pipefail
 
-VERSION="1.24.0"
+VERSION="1.25.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Der Tiefenscan hat einen eigenen, rein statischen Ablauf und verwendet keine

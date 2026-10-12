@@ -6,6 +6,13 @@
 # Woche je Projekt pruefen, den Report nach docs/quality-report.md schreiben und
 # ihn auf dem Entwicklungsbranch committen.
 #
+# Im Sicherheits-Turnus (--security-audit) misst der Lauf stattdessen den
+# statischen Sicherheits-Tiefenscan in Ornith-Modus — einmal je Kalendermonat
+# und Projekt. Der größere
+# --deep-Scan bleibt ein manueller Lauf und kommt nie hierher. Funde werden
+# wie die Gates-Befunde zu Vikunja-Todos: ein bekannter oder verworfener
+# Fingerabdruck bekommt keinen neuen Task.
+#
 # Die Arbeitsteilung ist Absicht. Alles Riskante — Branch wechseln, Container
 # starten, committen — macht dieses Script, deterministisch und nachlesbar. Das
 # Sprachmodell bekommt genau eine Aufgabe: aus dem gemessenen Ergebnis den
@@ -29,14 +36,14 @@
 #   10  uebersprungen: Worktree nicht sauber
 #   11  uebersprungen: Report noch offen
 #   12  abgebrochen: Zielbranch und Hauptbranch sind auseinandergelaufen
-#   13  abgebrochen: Umgebung liess sich nicht starten
-#   14  abgebrochen: der Agent hat keinen Report geschrieben
+#   13  abgebrochen: Messung fehlgeschlagen (Umgebung, Timeout, Audit)
+#   14  abgebrochen: der Agent fehlt oder hat keinen Report geschrieben
 #   15  abgebrochen: nach dem Lauf lagen fremde Aenderungen im Worktree
 #   16  Todo-Modus: Vikunja nicht erreichbar oder ohne Zugangsdaten
 
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_GUARD="${GUARD_WEEKLY_CODE_GUARD:-$SCRIPT_DIR/code-guard}"
 
@@ -66,14 +73,17 @@ GUARD_TIMEOUT_SET=0
 # Todo-Modus (--vikunja-project): Befunde werden Vikunja-Tasks statt eines
 # committeten Reports.
 VIKUNJA_PROJECT=""
+# Sicherheits-Turnus (--security-audit): statt der Gates misst der Lauf den
+# statischen Sicherheits-Tiefenscan in Ornith-Modus. Nie mit --deep.
+SECURITY_AUDIT=0
 
 # Dateien, die dauerhaft vom committeten Stand abweichen duerfen, ohne dass der
 # Worktree als "in Arbeit" gilt. Auf jedem Rechner steht eine eigene .env --
 # ohne diese Liste braeche der Turnus auf einem zweiten Rechner in jedem
 # einzelnen Projekt sofort ab.
 #
-# Sicher ist das, weil der Turnus ausschliesslich docs/quality-report.md zum
-# Commit vormerkt: eine ignorierte Datei kann gar nicht mitcommittet werden.
+# Sicher ist das, weil der Turnus nur den jeweiligen Report und beim
+# Sicherheitslauf ggf. dessen .gitignore zum Commit vormerkt.
 # Und einen Branchwechsel, der eine solche Aenderung ueberschreiben wuerde,
 # verweigert git von sich aus.
 IGNORE_DIRTY=(".env" ".env.local" ".env.*.local" "*.bak" "*.bak-*" "*.bak.*")
@@ -84,19 +94,21 @@ guard-weekly — wiederkehrender Qualitaets-Turnus fuer ein Projekt
 
 Verwendung: guard-weekly --project DIR [OPTIONEN]
 
-  --project DIR     Projektverzeichnis (Vorgabe: aktuelles Verzeichnis)
-  --branch NAME     Zielbranch fuer den Report (Vorgabe: develop)
-  --agent NAME      opencode | claude | none (Vorgabe: opencode)
-                    'none' misst nur und schreibt einen Report ohne Modell
-  --acknowledge     Report als abgearbeitet markieren und das committen
-  --status          nur zeigen, was ein Lauf jetzt tun wuerde
-  --force           auch laufen, wenn der Report noch offen ist
-  --no-commit       messen und Report schreiben, aber nicht committen
-  --no-push         committen, aber nicht pushen
-  --ignore-dirty P  Pfadmuster, das den Worktree nicht als schmutzig gelten
-                    laesst (mehrfach; zusaetzlich zu .env und *.bak*)
-  --full            Komplett-Lauf: auch Coverage, Mutation-Testing, E2E,
-                    Asset-Build und Browser-Audit
+   --project DIR     Projektverzeichnis (Vorgabe: aktuelles Verzeichnis)
+   --branch NAME     Zielbranch fuer den Report (Vorgabe: develop)
+   --agent NAME      opencode | claude | codex | none (Vorgabe: opencode)
+                     'none' misst nur und schreibt einen Report ohne Modell
+   --security-audit  Monatlicher Sicherheits-Turnus statt der Gates
+                     (Ornith-Modus, nie --deep). Ein Agent ist erforderlich.
+   --acknowledge     Report als abgearbeitet markieren und das committen
+   --status          nur zeigen, was ein Lauf jetzt tun wuerde
+   --force           auch laufen, wenn der Report noch offen ist
+   --no-commit       messen und Report schreiben, aber nicht committen
+   --no-push         committen, aber nicht pushen
+   --ignore-dirty P  Pfadmuster, das den Worktree nicht als schmutzig gelten
+                     laesst (mehrfach; zusaetzlich zu .env und *.bak*)
+   --full            Komplett-Lauf: auch Coverage, Mutation-Testing, E2E,
+                     Asset-Build und Browser-Audit (nicht mit --security-audit)
   --expensive-timeout N
                     Sekunden je teurem Check im Komplett-Lauf
                     (Vorgabe: 14400 = 4 h; 0 = unbegrenzt)
@@ -117,6 +129,7 @@ while [ $# -gt 0 ]; do
         --project)       PROJECT_DIR="${2:-}"; shift 2 ;;
         --branch)        TARGET_BRANCH="${2:-develop}"; shift 2 ;;
         --agent)         AGENT="${2:-opencode}"; shift 2 ;;
+        --security-audit) SECURITY_AUDIT=1; shift ;;
         --acknowledge)   DO_ACKNOWLEDGE=1; shift ;;
         --status)        DO_STATUS=1; shift ;;
         --force)         FORCE=1; shift ;;
@@ -138,13 +151,30 @@ if [ -n "$VIKUNJA_PROJECT" ]; then
     case "$VIKUNJA_PROJECT" in
         *[!0-9]*) echo "--vikunja-project erwartet eine Projekt-ID: $VIKUNJA_PROJECT" >&2; exit 2 ;;
     esac
-    NO_COMMIT=1
+    # Im Todo-Modus wird der Report verworfen — also nicht committen. Im
+    # Sicherheits-Turnus bleibt der Report committet; dort steuert der
+    # Zustand, ob neu gemessen wird.
+    [ "$SECURITY_AUDIT" -eq 1 ] || NO_COMMIT=1
+fi
+
+if [ "$SECURITY_AUDIT" -eq 1 ]; then
+    if [ "$FULL" -eq 1 ]; then
+        echo "--full und --security-audit lassen sich nicht kombinieren." >&2
+        exit 2
+    fi
+    if [ "$AGENT" = "none" ]; then
+        echo "Der Sicherheits-Turnus braucht einen Agenten (opencode, claude oder codex)." >&2
+        exit 2
+    fi
 fi
 
 cd "$PROJECT_DIR" 2>/dev/null || { echo "Verzeichnis nicht gefunden: $PROJECT_DIR" >&2; exit 2; }
 PROJECT_DIR="$PWD"
 PROJECT_NAME="$(basename "$PROJECT_DIR")"
 REPORT="docs/quality-report.md"
+if [ "$SECURITY_AUDIT" -eq 1 ]; then
+    REPORT="docs/security/audit-report.md"
+fi
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "Kein Git-Repository: $PROJECT_DIR" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "guard-weekly braucht jq." >&2; exit 2; }
@@ -280,20 +310,34 @@ if [ "$DO_STATUS" -eq 1 ]; then
     echo "Projekt:      $PROJECT_NAME ($PROJECT_DIR)"
     echo "Branch:       $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     echo "Zielbranch:   $TARGET_BRANCH"
+    if [ "$SECURITY_AUDIT" -eq 1 ]; then
+        echo "Prüfung:      Sicherheits-Tiefenscan im Turnus (Agent: $AGENT, nie --deep)"
+    else
+        echo "Prüfung:      code-guard-Gates$([ "$FULL" -eq 1 ] && echo ' (Komplett-Lauf)')"
+    fi
     [ -z "$VIKUNJA_PROJECT" ] \
-        || echo "Todo-Modus:   Befunde werden Tasks in Vikunja-Projekt $VIKUNJA_PROJECT, kein Commit"
+        || echo "Todo-Modus:   Befunde werden Tasks in Vikunja-Projekt $VIKUNJA_PROJECT$([ "$SECURITY_AUDIT" -eq 1 ] || echo ', kein Commit')"
     # Massgeblich ist der Report auf dem Zielbranch. Liegt der Branch nur
     # entfernt vor, wird dieser gelesen.
     ref="$TARGET_BRANCH"
     git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH" || ref="origin/$TARGET_BRANCH"
     if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
         branch_status="$(branch_report_status "$ref")"
-        case "$branch_status" in
-            absent)       echo "Report:       fehlt auf $ref — ein Lauf wuerde pruefen und ihn anlegen" ;;
-            acknowledged) echo "Report:       abgehakt am $(branch_report_value "$ref" acknowledged_at) — ein Lauf wuerde neu pruefen" ;;
-            open)         echo "Report:       OFFEN seit $(branch_report_value "$ref" generated_at) — ein Lauf wuerde ihn in Ruhe lassen" ;;
-            unmarked)     echo "Report:       auf $ref vorhanden, aber ohne Guard-Frontmatter — ein Lauf wuerde neu pruefen" ;;
-        esac
+        if [ "$SECURITY_AUDIT" -eq 1 ]; then
+            last_month="$(branch_report_value "$ref" generated_at | cut -c1-7)"
+            if [ "$last_month" = "$(date +%Y-%m)" ]; then
+                echo "Report:       Sicherheitsprüfung in diesem Kalendermonat bereits gelaufen"
+            else
+                echo "Report:       Sicherheitsprüfung für diesen Kalendermonat fällig"
+            fi
+        else
+            case "$branch_status" in
+                absent)       echo "Report:       fehlt auf $ref — ein Lauf wuerde pruefen und ihn anlegen" ;;
+                acknowledged) echo "Report:       abgehakt am $(branch_report_value "$ref" acknowledged_at) — ein Lauf wuerde neu pruefen" ;;
+                open)         echo "Report:       OFFEN seit $(branch_report_value "$ref" generated_at) — ein Lauf wuerde ihn in Ruhe lassen" ;;
+                unmarked)     echo "Report:       auf $ref vorhanden, aber ohne Guard-Frontmatter — ein Lauf wuerde neu pruefen" ;;
+            esac
+        fi
     else
         echo "Report:       $TARGET_BRANCH gibt es noch nicht — ein Lauf wuerde ihn anlegen"
     fi
@@ -379,11 +423,13 @@ restore_tolerated() {
     PRESERVE_DIR=""
 }
 
-# Committet ausschliesslich den Report -- und nur, wenn wirklich nichts anderes
-# im Baum liegt. `git add` bekommt genau diesen einen Pfad, geduldete Dateien
-# wie .env koennen also gar nicht mitwandern.
+# Committet den Report und ggf. die Sicherheits-.gitignore, aber nur, wenn
+# sonst nichts im Baum liegt. Geduldete Dateien wie .env wandern nicht mit.
 commit_report() {
     local message="$1"
+    # Im Sicherheits-Turnus darf neben dem Report die neue .gitignore liegen,
+    # die der Audit anlegt, damit findings.jsonl lokal bleibt.
+    local extra="${COMMIT_EXTRA:-}"
 
     if [ "$NO_COMMIT" -eq 1 ]; then
         log "--no-commit: der Report bleibt uncommitted liegen."
@@ -391,19 +437,27 @@ commit_report() {
     fi
 
     local unexpected
-    unexpected="$(dirty_paths | grep -v "^${REPORT}$" | grep -v '^$' || true)"
+    unexpected="$(dirty_paths | while IFS= read -r path; do
+        [ "$path" = "$REPORT" ] && continue
+        [ -n "$extra" ] && [ "$path" = "$extra" ] && continue
+        printf '%s\n' "$path"
+    done)"
     if [ -n "$unexpected" ]; then
         fail "Ausser dem Report haben sich weitere Dateien geaendert — es wird nichts committed:"
         printf '%s\n' "$unexpected" | sed 's/^/    /' >&2
         return 15
     fi
 
-    if ! dirty_paths --ignored-too | grep -qx -- "$REPORT"; then
+    if ! dirty_paths --ignored-too | grep -qxF -- "$REPORT" \
+        && { [ -z "$extra" ] || ! dirty_paths --ignored-too | grep -qxF -- "$extra"; }; then
         log "Der Report ist unveraendert — nichts zu committen."
         return 0
     fi
 
     git add -- "$REPORT" || { fail "git add fehlgeschlagen."; return 15; }
+    if [ -n "$extra" ] && [ -e "$extra" ]; then
+        git add -- "$extra" || { fail "git add fehlgeschlagen."; return 15; }
+    fi
     git commit --quiet -m "$message" || { fail "git commit fehlgeschlagen."; return 15; }
     log "Committed auf $TARGET_BRANCH: $(git rev-parse --short HEAD)"
 
@@ -522,7 +576,15 @@ if [ "$DO_ACKNOWLEDGE" -eq 1 ]; then
 fi
 
 # Im Todo-Modus wird der Report nie committet, sein Zustand steuert also nichts.
-if [ "$STATUS" = "open" ] && [ "$FORCE" -eq 0 ] && [ -z "$VIKUNJA_PROJECT" ]; then
+# Der Sicherheits-Turnus hat einen eigenen Report und eigenen Kalendermonat.
+if [ "$SECURITY_AUDIT" -eq 1 ] && [ "$FORCE" -eq 0 ] \
+    && [ "$(frontmatter_value generated_at 2>/dev/null | cut -c1-7)" = "$(date +%Y-%m)" ]; then
+    fail "Die Sicherheitsprüfung für diesen Kalendermonat ist bereits gelaufen."
+    echo "    Trotzdem messen: --force" >&2
+    exit 11
+fi
+if [ "$STATUS" = "open" ] && [ "$FORCE" -eq 0 ] \
+    && [ "$SECURITY_AUDIT" -eq 0 ] && [ -z "$VIKUNJA_PROJECT" ]; then
     since="$(frontmatter_value generated_at)"
     fail "Der Report auf $TARGET_BRANCH ist seit ${since:-unbekannt} offen und noch nicht abgehakt."
     echo "    Abhaken mit: guard-weekly --acknowledge --project $PROJECT_DIR" >&2
@@ -532,63 +594,138 @@ fi
 
 # ------------------------------------------------------------------- Messung --
 
-GUARD_ARGS=(--project "$PROJECT_DIR" --boot --boot-timeout "$BOOT_TIMEOUT" --no-color)
-if [ "$FULL" -eq 1 ]; then
-    GUARD_ARGS+=(--full --expensive-timeout "$EXPENSIVE_TIMEOUT")
-    # Ohne ausdrueckliche Vorgabe keine Gesamtgrenze: die Grenze je teurem
-    # Check reicht. timeout 0 bedeutet bei coreutils "unbegrenzt".
-    [ "$GUARD_TIMEOUT_SET" -eq 1 ] || GUARD_TIMEOUT=0
-    if [ "$EXPENSIVE_TIMEOUT" = 0 ]; then grenze="unbegrenzt"; else grenze="max. ${EXPENSIVE_TIMEOUT}s"; fi
-    log "Fahre code-guard (Komplett-Lauf, mit --boot; je teurem Check $grenze) …"
-else
-    log "Fahre code-guard (mit --boot) …"
-fi
-timeout "$GUARD_TIMEOUT" "$CODE_GUARD" "${GUARD_ARGS[@]}"
-GUARD_EXIT=$?
-
 SIDE_EFFECT_FILES=""
-case "$GUARD_EXIT" in
-    0|1)  log "code-guard fertig (Exit $GUARD_EXIT)." ;;
-    3)    if [ -n "$VIKUNJA_PROJECT" ]; then
-              # Im Todo-Modus wird nichts committet. Der Seiteneffekt wird selbst
-              # ein Todo, und die veraenderten getrackten Dateien gehen zurueck
-              # auf den committeten Stand -- sonst bliebe jeder weitere Lauf an
-              # der Dirty-Sperre haengen, ohne dass es jemand merkt. Der
-              # Worktree war vor dem Lauf sauber, alles jetzt Abweichende
-              # stammt also aus dem Lauf. Neue, ungetrackte Dateien bleiben
-              # liegen: loeschen ist hier nicht Sache des Turnus.
-              SIDE_EFFECT_FILES="$(dirty_paths | grep -vx -- "$REPORT" || true)"
-              log "code-guard meldet UNSAFE SIDE EFFECT — Todo-Modus: wird ein Todo, getrackte Dateien werden zurueckgesetzt."
-              while IFS= read -r se_path; do
-                  [ -n "$se_path" ] || continue
-                  if git ls-files --error-unmatch -- "$se_path" >/dev/null 2>&1; then
-                      git checkout --quiet -- "$se_path" && log "Zurueckgesetzt: $se_path"
-                  else
-                      log "Bleibt liegen (ungetrackt): $se_path"
-                  fi
-              done <<<"$SIDE_EFFECT_FILES"
-          else
-              fail "code-guard meldet UNSAFE SIDE EFFECT — der Lauf hat den Worktree veraendert. Nichts wird committed."
-              exit 15
-          fi ;;
-    4)    fail "Die Umgebung liess sich nicht starten."
-          exit 13 ;;
-    124)  fail "code-guard lief in den Timeout (${GUARD_TIMEOUT}s)."
-          exit 13 ;;
-    *)    fail "code-guard endete unerwartet mit Exit $GUARD_EXIT."
-          exit 13 ;;
-esac
+if [ "$SECURITY_AUDIT" -eq 1 ]; then
+    # Der Tiefenscan ist statisch: kein Docker, kein --boot. Und er ist nie
+    # der --deep-Scan: die Variante ist ein manueller Lauf und kostet ein
+    # Vielfaches. Ein Agent ist erforderlich, Ornith-Modus per Vorgabe.
+    if ! command -v "$AGENT" >/dev/null 2>&1; then
+        fail "Der Agent \"$AGENT\" ist nicht im PATH ($PATH)."
+        echo "    Im Cron fehlt oft /snap/bin — dort im Crontab eine PATH-Zeile setzen." >&2
+        exit 14
+    fi
+    log "Fahre die Sicherheits-Tiefenprüfung (Agent: $AGENT) …"
+    # Vorherige Fingerabdrücke sind lokal gespeichert und bestimmen, ob der
+    # Todo-Weg einen Fund erstmals sieht.
+    FINDINGS_FILE="docs/security/findings.jsonl"
+    KNOWN_FINGERPRINTS="$(jq -r '.fingerabdruck // empty' "$FINDINGS_FILE" 2>/dev/null || true)"
+    timeout "$GUARD_TIMEOUT" "$CODE_GUARD" \
+        --security-audit --weekly-report --project "$PROJECT_DIR" --agent "$AGENT"
+    GUARD_EXIT=$?
+    case "$GUARD_EXIT" in
+        0)   log "Sicherheits-Tiefenprüfung fertig (Exit $GUARD_EXIT)." ;;
+        2)   fail "Die Sicherheits-Tiefenprüfung wurde abgebrochen."
+             exit 13 ;;
+        3)   if [ -n "$VIKUNJA_PROJECT" ]; then
+                  # Im Todo-Modus wird nichts committet. Der Seiteneffekt wird
+                  # später selbst ein Todo; die getrackten Dateien gehen auf
+                  # den committeten Stand zurück — sonst bliebe jeder weitere
+                  # Lauf an der Dirty-Sperre hängen, ohne dass es jemand merkt.
+                  SIDE_EFFECT_FILES="$(dirty_paths | grep -vx -- "$REPORT" || true)"
+                  log "Sicherheits-Tiefenprüfung meldet UNSAFE SIDE EFFECT — Todo-Modus: wird ein Todo, getrackte Dateien werden zurückgesetzt."
+                  while IFS= read -r se_path; do
+                      [ -n "$se_path" ] || continue
+                      if git ls-files --error-unmatch -- "$se_path" >/dev/null 2>&1; then
+                          git checkout --quiet -- "$se_path" && log "Zurückgesetzt: $se_path"
+                      else
+                          log "Bleibt liegen (ungetrackt): $se_path"
+                      fi
+                  done <<<"$SIDE_EFFECT_FILES"
+              else
+                  fail "Sicherheits-Tiefenprüfung meldet UNSAFE SIDE EFFECT — der Lauf hat den Worktree verändert. Nichts wird committed."
+                  exit 15
+              fi ;;
+        124) fail "Die Sicherheits-Tiefenprüfung lief in den Timeout (${GUARD_TIMEOUT}s)."
+             exit 13 ;;
+        *)   fail "Die Sicherheits-Tiefenprüfung endete unerwartet mit Exit $GUARD_EXIT."
+             exit 13 ;;
+    esac
+    if [ ! -f "$FINDINGS_FILE" ]; then
+        fail "Es liegt keine $FINDINGS_FILE vor — der Lauf hat nichts hinterlassen."
+        exit 13
+    fi
+    # Beim Zurückwechseln auf den Ausgangsbranch kann die neue .gitignore
+    # verschwinden. Der lokale Fundspeicher muss dort trotzdem verborgen sein.
+    local_exclude="$(git rev-parse --git-path info/exclude)"
+    mkdir -p "$(dirname "$local_exclude")"
+    if ! grep -qxF '/docs/security/findings.jsonl' "$local_exclude" 2>/dev/null; then
+        printf '\n/docs/security/findings.jsonl\n' >> "$local_exclude"
+    fi
+    # Der Audit legt ggf. docs/security/.gitignore neu an, damit findings.jsonl
+    # lokal bleibt. Das ist eine erwartete Folge des Laufs und darf bei der
+    # Commit-Pruefung nicht als Fremdbefund durchgehen.
+    COMMIT_EXTRA="docs/security/.gitignore"
+    # Der Verdikt wird wie im Audit gezählt: offene Funde entscheiden.
+    if jq -e 'select(.status == "offen" and (.severity == "BLOCKER" or .severity == "HIGH"))' \
+            "$FINDINGS_FILE" >/dev/null 2>&1; then
+        VERDICT="RED"
+    elif jq -e 'select(.status == "offen")' "$FINDINGS_FILE" >/dev/null 2>&1; then
+        VERDICT="YELLOW"
+    else
+        VERDICT="GREEN"
+    fi
+    log "Verdikt: $VERDICT"
+else
+    GUARD_ARGS=(--project "$PROJECT_DIR" --boot --boot-timeout "$BOOT_TIMEOUT" --no-color)
+    if [ "$FULL" -eq 1 ]; then
+        GUARD_ARGS+=(--full --expensive-timeout "$EXPENSIVE_TIMEOUT")
+        # Ohne ausdrueckliche Vorgabe keine Gesamtgrenze: die Grenze je teurem
+        # Check reicht. timeout 0 bedeutet bei coreutils "unbegrenzt".
+        [ "$GUARD_TIMEOUT_SET" -eq 1 ] || GUARD_TIMEOUT=0
+        if [ "$EXPENSIVE_TIMEOUT" = 0 ]; then grenze="unbegrenzt"; else grenze="max. ${EXPENSIVE_TIMEOUT}s"; fi
+        log "Fahre code-guard (Komplett-Lauf, mit --boot; je teurem Check $grenze) …"
+    else
+        log "Fahre code-guard (mit --boot) …"
+    fi
+    timeout "$GUARD_TIMEOUT" "$CODE_GUARD" "${GUARD_ARGS[@]}"
+    GUARD_EXIT=$?
+    case "$GUARD_EXIT" in
+        0|1)  log "code-guard fertig (Exit $GUARD_EXIT)." ;;
+        3)    if [ -n "$VIKUNJA_PROJECT" ]; then
+                  # Im Todo-Modus wird nichts committet. Der Seiteneffekt wird selbst
+                  # ein Todo, und die veraenderten getrackten Dateien gehen zurueck
+                  # auf den committeten Stand -- sonst bliebe jeder weitere Lauf an
+                  # der Dirty-Sperre haengen, ohne dass es jemand merkt. Der
+                  # Worktree war vor dem Lauf sauber, alles jetzt Abweichende
+                  # stammt also aus dem Lauf. Neue, ungetrackte Dateien bleiben
+                  # liegen: loeschen ist hier nicht Sache des Turnus.
+                  SIDE_EFFECT_FILES="$(dirty_paths | grep -vx -- "$REPORT" || true)"
+                  log "code-guard meldet UNSAFE SIDE EFFECT — Todo-Modus: wird ein Todo, getrackte Dateien werden zurueckgesetzt."
+                  while IFS= read -r se_path; do
+                      [ -n "$se_path" ] || continue
+                      if git ls-files --error-unmatch -- "$se_path" >/dev/null 2>&1; then
+                          git checkout --quiet -- "$se_path" && log "Zurueckgesetzt: $se_path"
+                      else
+                          log "Bleibt liegen (ungetrackt): $se_path"
+                      fi
+                  done <<<"$SIDE_EFFECT_FILES"
+              else
+                  fail "code-guard meldet UNSAFE SIDE EFFECT — der Lauf hat den Worktree veraendert. Nichts wird committed."
+                  exit 15
+              fi ;;
+        4)    fail "Die Umgebung liess sich nicht starten."
+              exit 13 ;;
+        124)  fail "code-guard lief in den Timeout (${GUARD_TIMEOUT}s)."
+              exit 13 ;;
+        *)    fail "code-guard endete unerwartet mit Exit $GUARD_EXIT."
+              exit 13 ;;
+    esac
 
-RESULTS="docs/.guard/results.json"
-[ -f "$RESULTS" ] || { fail "code-guard hat kein $RESULTS hinterlassen."; exit 13; }
-VERDICT="$(jq -r '.verdict // "?"' "$RESULTS")"
-log "Verdikt: $VERDICT"
+    RESULTS="docs/.guard/results.json"
+    [ -f "$RESULTS" ] || { fail "code-guard hat kein $RESULTS hinterlassen."; exit 13; }
+    VERDICT="$(jq -r '.verdict // "?"' "$RESULTS")"
+    log "Verdikt: $VERDICT"
+fi
 
 # -------------------------------------------------------------- Reporttext ----
 #
 # Der Agent hat genau eine Schreibdatei und genau eine Aufgabe. Der Prompt ist
 # absichtlich ein einziger, enger Auftrag: mehrteilige Auftraege bricht opencode
 # gern kommentarlos ab, und ein halb erledigter Turnus ist schlimmer als gar keiner.
+# Der Sicherheits-Turnus überspringt diesen Abschnitt: Der Tiefenscan hat seinen
+# Report bereits in der Messung geschrieben, es fehlt hier nichts.
+
+if [ "$SECURITY_AUDIT" -eq 0 ]; then
 
 AGENT_PROMPT="Fuehre den semantischen Teil des Qualitaets-Audits fuer dieses Projekt aus.
 
@@ -644,10 +781,19 @@ case "$AGENT" in
         agent_exit=$?
         [ "$agent_exit" -eq 0 ] || log "Hinweis: claude endete mit Exit $agent_exit."
         ;;
+    codex)
+        log "Uebergebe an codex …"
+        timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --cd "$PROJECT_DIR" \
+            "$AGENT_PROMPT" < /dev/null
+        agent_exit=$?
+        [ "$agent_exit" -eq 0 ] || log "Hinweis: codex endete mit Exit $agent_exit."
+        ;;
     *)
-        fail "Unbekannter Agent: $AGENT (opencode|claude|none)"
+        fail "Unbekannter Agent: $AGENT (opencode|claude|codex|none)"
         exit 2 ;;
 esac
+
+fi
 
 # ------------------------------------------------------------- Todo-Modus -----
 #
@@ -696,11 +842,12 @@ html_escape() { jq -rn --arg s "$1" '$s | @html'; }
 # Check-ID aus einem Guard-Titel: "[Guard] <projekt>: <label> (<id>)", aeltere
 # Titel tragen noch den Status dahinter ("... (<id>) FAIL"). Die ID ist der
 # Schluessel, nicht der Titel -- sonst entstuende bei jedem Statuswechsel
-# (MISSING -> FAIL) ein neuer Task und der alte bliebe offen.
+# (MISSING -> FAIL) ein neuer Task und der alte bliebe offen. Im
+# Sicherheits-Turnus ist die ID der Fingerabdruck des Funds (sha256:...).
 guard_check_id() {
     local prefix="[Guard] $PROJECT_NAME: "
     case "$1" in "$prefix"*) ;; *) return 1 ;; esac
-    printf '%s\n' "$1" | sed -nE 's/^.* \(([a-z0-9][a-z0-9-]*)\)( [A-Z]+)?$/\1/p'
+    printf '%s\n' "$1" | sed -nE 's/^.* \(([a-z0-9][a-z0-9-]*|sha256:[0-9a-f]{64})\)( [A-Z]+)?$/\1/p'
 }
 
 # Schliesst einen Task. Vikunja ersetzt beim Update den kompletten Datensatz:
@@ -723,8 +870,10 @@ create_todos() {
         return 16
     fi
 
-    local findings
-    findings="$(jq -c '.checks[] | select(.status == "FAIL" or .status == "TIMEOUT" or .status == "MISSING" or .status == "WARN")' "$RESULTS")"
+    local findings=""
+    if [ "$SECURITY_AUDIT" -eq 0 ]; then
+        findings="$(jq -c '.checks[] | select(.status == "FAIL" or .status == "TIMEOUT" or .status == "MISSING" or .status == "WARN")' "$RESULTS")"
+    fi
     if [ -n "$SIDE_EFFECT_FILES" ]; then
         # Als Pseudo-Check in dieselbe Schleife: gleiche Dubletten-Logik.
         local nl=$'\n'
@@ -756,7 +905,11 @@ create_todos() {
     today="$(date '+%d.%m.%Y %H:%M')"
     host="$(hostname 2>/dev/null || echo '?')"
     local run_info
-    run_info="im Guard-Lauf vom $(html_escape "$today") (Commit <code>$(html_escape "$commit")</code>, Host $(html_escape "$host"))"
+    if [ "$SECURITY_AUDIT" -eq 1 ]; then
+        run_info="im Sicherheits-Lauf vom $(html_escape "$today") (Commit <code>$(html_escape "$commit")</code>, Host $(html_escape "$host"))"
+    else
+        run_info="im Guard-Lauf vom $(html_escape "$today") (Commit <code>$(html_escape "$commit")</code>, Host $(html_escape "$host"))"
+    fi
 
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -789,8 +942,13 @@ create_todos() {
         [ -z "$note" ] || desc+="<p><strong>Hinweis:</strong> $(html_escape "$note")</p>"
         [ -z "$logf" ] || desc+="<p><strong>Log:</strong> <code>$(html_escape "$host:$PROJECT_DIR/$logf")</code></p>"
         [ -z "$tail_txt" ] || desc+="<pre>$(html_escape "$tail_txt")</pre>"
-        [ -f "$REPORT" ] && desc+="<p>Der volle Report liegt auf <code>$(html_escape "$host:$PROJECT_DIR/docs/.guard/quality-report.md")</code> (bis zum naechsten Lauf).</p>"
-        desc+="<p>Wird automatisch geschlossen, sobald der Check in einem Guard-Lauf wieder PASS ist.</p>"
+        if [ "$SECURITY_AUDIT" -eq 1 ]; then
+            desc+="<p>Der volle Report ist committet: <code>$(html_escape "$host:$PROJECT_DIR/$REPORT")</code>.</p>"
+            desc+="<p>Wird automatisch geschlossen, sobald ein späterer Lauf keine Seiteneffekte meldet.</p>"
+        else
+            [ -f "$REPORT" ] && desc+="<p>Der volle Report liegt auf <code>$(html_escape "$host:$PROJECT_DIR/docs/.guard/quality-report.md")</code> (bis zum naechsten Lauf).</p>"
+            desc+="<p>Wird automatisch geschlossen, sobald der Check in einem Guard-Lauf wieder PASS ist.</p>"
+        fi
 
         body="$(jq -n --arg t "$title" --arg d "$desc" '{title: $t, description: $d}')"
         if vikunja_call PUT "/projects/$VIKUNJA_PROJECT/tasks" "$body" >/dev/null; then
@@ -800,16 +958,80 @@ create_todos() {
         fi
     done <<<"$findings"
 
+    # Offene Funde des Sicherheits-Laufs. Ein Fund, der schon offen im Projekt
+    # steht, bekommt nur einen Kommentar — sonst stünde derselbe Fund nach ein
+    # paar Läufen mehrfach da. Verworfene Fingerabdrücke stehen nicht in der
+    # Liste und erzeugen deshalb nie einen Task.
+    if [ "$SECURITY_AUDIT" -eq 1 ]; then
+        local fline fp sev datei zeile beschreibung title2 desc2 body2 existing2
+        while IFS= read -r fline; do
+            [ -n "$fline" ] || continue
+            fp="$(jq -r '.fingerabdruck' <<<"$fline")"
+            sev="$(jq -r '.severity // "?"' <<<"$fline")"
+            datei="$(jq -r '.datei' <<<"$fline")"
+            zeile="$(jq -r '.zeile' <<<"$fline")"
+            beschreibung="$(jq -r '.beschreibung // ""' <<<"$fline")"
+            title2="[Guard] $PROJECT_NAME: Sicherheitsfund ($fp)"
+            existing2="${open_by_check[$fp]:-}"
+            if [ -n "$existing2" ]; then
+                if comment_task "$existing2" "<p>Weiterhin offen $run_info, Schwere <strong>$(html_escape "$sev")</strong>.</p>"; then
+                    commented=$((commented + 1))
+                else
+                    fail "Kommentar an Task #$existing2 fehlgeschlagen."; errors=$((errors + 1))
+                fi
+                continue
+            fi
+            # Der lokale Speicher kennt auch erledigte und verworfene Funde.
+            # Nur ein erstmals auftauchender Fingerabdruck wird angelegt.
+            if grep -qxF -- "$fp" <<<"$KNOWN_FINGERPRINTS"; then
+                continue
+            fi
+            desc2="<p><strong>Projekt:</strong> $(html_escape "$PROJECT_NAME")<br>"
+            desc2+="<strong>Lauf:</strong> $(html_escape "$today") auf $(html_escape "$host")<br>"
+            desc2+="<strong>Branch/Commit:</strong> $(html_escape "$branch") @ <code>$(html_escape "$commit")</code><br>"
+            desc2+="<strong>Prüfung:</strong> Statische Sicherheits-Tiefenprüfung (Agent: $(html_escape "$AGENT"))<br>"
+            desc2+="<strong>Schwere:</strong> $(html_escape "$sev")<br>"
+            desc2+="<strong>Beleg:</strong> <code>$(html_escape "$datei")</code>:$zeile</p>"
+            [ -z "$beschreibung" ] || desc2+="<p>$(html_escape "$beschreibung")</p>"
+            desc2+="<p>Fingerabdruck: <code>$fp</code></p>"
+            desc2+="<p>Der volle Report ist committet: <code>$(html_escape "$host:$PROJECT_DIR/$REPORT")</code>.</p>"
+            desc2+="<p>Wird automatisch geschlossen, sobald der Fund in einem späteren Lauf erledigt oder verworfen ist.</p>"
+            body2="$(jq -n --arg t "$title2" --arg d "$desc2" '{title: $t, description: $d}')"
+            if vikunja_call PUT "/projects/$VIKUNJA_PROJECT/tasks" "$body2" >/dev/null; then
+                created=$((created + 1))
+            else
+                fail "Anlegen von \"$title2\" fehlgeschlagen."; errors=$((errors + 1))
+            fi
+        done <<<"$(jq -c 'select(.status == "offen")' "$FINDINGS_FILE")"
+    fi
+
     # Behoben = der Check lief in diesem Lauf und ist PASS. SKIPPED oder ein
-    # fehlender Check sagt nichts darueber, ob der Befund weg ist.
+    # fehlender Check sagt nichts darueber, ob der Befund weg ist. Im
+    # Sicherheits-Turnus ist ein Fund abgearbeitet, wenn der Lauf ihn als
+    # erledigt oder verworfen einstuft.
     local passed
-    passed="$(jq -r '.checks[] | select(.status == "PASS") | .id' "$RESULTS")"
+    if [ "$SECURITY_AUDIT" -eq 1 ]; then
+        passed="$(jq -r 'select(.status == "erledigt" or .status == "verworfen") | .fingerabdruck' "$FINDINGS_FILE")"
+    else
+        passed="$(jq -r '.checks[] | select(.status == "PASS") | .id' "$RESULTS")"
+    fi
     [ -n "$SIDE_EFFECT_FILES" ] || passed+=$'\n'"side-effect"
+    local close_note fstatus
     while IFS= read -r cid; do
         [ -n "$cid" ] || continue
         tid="${open_by_check[$cid]:-}"
         [ -n "$tid" ] || continue
-        if comment_task "$tid" "<p>Behoben $run_info: Check ist wieder PASS. Automatisch geschlossen.</p>" \
+        if [ "$SECURITY_AUDIT" -eq 1 ]; then
+            if [ "$cid" = "side-effect" ]; then
+                close_note="<p>Kein Seiteneffekt $run_info — automatisch geschlossen.</p>"
+            else
+                fstatus="$(jq -r --arg fp "$cid" 'select(.fingerabdruck == $fp) | .status' "$FINDINGS_FILE" | head -1)"
+                close_note="<p>Als <strong>$fstatus</strong> eingestuft $run_info — automatisch geschlossen.</p>"
+            fi
+        else
+            close_note="<p>Behoben $run_info: Check ist wieder PASS. Automatisch geschlossen.</p>"
+        fi
+        if comment_task "$tid" "$close_note" \
             && vikunja_close_task "$tid"; then
             closed=$((closed + 1))
             log "Geschlossen: #$tid ($cid)"
@@ -839,8 +1061,14 @@ discard_report() {
 if [ -n "$VIKUNJA_PROJECT" ]; then
     create_todos
     todo_exit=$?
-    discard_report
-    exit "$todo_exit"
+    if [ "$SECURITY_AUDIT" -eq 1 ] && [ "$todo_exit" -eq 0 ]; then
+        # Der Sicherheits-Report bleibt im Baum und wird unten committet —
+        # sein Zustand steuert den naechsten Turnus wie beim Gate-Lauf.
+        :
+    else
+        discard_report
+        exit "$todo_exit"
+    fi
 fi
 
 if [ ! -f "$REPORT" ]; then
@@ -861,5 +1089,9 @@ if [ "$NO_COMMIT" -eq 1 ]; then
     exit 0
 fi
 
-commit_report "chore(guard): Qualitaets-Report vom $(date '+%Y-%m-%d') ($VERDICT)"
+if [ "$SECURITY_AUDIT" -eq 1 ]; then
+    commit_report "chore(guard): Sicherheits-Report vom $(date '+%Y-%m-%d') ($VERDICT)"
+else
+    commit_report "chore(guard): Qualitaets-Report vom $(date '+%Y-%m-%d') ($VERDICT)"
+fi
 exit $?

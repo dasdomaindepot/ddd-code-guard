@@ -21,7 +21,7 @@ STAGES = (
     ("dubletten", "05-dubletten.json"),
     ("gegenpruefung", "06-gegenpruefung.json"),
 )
-ALLOWED = ("docs/.guard/", "docs/security/.gitignore", "docs/security/findings.jsonl", "docs/quality-report.md")
+ALLOWED = ("docs/.guard/", "docs/security/.gitignore", "docs/security/findings.jsonl", "docs/security/audit-report.md", "docs/quality-report.md")
 
 
 def git(project, *args):
@@ -174,11 +174,55 @@ def deep_search(agent, project, workspace, baseline):
     return 0
 
 
-def write_results(project, findings):
+def load_previous(finding_file):
+    """Liest vorhandene Funde, damit Status und Verwerfung über Läufe hinweg bleiben."""
+    if not finding_file.is_file():
+        return {}
+    previous = {}
+    for number, line in enumerate(finding_file.read_text(encoding="utf-8").splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Ungültiger gespeicherter Fund in Zeile {number}") from error
+        if not isinstance(item, dict) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(item.get("fingerabdruck", ""))
+        ) or item.get("status") not in ("offen", "erledigt", "verworfen"):
+            raise ValueError(f"Ungültiger gespeicherter Fund in Zeile {number}")
+        previous[item["fingerabdruck"]] = item
+    return previous
+
+
+def merge_findings(previous, findings):
+    """Führt die Funde des aktuellen Laufs mit den vorhandenen zusammen.
+
+    Ein einmal verworfener Fingerabdruck bleibt verworfen; neue Funde ergänzen
+    die Datei, und Funde, die der Lauf nicht mehr meldet, bleiben erhalten.
+    """
+    merged = dict(previous)
+    for finding in findings:
+        fingerprint = finding["fingerabdruck"]
+        existing = merged.get(fingerprint)
+        if not existing:
+            merged[fingerprint] = finding
+        elif existing.get("status") == "offen" and finding["status"] in ("erledigt", "verworfen"):
+            # Ein offener Fund darf ausdrücklich abgeschlossen werden.
+            merged[fingerprint] = {**existing, **finding}
+        else:
+            # Bereits erledigte oder verworfene Funde bleiben endgültig so.
+            # Auch ein erneut offener Fund behält seine geprüften Metadaten.
+            merged[fingerprint] = existing
+    return list(merged.values())
+
+
+def write_results(project, findings, report_path="docs/quality-report.md"):
     finding_file = project / "docs/security/findings.jsonl"
-    report_file = project / "docs/quality-report.md"
-    finding_file.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in findings), encoding="utf-8")
-    opened = [item for item in findings if item["status"] == "offen"]
+    report_file = project / report_path
+    merged = merge_findings(load_previous(finding_file), findings)
+    finding_file.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in merged), encoding="utf-8")
+    opened = [item for item in merged if item["status"] == "offen"]
     verdict = "RED" if any(item["severity"] in ("BLOCKER", "HIGH") for item in opened) else (
         "YELLOW" if opened else "GREEN"
     )
@@ -201,6 +245,8 @@ def main():
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--agent", choices=("opencode", "claude", "codex"))
     parser.add_argument("--deep", action="store_true")
+    parser.add_argument("--weekly-report", action="store_true",
+                        help="Separater Report für den monatlichen Turnus")
     args = parser.parse_args()
     if args.deep and args.agent == "opencode":
         parser.error("--deep unterstützt nur claude oder codex")
@@ -264,7 +310,7 @@ def main():
                     raise ValueError("Großer Scan benötigt 24 nummerierte Untersuchungen im Plan")
             print(f"Stufe {stage}: vorhanden")
         findings = json.loads((workspace / STAGES[-1][1]).read_text(encoding="utf-8"))
-        write_results(project, findings)
+        write_results(project, findings, "docs/security/audit-report.md" if args.weekly_report else "docs/quality-report.md")
         print(f"Sicherheits-Audit abgeschlossen: {len(findings)} geprüfte Funde")
         return 0
     except (OSError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as error:

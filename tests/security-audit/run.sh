@@ -72,6 +72,22 @@ jq -e '.fingerabdruck and .status == "offen"' docs/security/findings.jsonl >/dev
 grep -q 'app.py:1' docs/quality-report.md
 ! grep -q 'Vertrauliches Detail' docs/quality-report.md
 [ "$(cat app.py)" = 'print("unverändert")' ]
+python3 - "$ROOT/claude/skills/code-quality/bin/guard-security-audit" <<'PY'
+import importlib.machinery
+import sys
+audit = importlib.machinery.SourceFileLoader("audit_merge", sys.argv[1]).load_module()
+old = {"sha256:a": {"fingerabdruck": "sha256:a", "status": "verworfen", "begründung": "geprüft"},
+       "sha256:b": {"fingerabdruck": "sha256:b", "status": "erledigt"},
+       "sha256:c": {"fingerabdruck": "sha256:c", "status": "offen", "severity": "HIGH"}}
+new = [{"fingerabdruck": key, "status": "offen", "severity": "LOW"} for key in ("sha256:a", "sha256:b", "sha256:d")]
+new.append({"fingerabdruck": "sha256:c", "status": "erledigt"})
+merged = {item["fingerabdruck"]: item for item in audit.merge_findings(old, new)}
+assert merged["sha256:a"]["status"] == "verworfen"
+assert merged["sha256:a"]["begründung"] == "geprüft"
+assert merged["sha256:b"]["status"] == "erledigt"
+assert merged["sha256:c"]["status"] == "erledigt"
+assert merged["sha256:d"]["status"] == "offen"
+PY
 if git -c core.excludesFile=/dev/null status --porcelain --untracked-files=all | grep -q 'docs/.guard'; then
     echo 'Stufenordner ist nicht vor Git verborgen' >&2
     exit 1
