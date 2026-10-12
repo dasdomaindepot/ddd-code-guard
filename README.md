@@ -122,13 +122,22 @@ did not start (`--boot`).
 
 #### Statischer Sicherheits-Audit
 
+Die Stufen orientieren sich methodisch an
+[google/mantis](https://github.com/google/mantis) (Apache-2.0). Code Guard
+verwendet dafür einen eigenen, rein statischen Ablauf.
+
 `code-guard --security-audit --project DIR` prüft das gesamte Projekt in sechs
 getrennten Agentenstufen: Historie, Bedrohungsmodell, Plan, Suche, Dubletten und
 Gegenprüfung. Vorgabe ist Ornith über `opencode`; mit `--agent claude` oder
-`--agent codex` lässt sich der Agent ausdrücklich wechseln. Der Lauf führt
-keinen Projektcode aus und endet nach der Gegenprüfung. Jede Stufe muss eine
-Ausgabedatei unter `docs/.guard/security-audit/` liefern, sonst bricht der Lauf
-ab. Der öffentliche Report unter `docs/quality-report.md` enthält zu Funden
+`--agent codex` lässt sich der Agent ausdrücklich wechseln. Der Lauf weist den
+Agenten an, keinen Projektcode, keine Tests, Builds oder Netzwerkbefehle
+auszuführen, und endet nach der Gegenprüfung. Er reproduziert keine
+Schwachstellen und führt keine Exploits aus. Technisch erzwungen wird nur, dass
+außer den Ausgabedateien keine Projektdatei geändert wird (sonst Exit 3); den
+Lauf deshalb nur in einer Umgebung starten, in der der Agent nichts Schädliches
+ausführen kann. Jede Stufe
+muss eine Ausgabedatei unter `docs/.guard/security-audit/` liefern, sonst bricht
+der Lauf ab. Der öffentliche Report unter `docs/quality-report.md` enthält zu Funden
 nur ID, Schwere und Datei:Zeile. Details stehen lokal in
 `docs/security/findings.jsonl`; diese Datei muss im Projekt ignoriert sein.
 
@@ -138,7 +147,9 @@ Prompt als fünf Argumente.
 
 `code-guard --security-audit --deep` startet den großen Scan ausdrücklich.
 Vorgabe ist Claude; `--deep --agent codex` nutzt Codex. Ornith ist im
-Deep-Modus nicht zulässig. Vor dem ersten Modellaufruf erscheint eine
+Deep-Modus nicht zulässig. Der normale Ornith-Lauf beansprucht vor allem lokale
+Rechenzeit; bei anderen Agenten hängen die Kosten vom gewählten Modell und Tarif
+ab. Vor dem ersten Modellaufruf im Deep-Modus erscheint eine
 Kostenschätzung von etwa 1,4 Mio. Tokens und 45 Minuten für ein mittleres
 Projekt. Der Plan muss 24 nummerierte Untersuchungsfragen über mehrere
 Dateien enthalten. Vier parallele Such-Batches bearbeiten jeweils sechs

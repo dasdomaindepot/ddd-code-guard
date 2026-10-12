@@ -473,13 +473,18 @@ Bleibt das Script-Urteil unverändert, schreibst du es einfach so hin.
 
 ## Statischer Sicherheits-Audit
 
+Die Stufen orientieren sich methodisch an
+[google/mantis](https://github.com/google/mantis) (Apache-2.0). Code Guard
+verwendet einen eigenen, rein statischen Ablauf.
+
 `bin/code-guard --security-audit --project <projektverzeichnis>` führt eine
 Tiefenprüfung über das gesamte Projekt aus. Das Script ruft nacheinander sechs
 enge Stufen auf: Historie, Bedrohungsmodell, Plan, Suche, Dubletten und
 Gegenprüfung. Vorgabe ist Ornith über opencode; `--agent claude` und
 `--agent codex` sind nur auf ausdrücklichen Wunsch zu verwenden. Kein
-Projektcode, keine Tests und keine Netzwerkbefehle werden ausgeführt; eine
-Reproduktion findet nicht statt. Jede Stufe muss ihr Ergebnis unter
+Projektcode, keine Tests, Builds oder Netzwerkbefehle werden ausgeführt;
+Schwachstellen werden nicht reproduziert und Exploits nicht ausgeführt. Jede
+Stufe muss ihr Ergebnis unter
 `docs/.guard/security-audit/` ablegen. Ein fehlendes Ergebnis beendet den Lauf.
 Die Gegenprüfung folgt `references/semantic-review.md`; Funde folgen
 `references/security-knowledge.md`. Der Report enthält zu jedem Fund nur ID,
@@ -488,6 +493,8 @@ Schwere und Datei:Zeile, Details bleiben in der lokal ignorierten
 
 Der optionale große Scan wird nur mit `--security-audit --deep` gestartet.
 Er verwendet standardmäßig Claude oder ausdrücklich `--agent codex`.
+Der normale Ornith-Lauf kostet vor allem lokale Rechenzeit; bei anderen
+Agenten richten sich die Kosten nach Modell und Tarif.
 Vor dem Start wird der Richtwert von ca. 1,4 Mio. Tokens und 45 Minuten
 angezeigt. Ein Plan mit mindestens 24 nummerierten, dateiübergreifenden
 Untersuchungsfragen wird in vier parallelen Such-Batches zu je sechs Fragen
