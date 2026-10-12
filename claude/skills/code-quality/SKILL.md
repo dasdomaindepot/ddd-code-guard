@@ -486,6 +486,15 @@ Die Gegenprüfung folgt `references/semantic-review.md`; Funde folgen
 Schwere und Datei:Zeile, Details bleiben in der lokal ignorierten
 `docs/security/findings.jsonl`.
 
+Der optionale große Scan wird nur mit `--security-audit --deep` gestartet.
+Er verwendet standardmäßig Claude oder ausdrücklich `--agent codex`.
+Vor dem Start wird der Richtwert von ca. 1,4 Mio. Tokens und 45 Minuten
+angezeigt. Ein Plan mit mindestens 24 nummerierten, dateiübergreifenden
+Untersuchungsfragen wird in vier parallelen Such-Batches zu je sechs Fragen
+bearbeitet; jede Suche schreibt in eine eigene UUID-Datei. Danach laufen
+Dublettenprüfung und gründliche Gegenprüfung gegen den echten Code. Ein
+erschöpftes Codex-Kontingent beendet den Lauf mit Fehler statt Agentenwechsel.
+
 ## Der wöchentliche Turnus
 
 Neben dem Audit von Hand gibt es den unbeaufsichtigten Lauf:

@@ -2,6 +2,7 @@
 """Statischer Sicherheits-Tiefenscan mit sechs einzeln geprüften Agentenstufen."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import uuid
 
 
 STAGES = (
@@ -124,10 +126,52 @@ def call_agent(agent, stage, project, output, message):
     else:
         command = agent_command(agent, project, message)
     try:
-        return subprocess.run(command, cwd=project, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=1800).returncode
+        result = subprocess.run(command, cwd=project, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=1800)
+        return result.returncode, result.stdout + result.stderr
     except subprocess.TimeoutExpired:
-        return 124
+        return 124, "Zeitlimit überschritten"
+
+
+def check_agent_result(agent, stage, code, details):
+    if not code:
+        return
+    if agent == "codex" and re.search(
+        r"usage limit|rate limit|quota|insufficient credits|Kontingent",
+        details, re.IGNORECASE
+    ):
+        raise ValueError(f"Codex-Kontingent erschöpft in {stage}; kein Agentenwechsel (Exit {code})")
+    raise ValueError(f"Agentenaufruf für {stage} fehlgeschlagen (Exit {code})")
+
+
+def deep_search(agent, project, workspace, baseline):
+    """Vier isolierte Suchaufrufe prüfen je sechs Untersuchungen aus dem Plan."""
+    jobs = []
+    for batch in range(1, 5):
+        output = workspace / f"{uuid.uuid4()}.json"
+        message = prompt("suche", output, workspace) + (
+            f"\n\nGroßer Scan, Batch {batch}/4: Bearbeite ausschließlich die "
+            f"Untersuchungen {(batch - 1) * 6 + 1} bis {batch * 6} aus 03-plan.md. "
+            "Lies gezielt die betroffenen Dateien und ihre Aufrufketten, nicht "
+            "pauschal ganze Dateien. Schreibe nur in deine UUID-Ausgabedatei."
+        )
+        jobs.append((f"suche-{batch}", output, message))
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(
+            lambda job: call_agent(agent, job[0], project, job[1], job[2]), jobs
+        ))
+    if snapshot(project) != baseline:
+        print("UNSAFE SIDE EFFECT nach Stufe suche", file=sys.stderr)
+        return 3
+    candidates = []
+    for (stage, output, _), (code, details) in zip(jobs, results):
+        check_agent_result(agent, stage, code, details)
+        validate("suche", output)
+        candidates.extend(json.loads(output.read_text(encoding="utf-8")))
+        print(f"Stufe {stage}: vorhanden")
+    merged = workspace / "04-suche.json"
+    merged.write_text(json.dumps(candidates, ensure_ascii=False) + "\n", encoding="utf-8")
+    return 0
 
 
 def write_results(project, findings):
@@ -155,8 +199,12 @@ def write_results(project, findings):
 def main():
     parser = argparse.ArgumentParser(description="Statischer Sicherheits-Tiefenscan")
     parser.add_argument("--project", type=Path, default=Path.cwd())
-    parser.add_argument("--agent", choices=("opencode", "claude", "codex"), default="opencode")
+    parser.add_argument("--agent", choices=("opencode", "claude", "codex"))
+    parser.add_argument("--deep", action="store_true")
     args = parser.parse_args()
+    if args.deep and args.agent == "opencode":
+        parser.error("--deep unterstützt nur claude oder codex")
+    args.agent = args.agent or ("claude" if args.deep else "opencode")
     project = args.project.resolve()
     workspace = project / "docs/.guard/security-audit"
     try:
@@ -175,17 +223,45 @@ def main():
         baseline = snapshot(project)
         workspace.mkdir(parents=True, exist_ok=True)
         (project / "docs/.guard/.gitignore").write_text("*\n", encoding="utf-8")
+        if args.deep:
+            print("Kostenschätzung für --deep: ca. 1,4 Mio. Tokens und 45 Minuten "
+                  "für ein mittleres Projekt; tatsächlicher Verbrauch kann abweichen.", flush=True)
+            if args.agent == "codex":
+                print("Codex-Kontingent vor dem Start prüfen; bei Erschöpfung bricht der Lauf ab.",
+                      flush=True)
         for stage, filename in STAGES:
             output = workspace / filename
             output.unlink(missing_ok=True)
+            if args.deep and stage == "suche":
+                result = deep_search(args.agent, project, workspace, baseline)
+                if result:
+                    return result
+                continue
             message = prompt(stage, output, workspace)
-            code = call_agent(args.agent, stage, project, output, message)
+            if args.deep and stage == "plan":
+                message += (
+                    "\n\nGroßer Scan: Schreibe mindestens 24 nummerierte, konkrete "
+                    "Untersuchungsfragen (1 bis 24), verteilt auf vier Gruppen zu "
+                    "je sechs. Jede Frage benennt Einstieg, Datenfluss oder "
+                    "Vertrauensgrenze und die über mehrere Dateien zu prüfenden "
+                    "Aufrufketten. Plane gezielte Lesezugriffe statt ganze Dateien."
+                )
+            if args.deep and stage == "gegenpruefung":
+                message += (
+                    "\n\nGroßer Scan: Prüfe jeden Fund gründlich gegen den echten "
+                    "Code über alle betroffenen Dateien und dokumentiere "
+                    "Gegenbelege vor dem Urteil."
+                )
+            code, details = call_agent(args.agent, stage, project, output, message)
             if snapshot(project) != baseline:
                 print(f"UNSAFE SIDE EFFECT nach Stufe {stage}", file=sys.stderr)
                 return 3
-            if code:
-                raise ValueError(f"Agentenaufruf für {stage} fehlgeschlagen (Exit {code})")
+            check_agent_result(args.agent, stage, code, details)
             validate(stage, output)
+            if args.deep and stage == "plan":
+                numbers = set(map(int, re.findall(r"(?m)^\s*(\d{1,2})[.)]\s+", output.read_text(encoding="utf-8"))))
+                if not set(range(1, 25)).issubset(numbers):
+                    raise ValueError("Großer Scan benötigt 24 nummerierte Untersuchungen im Plan")
             print(f"Stufe {stage}: vorhanden")
         findings = json.loads((workspace / STAGES[-1][1]).read_text(encoding="utf-8"))
         write_results(project, findings)

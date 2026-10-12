@@ -19,7 +19,7 @@
 #
 set -uo pipefail
 
-VERSION="1.23.0"
+VERSION="1.24.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Der Tiefenscan hat einen eigenen, rein statischen Ablauf und verwendet keine
@@ -68,6 +68,7 @@ Verwendung: code-guard [OPTIONEN]
 
   --project DIR    Projektverzeichnis (Vorgabe: aktuelles Verzeichnis)
   --security-audit Statischer Sicherheits-Tiefenscan über das ganze Projekt
+  --deep           Großer Scan (nur mit --security-audit; Vorgabe: claude)
   --agent NAME     Agent für --security-audit: opencode | claude | codex
   --base REF       Vergleichsbasis fuer den Diff (Vorgabe: automatisch)
   --full           teure Checks mitfahren (coverage, infection, e2e, build)

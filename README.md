@@ -136,6 +136,17 @@ Für Tests ersetzt `GUARD_SECURITY_AGENT_STUB` den Modellaufruf durch ein
 ausführbares Testprogramm. Es erhält Agent, Stufe, Projektpfad, Ausgabepfad und
 Prompt als fünf Argumente.
 
+`code-guard --security-audit --deep` startet den großen Scan ausdrücklich.
+Vorgabe ist Claude; `--deep --agent codex` nutzt Codex. Ornith ist im
+Deep-Modus nicht zulässig. Vor dem ersten Modellaufruf erscheint eine
+Kostenschätzung von etwa 1,4 Mio. Tokens und 45 Minuten für ein mittleres
+Projekt. Der Plan muss 24 nummerierte Untersuchungsfragen über mehrere
+Dateien enthalten. Vier parallele Such-Batches bearbeiten jeweils sechs
+Fragen und schreiben in eigene UUID-Dateien unter
+`docs/.guard/security-audit/`; danach werden die Kandidaten gemeinsam auf
+Dubletten und gegen den echten Code geprüft. Bei erschöpftem Codex-Kontingent
+bricht der Lauf mit Fehlermeldung und Exit-Code 2 ab.
+
 #### Weekly run
 
 `bin/guard-weekly --project DIR` is meant for cron: it checks the worktree is
