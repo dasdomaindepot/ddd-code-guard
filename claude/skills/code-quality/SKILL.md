@@ -471,6 +471,21 @@ sichtbar, mit dem Beleg aus dem Log:
 
 Bleibt das Script-Urteil unverändert, schreibst du es einfach so hin.
 
+## Statischer Sicherheits-Audit
+
+`bin/code-guard --security-audit --project <projektverzeichnis>` führt eine
+Tiefenprüfung über das gesamte Projekt aus. Das Script ruft nacheinander sechs
+enge Stufen auf: Historie, Bedrohungsmodell, Plan, Suche, Dubletten und
+Gegenprüfung. Vorgabe ist Ornith über opencode; `--agent claude` und
+`--agent codex` sind nur auf ausdrücklichen Wunsch zu verwenden. Kein
+Projektcode, keine Tests und keine Netzwerkbefehle werden ausgeführt; eine
+Reproduktion findet nicht statt. Jede Stufe muss ihr Ergebnis unter
+`docs/.guard/security-audit/` ablegen. Ein fehlendes Ergebnis beendet den Lauf.
+Die Gegenprüfung folgt `references/semantic-review.md`; Funde folgen
+`references/security-knowledge.md`. Der Report enthält zu jedem Fund nur ID,
+Schwere und Datei:Zeile, Details bleiben in der lokal ignorierten
+`docs/security/findings.jsonl`.
+
 ## Der wöchentliche Turnus
 
 Neben dem Audit von Hand gibt es den unbeaufsichtigten Lauf:

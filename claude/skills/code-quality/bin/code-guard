@@ -7,7 +7,8 @@
 # Script trifft keine Urteile ueber Architektur oder Fachlichkeit — das macht
 # anschliessend der code-quality-Skill auf Basis dieser Ergebnisse.
 #
-# Es aendert niemals Projektcode. Einzige Schreibziele: docs/.guard/**
+# Es aendert niemals Projektcode. Im Sicherheitsmodus schreibt es außerdem
+# docs/security/findings.jsonl und docs/quality-report.md.
 #
 # Exit-Codes:
 #   0  Policy erfuellt
@@ -18,8 +19,20 @@
 #
 set -uo pipefail
 
-VERSION="1.22.0"
+VERSION="1.23.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Der Tiefenscan hat einen eigenen, rein statischen Ablauf und verwendet keine
+# deterministischen Projekt-Checks. Argumente werden dort getrennt geprüft.
+for arg in "$@"; do
+    if [ "$arg" = "--security-audit" ]; then
+        args=()
+        for value in "$@"; do
+            [ "$value" = "--security-audit" ] || args+=("$value")
+        done
+        exec "$SCRIPT_DIR/guard-security-audit" "${args[@]}"
+    fi
+done
 
 # ---------------------------------------------------------------- Optionen ---
 
@@ -54,6 +67,8 @@ code-guard — deterministische Qualitaets-Gates
 Verwendung: code-guard [OPTIONEN]
 
   --project DIR    Projektverzeichnis (Vorgabe: aktuelles Verzeichnis)
+  --security-audit Statischer Sicherheits-Tiefenscan über das ganze Projekt
+  --agent NAME     Agent für --security-audit: opencode | claude | codex
   --base REF       Vergleichsbasis fuer den Diff (Vorgabe: automatisch)
   --full           teure Checks mitfahren (coverage, infection, e2e, build)
   --boot           Docker-Stack vor dem Lauf starten und danach wieder stoppen

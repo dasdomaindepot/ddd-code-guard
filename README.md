@@ -120,6 +120,22 @@ did not start (`--boot`).
 
 `docs/.guard/` hides itself from Git.
 
+#### Statischer Sicherheits-Audit
+
+`code-guard --security-audit --project DIR` prüft das gesamte Projekt in sechs
+getrennten Agentenstufen: Historie, Bedrohungsmodell, Plan, Suche, Dubletten und
+Gegenprüfung. Vorgabe ist Ornith über `opencode`; mit `--agent claude` oder
+`--agent codex` lässt sich der Agent ausdrücklich wechseln. Der Lauf führt
+keinen Projektcode aus und endet nach der Gegenprüfung. Jede Stufe muss eine
+Ausgabedatei unter `docs/.guard/security-audit/` liefern, sonst bricht der Lauf
+ab. Der öffentliche Report unter `docs/quality-report.md` enthält zu Funden
+nur ID, Schwere und Datei:Zeile. Details stehen lokal in
+`docs/security/findings.jsonl`; diese Datei muss im Projekt ignoriert sein.
+
+Für Tests ersetzt `GUARD_SECURITY_AGENT_STUB` den Modellaufruf durch ein
+ausführbares Testprogramm. Es erhält Agent, Stufe, Projektpfad, Ausgabepfad und
+Prompt als fünf Argumente.
+
 #### Weekly run
 
 `bin/guard-weekly --project DIR` is meant for cron: it checks the worktree is
