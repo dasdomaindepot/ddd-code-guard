@@ -9,7 +9,7 @@
 # Im Sicherheits-Turnus (--security-audit) misst der Lauf stattdessen den
 # statischen Sicherheits-Tiefenscan in Ornith-Modus — einmal je Kalendermonat
 # und Projekt. Der größere
-# --deep-Scan bleibt ein manueller Lauf und kommt nie hierher. Funde werden
+# --deep-Scan ist über das Sicherheitsprofil ebenfalls möglich. Funde werden
 # wie die Gates-Befunde zu Vikunja-Todos: ein bekannter oder verworfener
 # Fingerabdruck bekommt keinen neuen Task.
 #
@@ -43,7 +43,7 @@
 
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_GUARD="${GUARD_WEEKLY_CODE_GUARD:-$SCRIPT_DIR/code-guard}"
 
@@ -74,8 +74,10 @@ GUARD_TIMEOUT_SET=0
 # committeten Reports.
 VIKUNJA_PROJECT=""
 # Sicherheits-Turnus (--security-audit): statt der Gates misst der Lauf den
-# statischen Sicherheits-Tiefenscan in Ornith-Modus. Nie mit --deep.
+# statischen Sicherheits-Tiefenscan im gewählten Profil.
 SECURITY_AUDIT=0
+SECURITY_PROFILE="quick"
+SECURITY_ENGINE="guard"
 
 # Dateien, die dauerhaft vom committeten Stand abweichen duerfen, ohne dass der
 # Worktree als "in Arbeit" gilt. Auf jedem Rechner steht eine eigene .env --
@@ -99,7 +101,8 @@ Verwendung: guard-weekly --project DIR [OPTIONEN]
    --agent NAME      opencode | claude | codex | none (Vorgabe: opencode)
                      'none' misst nur und schreibt einen Report ohne Modell
    --security-audit  Monatlicher Sicherheits-Turnus statt der Gates
-                     (Ornith-Modus, nie --deep). Ein Agent ist erforderlich.
+   --security-profile quick | standard | deep (Vorgabe: quick)
+   --security-engine guard | cf (Vorgabe: guard)
    --acknowledge     Report als abgearbeitet markieren und das committen
    --status          nur zeigen, was ein Lauf jetzt tun wuerde
    --force           auch laufen, wenn der Report noch offen ist
@@ -112,8 +115,10 @@ Verwendung: guard-weekly --project DIR [OPTIONEN]
   --expensive-timeout N
                     Sekunden je teurem Check im Komplett-Lauf
                     (Vorgabe: 14400 = 4 h; 0 = unbegrenzt)
-  --guard-timeout N Sekunden fuer den ganzen code-guard-Lauf
-                    (Vorgabe: 1800, mit --full unbegrenzt; 0 = unbegrenzt)
+   --guard-timeout N Sekunden fuer den ganzen code-guard-Lauf
+                     (Vorgabe: 1800; mit --full unbegrenzt; bei
+                     --security-audit je nach Profil standard=5400,
+                     deep=10800, cf-Engine=14400; 0 = unbegrenzt)
   --vikunja-project ID
                     Todo-Modus: je Befund (FAIL/TIMEOUT/MISSING/WARN) ein Task
                     im Vikunja-Projekt ID, offene Dubletten bekommen nur einen
@@ -130,6 +135,8 @@ while [ $# -gt 0 ]; do
         --branch)        TARGET_BRANCH="${2:-develop}"; shift 2 ;;
         --agent)         AGENT="${2:-opencode}"; shift 2 ;;
         --security-audit) SECURITY_AUDIT=1; shift ;;
+        --security-profile) SECURITY_PROFILE="${2:-}"; shift 2 ;;
+        --security-engine) SECURITY_ENGINE="${2:-}"; shift 2 ;;
         --acknowledge)   DO_ACKNOWLEDGE=1; shift ;;
         --status)        DO_STATUS=1; shift ;;
         --force)         FORCE=1; shift ;;
@@ -158,6 +165,22 @@ if [ -n "$VIKUNJA_PROJECT" ]; then
 fi
 
 if [ "$SECURITY_AUDIT" -eq 1 ]; then
+    case "$SECURITY_PROFILE" in quick|standard|deep) ;; *) echo "Ungültiges Sicherheitsprofil: $SECURITY_PROFILE" >&2; exit 2 ;; esac
+    case "$SECURITY_ENGINE" in guard|cf) ;; *) echo "Ungültige Sicherheits-Engine: $SECURITY_ENGINE" >&2; exit 2 ;; esac
+    if { [ "$SECURITY_PROFILE" != quick ] || [ "$SECURITY_ENGINE" = cf ]; } \
+        && [ "$AGENT" != claude ] && [ "$AGENT" != codex ]; then
+        echo "Profil standard/deep oder cf-Engine verlangen --agent claude oder --agent codex." >&2
+        exit 2
+    fi
+    if [ "$GUARD_TIMEOUT_SET" -eq 0 ]; then
+        if [ "$SECURITY_ENGINE" = cf ]; then
+            GUARD_TIMEOUT=14400
+        elif [ "$SECURITY_PROFILE" = deep ]; then
+            GUARD_TIMEOUT=10800
+        elif [ "$SECURITY_PROFILE" = standard ]; then
+            GUARD_TIMEOUT=5400
+        fi
+    fi
     if [ "$FULL" -eq 1 ]; then
         echo "--full und --security-audit lassen sich nicht kombinieren." >&2
         exit 2
@@ -311,7 +334,7 @@ if [ "$DO_STATUS" -eq 1 ]; then
     echo "Branch:       $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     echo "Zielbranch:   $TARGET_BRANCH"
     if [ "$SECURITY_AUDIT" -eq 1 ]; then
-        echo "Prüfung:      Sicherheits-Tiefenscan im Turnus (Agent: $AGENT, nie --deep)"
+        echo "Prüfung:      Sicherheits-Tiefenscan im Turnus (Agent: $AGENT, Profil: $SECURITY_PROFILE, Engine: $SECURITY_ENGINE)"
     else
         echo "Prüfung:      code-guard-Gates$([ "$FULL" -eq 1 ] && echo ' (Komplett-Lauf)')"
     fi
@@ -428,7 +451,7 @@ restore_tolerated() {
 commit_report() {
     local message="$1"
     # Im Sicherheits-Turnus darf neben dem Report die neue .gitignore liegen,
-    # die der Audit anlegt, damit findings.jsonl lokal bleibt.
+    # die der Audit anlegt, damit Funde und Coverage-Ledger lokal bleiben.
     local extra="${COMMIT_EXTRA:-}"
 
     if [ "$NO_COMMIT" -eq 1 ]; then
@@ -596,9 +619,7 @@ fi
 
 SIDE_EFFECT_FILES=""
 if [ "$SECURITY_AUDIT" -eq 1 ]; then
-    # Der Tiefenscan ist statisch: kein Docker, kein --boot. Und er ist nie
-    # der --deep-Scan: die Variante ist ein manueller Lauf und kostet ein
-    # Vielfaches. Ein Agent ist erforderlich, Ornith-Modus per Vorgabe.
+    # Der Tiefenscan ist statisch: kein Docker, kein --boot.
     if ! command -v "$AGENT" >/dev/null 2>&1; then
         fail "Der Agent \"$AGENT\" ist nicht im PATH ($PATH)."
         echo "    Im Cron fehlt oft /snap/bin — dort im Crontab eine PATH-Zeile setzen." >&2
@@ -609,12 +630,14 @@ if [ "$SECURITY_AUDIT" -eq 1 ]; then
     # Todo-Weg einen Fund erstmals sieht.
     FINDINGS_FILE="docs/security/findings.jsonl"
     KNOWN_FINGERPRINTS="$(jq -r '.fingerabdruck // empty' "$FINDINGS_FILE" 2>/dev/null || true)"
+    KNOWN_CONDITIONAL="$(jq -r 'select(.status == "bedingt") | .fingerabdruck' "$FINDINGS_FILE" 2>/dev/null || true)"
     timeout "$GUARD_TIMEOUT" "$CODE_GUARD" \
-        --security-audit --weekly-report --project "$PROJECT_DIR" --agent "$AGENT"
+        --security-audit --weekly-report --project "$PROJECT_DIR" --agent "$AGENT" \
+        --profile "$SECURITY_PROFILE" --engine "$SECURITY_ENGINE"
     GUARD_EXIT=$?
     case "$GUARD_EXIT" in
         0)   log "Sicherheits-Tiefenprüfung fertig (Exit $GUARD_EXIT)." ;;
-        2)   fail "Die Sicherheits-Tiefenprüfung wurde abgebrochen."
+        2)   fail "Die Sicherheits-Tiefenprüfung wurde abgebrochen; bei Codex auch Kontingent prüfen."
              exit 13 ;;
         3)   if [ -n "$VIKUNJA_PROJECT" ]; then
                   # Im Todo-Modus wird nichts committet. Der Seiteneffekt wird
@@ -963,18 +986,29 @@ create_todos() {
     # paar Läufen mehrfach da. Verworfene Fingerabdrücke stehen nicht in der
     # Liste und erzeugen deshalb nie einen Task.
     if [ "$SECURITY_AUDIT" -eq 1 ]; then
-        local fline fp sev datei zeile beschreibung title2 desc2 body2 existing2
+        local fline fp sev datei zeile beschreibung title2 desc2 body2 existing2 fstatus
         while IFS= read -r fline; do
             [ -n "$fline" ] || continue
             fp="$(jq -r '.fingerabdruck' <<<"$fline")"
-            sev="$(jq -r '.severity // "?"' <<<"$fline")"
+            sev="$(jq -r '.severity // ""' <<<"$fline")"
+            fstatus="$(jq -r '.status' <<<"$fline")"
             datei="$(jq -r '.datei' <<<"$fline")"
             zeile="$(jq -r '.zeile' <<<"$fline")"
             beschreibung="$(jq -r '.beschreibung // ""' <<<"$fline")"
             title2="[Guard] $PROJECT_NAME: Sicherheitsfund ($fp)"
+            [ "$fstatus" != "bedingt" ] || title2="[Guard] $PROJECT_NAME: Prüfen: Sicherheitsfund ($fp)"
             existing2="${open_by_check[$fp]:-}"
             if [ -n "$existing2" ]; then
-                if comment_task "$existing2" "<p>Weiterhin offen $run_info, Schwere <strong>$(html_escape "$sev")</strong>.</p>"; then
+                if [ "$fstatus" = "bedingt" ]; then
+                    desc2="<p>Weiterhin bedingt $run_info; offene Voraussetzung prüfen.</p>"
+                else
+                    if grep -qxF -- "$fp" <<<"${KNOWN_CONDITIONAL:-}"; then
+                        desc2="<p>Von bedingt zu offen $run_info, Schwere <strong>$(html_escape "$sev")</strong>.</p>"
+                    else
+                        desc2="<p>Weiterhin offen $run_info, Schwere <strong>$(html_escape "$sev")</strong>.</p>"
+                    fi
+                fi
+                if comment_task "$existing2" "$desc2"; then
                     commented=$((commented + 1))
                 else
                     fail "Kommentar an Task #$existing2 fehlgeschlagen."; errors=$((errors + 1))
@@ -990,7 +1024,7 @@ create_todos() {
             desc2+="<strong>Lauf:</strong> $(html_escape "$today") auf $(html_escape "$host")<br>"
             desc2+="<strong>Branch/Commit:</strong> $(html_escape "$branch") @ <code>$(html_escape "$commit")</code><br>"
             desc2+="<strong>Prüfung:</strong> Statische Sicherheits-Tiefenprüfung (Agent: $(html_escape "$AGENT"))<br>"
-            desc2+="<strong>Schwere:</strong> $(html_escape "$sev")<br>"
+            [ "$fstatus" = "bedingt" ] || desc2+="<strong>Schwere:</strong> $(html_escape "$sev")<br>"
             desc2+="<strong>Beleg:</strong> <code>$(html_escape "$datei")</code>:$zeile</p>"
             [ -z "$beschreibung" ] || desc2+="<p>$(html_escape "$beschreibung")</p>"
             desc2+="<p>Fingerabdruck: <code>$fp</code></p>"
@@ -1002,7 +1036,7 @@ create_todos() {
             else
                 fail "Anlegen von \"$title2\" fehlgeschlagen."; errors=$((errors + 1))
             fi
-        done <<<"$(jq -c 'select(.status == "offen")' "$FINDINGS_FILE")"
+        done <<<"$(jq -c 'select(.status == "offen" or .status == "bedingt")' "$FINDINGS_FILE")"
     fi
 
     # Behoben = der Check lief in diesem Lauf und ist PASS. SKIPPED oder ein

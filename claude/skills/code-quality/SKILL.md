@@ -430,6 +430,7 @@ Für die Einordnung der Script-Ergebnisse und die semantische Prüfung:
 7. Die semantischen Achsen → `references/semantic-review.md`
 8. Projektprofil (welche Achsen laufen) → `references/project-profile.md`
 9. Sicherheitswissen des Projekts → `references/security-knowledge.md`
+10. Sicherheitsmethodik und Fachreferenzen → `references/cf-security/`
 
 Nach einem gewöhnlichen Qualitätsfehler machst du weiter, solange die folgenden
 Prüfungen unabhängig und sicher bleiben. Du hältst nur an bei unerwarteten
@@ -476,6 +477,9 @@ Bleibt das Script-Urteil unverändert, schreibst du es einfach so hin.
 Die Stufen orientieren sich methodisch an
 [google/mantis](https://github.com/google/mantis) (Apache-2.0). Code Guard
 verwendet einen eigenen, rein statischen Ablauf.
+Methodik und Fachreferenzen aus
+[cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill) (MIT),
+unverändert unter `references/cf-security/`.
 
 `bin/code-guard --security-audit --project <projektverzeichnis>` führt eine
 Tiefenprüfung über das gesamte Projekt aus. Das Script ruft nacheinander sechs
@@ -490,17 +494,37 @@ Die Gegenprüfung folgt `references/semantic-review.md`; Funde folgen
 `references/security-knowledge.md`. Der Report enthält zu jedem Fund nur ID,
 Schwere und Datei:Zeile, Details bleiben in der lokal ignorierten
 `docs/security/findings.jsonl`.
+Das Projekt bestimmt die Fachreferenzen; der normale Ornith-Lauf nimmt höchstens
+drei, der große Scan weitere. Fehlt eine entscheidende Tatsache außerhalb des
+Codes, bleibt der Fund `bedingt` ohne Severity und erscheint unter „Offene
+Voraussetzungen“.
 
-Der optionale große Scan wird nur mit `--security-audit --deep` gestartet.
-Er verwendet standardmäßig Claude oder ausdrücklich `--agent codex`.
-Der normale Ornith-Lauf kostet vor allem lokale Rechenzeit; bei anderen
-Agenten richten sich die Kosten nach Modell und Tarif.
-Vor dem Start wird der Richtwert von ca. 1,4 Mio. Tokens und 45 Minuten
-angezeigt. Ein Plan mit mindestens 24 nummerierten, dateiübergreifenden
-Untersuchungsfragen wird in vier parallelen Such-Batches zu je sechs Fragen
-bearbeitet; jede Suche schreibt in eine eigene UUID-Datei. Danach laufen
-Dublettenprüfung und gründliche Gegenprüfung gegen den echten Code. Ein
-erschöpftes Codex-Kontingent beendet den Lauf mit Fehler statt Agentenwechsel.
+`--profile quick|standard|deep` steuert die Prüftiefe (`quick` ist Vorgabe).
+`--deep` ist ein Alias für `--profile deep`. Standard und Deep benötigen
+Claude oder Codex. Der Plan schreibt `03-ledger.json` mit mindestens acht
+Coverage-Einheiten. Vier Such-Batches bearbeiten die Einheiten; die neue
+Kritiker-Stufe schlägt übersehene Oberflächen vor. Deep prüft diese in genau
+einer zweiten Suchwelle, Standard stellt sie für den nächsten Lauf zurück.
+Der lokal ignorierte `docs/security/coverage-ledger.json` speichert Status,
+Quellhash und Datum. Unveränderte abgedeckte Einheiten bleiben sichtbar;
+geänderte oder offene Einheiten werden bevorzugt. Die Deep-Kostenschätzung
+beträgt ca. 1,4 Mio. Tokens und 45 Minuten bei bis zu elf Aufrufen pro Projekt.
+Ein erschöpftes Codex-Kontingent beendet den Lauf mit Fehler.
+
+`--engine cf` führt den vollständigen statischen Cloudflare-Ablauf mit Claude
+oder Codex in einem Agentenaufruf aus. Die lokalen Artefakte liegen unter
+`docs/.guard/security-audit/cf/run-N`; cf-Funde gehen danach durch die normale
+Gegenprüfungsvalidierung. Projektcode, Builds, Tests und Netzwerk sind im
+Audit ausgeschlossen; fehlende Sandbox-Fakten bleiben `bedingt`.
+
+Im monatlichen Turnus wählen `guard-weekly --security-audit
+--security-profile deep --agent claude` und `--security-engine cf` Profil und
+Engine. `bin/guard-security-all` verarbeitet eine Projektliste mit absoluten
+Pfaden (Vorgabe `~/.config/code-guard/projects.txt`). Beispiel-Crontab:
+
+```cron
+0 3 1 * * /pfad/zum/repo/claude/skills/code-quality/bin/guard-security-all --security-profile deep --agent claude >> /var/log/guard-security-all.log 2>&1
+```
 
 ## Der wöchentliche Turnus
 

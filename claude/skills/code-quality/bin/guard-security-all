@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Führt den monatlichen Sicherheits-Turnus für eine Projektliste aus.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WEEKLY="${GUARD_SECURITY_ALL_WEEKLY:-$SCRIPT_DIR/guard-weekly}"
+PROJECTS_FILE="${HOME}/.config/code-guard/projects.txt"
+DRY_RUN=0
+OPTIONS=()
+
+usage() {
+    cat <<'USAGE'
+guard-security-all [--projects FILE] [--dry-run] [guard-weekly-Optionen]
+
+Die Projektliste enthält je Zeile einen absoluten Pfad; # leitet einen Kommentar ein.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --projects) [ "$#" -ge 2 ] || { echo "--projects braucht eine Datei" >&2; exit 2; }; PROJECTS_FILE="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --security-audit|--project) echo "Option wird durch guard-security-all gesetzt: $1" >&2; exit 2 ;;
+        *) OPTIONS+=("$1"); shift ;;
+    esac
+done
+
+[ -f "$PROJECTS_FILE" ] || { echo "Projektliste fehlt: $PROJECTS_FILE" >&2; exit 2; }
+PROJECTS=()
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [ -n "$line" ] || continue
+    case "$line" in /*) PROJECTS+=("$line") ;; *) echo "Projektpfad muss absolut sein: $line" >&2; exit 2 ;; esac
+done < "$PROJECTS_FILE"
+
+FAILED=0
+RESULTS=()
+for project in "${PROJECTS[@]}"; do
+    command=("$WEEKLY" --project "$project" --security-audit "${OPTIONS[@]}")
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%q ' "${command[@]}"
+        printf '\n'
+        continue
+    fi
+    "${command[@]}"
+    code=$?
+    RESULTS+=("$project: Exit $code")
+    [ "$code" -eq 0 ] || FAILED=1
+done
+if [ "$DRY_RUN" -eq 0 ]; then
+    printf '%s\n' "${RESULTS[@]}"
+fi
+exit "$FAILED"

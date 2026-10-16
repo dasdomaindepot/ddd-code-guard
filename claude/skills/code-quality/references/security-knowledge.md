@@ -72,14 +72,20 @@ alter Pfad allein belegt noch keine Regression.
 Gleiches JSONL-Format. Ein Eintrag enthält mindestens:
 
 ```json
-{"fingerabdruck":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","status":"verworfen","datei":"src/Controller/ExportController.php","beschreibung":"Beobachteter Datenfluss und seine Sicherheitsfolge","begründung":"Der Datenfluss ist durch eine vorgeschaltete Berechtigungsprüfung geschützt."}
+{"fingerabdruck":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","status":"verworfen","datei":"src/Controller/ExportController.php","zeile":42,"beschreibung":"Beobachteter Datenfluss und seine Sicherheitsfolge","begründung":"Der Datenfluss ist durch eine vorgeschaltete Berechtigungsprüfung geschützt."}
 ```
 
 `fingerabdruck` ist eine stabile Kennung für denselben Befund, nicht für die
 Zeilennummer. `datei` ist ein relativer Projektpfad. `status` ist genau
-`offen`, `erledigt` oder `verworfen`. `beschreibung` hält den Fund nachvollziehbar
-fest. Bei `erledigt` nennt `begründung` die Behebung, bei `verworfen` den
-konkreten Grund für den Fehlalarm; bei `offen` darf sie fehlen. Ein Fund kann
+`offen`, `bedingt`, `erledigt` oder `verworfen`. `beschreibung` hält den Fund nachvollziehbar
+fest; `zeile` ist eine positive, bei offenen und bedingten Funden vorhandene
+Dateizeile. `offen` verlangt `severity` (`BLOCKER`, `HIGH`, `MEDIUM`, `LOW`)
+sowie `angreifer`, `grenze` und `wirkung`. `bedingt` hat keine Severity und
+verlangt `offene_voraussetzung`: die fehlende Tatsache außerhalb des Codes
+und eine gefahrlose Prüfung durch den Betreiber. Bei `erledigt` nennt
+`begründung` die Behebung, bei `verworfen` den konkreten Grund für den
+Fehlalarm. `belege` kann weitere projekt-relative `pfad:zeile`-Angaben enthalten.
+Fingerabdrücke sind innerhalb eines Laufs eindeutig. Ein Fund kann
 bei erneutem Auftreten mit demselben Fingerabdruck aktualisiert werden. Die
 Datei bleibt lokal, auch wenn sie nur scheinbar harmlose Details enthält.
 

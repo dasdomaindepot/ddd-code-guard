@@ -38,6 +38,12 @@ abgeschalteter CSRF-Schutz oder `flush()` ohne Validierung. Sie stehen unter
 
 ## Gegenprüfung von Sicherheitsbefunden
 
+Nach der Methodik in `references/cf-security/SKILL.md` braucht ein Fund einen
+Angreifer mit geringerem Vertrauen, eine akzeptierte Eingabe oder Aktion, die
+beabsichtigte Kontrolle, eine überschrittene Vertrauensgrenze, einen betroffenen
+Principal oder eine Ressource und ein konkretes Ergebnis. Fehlt eines davon,
+ist es kein Fund.
+
 Wende diese Regeln im Diff-Review auf jeden behaupteten Angriffsweg an; sie
 gelten ebenso für eine spätere Tiefenprüfung. Beginne bei der Rolle des
 Angreifers, nicht bei der gefährlich aussehenden Senke. Halte für den Fund und
@@ -67,6 +73,14 @@ bewertet werden, sofern dessen Wirkung belegt ist. Dokumentiere einen
 verworfenen Verdacht knapp mit dem entscheidenden Gegenbeleg, statt ihm eine
 Severity zu geben.
 
+**Nicht melden** (Quelle: `references/cf-security/SKILL.md`): bloße
+Checklistenabweichungen; zusätzliche Schutzschichten ohne erreichbare
+Grenzverletzung; Tests gegen Live- oder geteilte Systeme; vermutetes Proxy-,
+Provider-, Browser-, Identitäts- oder Deploymentverhalten; Auswirkungen nur
+auf denselben Principal; stärkere Folgen als beobachtet; unstrukturierte,
+nicht prüfbare Verdachte; unveränderte Altfunde als neue Funde; Severity für
+`bedingt`; Berichte vor Gegenprüfung oder mit Widerspruch zu den Funddaten.
+
 **Bedingt gültig:** Hängt die Wirkung von Produktionsdaten oder der
 Deploy-Konfiguration ab, benenne die fehlende Voraussetzung ausdrücklich und
 kennzeichne den Fund als „bedingt gültig“. Belege den Codepfad, unterscheide
@@ -92,6 +106,16 @@ nachgewiesene Wirkung.
 | `MEDIUM` | Begrenzte, aber konkrete Wirkung mit zusätzlichen Rechten, Nutzerinteraktion oder eng begrenztem Ziel. Ein unvalidierter typisierter Parameter zählt nur, wenn seine tatsächliche Wirkung gezeigt ist. |
 | `LOW` | Kleine, belegte Wirkung ohne weiterreichende Ausnutzung; offene Prüffragen bleiben ausdrücklich Vermutungen und zählen nicht als Sicherheitsnachweis. |
 
+Die Cloudflare-Anker (`references/cf-security/SKILL.md`) präzisieren dieses
+Raster: critical → `BLOCKER` (anonyme Codeausführung, voller Datenspeicherzugriff
+oder beliebige Kontoübernahme), high → `HIGH` (vollständige Umgehung einer
+wirksamen Sicherheitskontrolle), medium → `MEDIUM` (echte Grenzverletzung mit
+enger Wirkung oder seltenen Voraussetzungen), low → `LOW` (geringe belegte
+Wirkung), informational → `LOW` mit Hinweis „nur informativ“. Die Trennfrage
+zwischen `HIGH` und `MEDIUM` lautet: Hebt das belegte Ergebnis eine ausdrückliche
+Kontrolle für eine folgenschwere Aktion vollständig auf oder schwächt es sie
+nur? Die belegte Wirkung begrenzt die Severity.
+
 Für eine Kette bewerte jeden Übergang einzeln. Übernimm nicht die Severity der
 letzten Senke, wenn ein früherer Schritt nur unter engeren Rechten oder mit
 geringerer belegter Wirkung funktioniert: Die Gesamtkette darf nicht höher als
@@ -114,6 +138,18 @@ Werte, abgeleitete Werte mit Quelle, offen gebliebene Werte.
 
 ## Rückgriff auf Sicherheitswissen
 
+Bei sicherheitsrelevanten Diffs lies die passende Fachreferenz aus
+`references/cf-security/` im Beratungsmodus. Es folgt kein vollständiger
+Cloudflare-Ablauf und es entstehen keine zusätzlichen Artefakte:
+
+| Diff berührt | Fachreferenz |
+|---|---|
+| Authentifizierung, `security.yaml`, Voter, Controller-Routen | `WEB-PROTOCOL-AND-AUTH.md` |
+| Uploads | `WEB-PROTOCOL-AND-AUTH.md`, `DATA-ISOLATION-AND-LIFECYCLE.md` |
+| Webhooks, Messenger-Handler | `PROTOCOLS-RPC-AND-MESSAGING.md` |
+| Templates mit `\|raw` | `CLIENT-SIDE.md` |
+| Externe HTTP-Aufrufe | `WEB-PROTOCOL-AND-AUTH.md` |
+
 Liegt `docs/security/` im Projekt vor, lies die vorhandenen Dateien nach
 `references/security-knowledge.md`. Fehlt der Ordner oder eine einzelne Datei,
 läuft das normale Diff-Review ohne dieses Wissen weiter. Beziehe die Angaben
@@ -128,7 +164,7 @@ Dateien und neuer Aufrufpfade:
    Fehlerursache tatsächlich zurückbringt; nenne Fix-Commit und aktuelle
    Codezeile als Beleg.
 3. Vergleiche Funde aus der lokalen `findings.jsonl` anhand von Fingerabdruck,
-   Pfad und Ursache. `offen` und `erledigt` sind Prüfhinweise, keine automatischen
+   Pfad und Ursache. `offen`, `bedingt` und `erledigt` sind Prüfhinweise, keine automatischen
    Befunde. Bei `verworfen` prüfe die Begründung gegen den aktuellen Code:
    Trifft sie noch zu, melde denselben Fehlalarm nicht erneut. Bei geändertem
    Datenfluss oder entfallener Schutzmaßnahme prüfe den Fund neu.

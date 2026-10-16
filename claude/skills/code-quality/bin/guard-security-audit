@@ -11,6 +11,8 @@ import re
 import subprocess
 import sys
 import uuid
+from datetime import date
+import shutil
 
 
 STAGES = (
@@ -21,7 +23,9 @@ STAGES = (
     ("dubletten", "05-dubletten.json"),
     ("gegenpruefung", "06-gegenpruefung.json"),
 )
-ALLOWED = ("docs/.guard/", "docs/security/.gitignore", "docs/security/findings.jsonl", "docs/security/audit-report.md", "docs/quality-report.md")
+ALLOWED = ("docs/.guard/", "docs/security/.gitignore", "docs/security/findings.jsonl", "docs/security/coverage-ledger.json", "docs/security/audit-report.md", "docs/quality-report.md")
+CF_REFERENCES = Path(__file__).resolve().parents[1] / "references/cf-security"
+AI_PACKAGES = ("openai", "anthropic", "ollama", "llm", "gemini", "mistral")
 
 
 def git(project, *args):
@@ -47,41 +51,206 @@ def snapshot(project):
     return result
 
 
-def validate(stage, path):
+def companions(project, deep):
+    """Wählt Fachreferenzen in fester Reihenfolge nach Projektmerkmalen."""
+    has = lambda name: (project / name).exists()
+    package = has("package.json")
+    composer = has("composer.json")
+    names = ["ATTACK-CLASSES.md"]
+    if composer or package:
+        names += ["WEB-PROTOCOL-AND-AUTH.md", "DATA-ISOLATION-AND-LIFECYCLE.md"]
+    if has("templates") or has("assets") or package:
+        names.append("CLIENT-SIDE.md")
+    if any(has(name) for name in ("composer.lock", "package-lock.json", ".gitlab-ci.yml")):
+        names.append("SUPPLY-CHAIN-AND-RELEASE.md")
+    if (any(has(name) for name in ("Dockerfile", ".gitlab-ci.yml", "deploy")) or
+            any(project.glob("docker-compose*.yml")) or any(project.glob("compose*.yml"))):
+        names.append("CLOUD-AND-DEPLOYMENT.md")
+    if has("config/packages/messenger.yaml"):
+        names.append("PROTOCOLS-RPC-AND-MESSAGING.md")
+    for filename in ("composer.json", "package.json"):
+        if has(filename):
+            try:
+                data = json.loads((project / filename).read_text(encoding="utf-8"))
+                dependencies = {key for group in ("require", "require-dev", "dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+                                for key in data.get(group, {})}
+            except (OSError, ValueError, TypeError, AttributeError):
+                dependencies = set()
+            if any(term in key.lower() for key in dependencies for term in AI_PACKAGES):
+                names.append("AI-AND-LLM.md")
+                break
+    if deep:
+        names.append("RESOURCE-EXHAUSTION-AND-AVAILABILITY.md")
+    tracked = {os.fsdecode(path) for path in git(project, "ls-files", "-z").split(b"\0") if path}
+    if any(path.endswith((".c", ".cpp", ".rs")) or path == "go.mod" for path in tracked):
+        names.append("MEMORY-SAFETY-AND-BINARY.md")
+    if (any(path.endswith((".swift", ".kt")) for path in tracked) or
+            (package and "electron" in (project / "package.json").read_text(encoding="utf-8").lower())):
+        names.append("DESKTOP-MOBILE-AND-LOCAL-IPC.md")
+    return [CF_REFERENCES / name for name in (names if deep else names[:3])]
+
+
+def valid_relative(value):
+    """Prüft einen projekt-relativen Belegpfad."""
+    return (isinstance(value, str) and bool(value) and not Path(value).is_absolute() and
+            not any(part in ("", ".", "..") for part in value.split("/")) and
+            not re.search(r"[\x00-\x1f|\\]", value))
+
+
+def validate(stage, path, project=None):
     if not path.is_file() or not path.read_text(encoding="utf-8").strip():
         raise ValueError(f"Stufenergebnis fehlt: {stage}")
-    if stage not in ("suche", "dubletten", "gegenpruefung"):
+    if stage not in ("suche", "dubletten", "gegenpruefung", "plan-ledger", "kritik"):
         return
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError(f"Ungültiges Stufenergebnis: {stage} erwartet JSON-Liste")
+    if stage in ("plan-ledger", "kritik"):
+        validate_units(data, project, minimum=8 if stage == "plan-ledger" else 0)
+        return
     if stage == "gegenpruefung":
-        for finding in data:
+        seen = set()
+        for index, finding in enumerate(data, 1):
+            fingerprint = finding.get("fingerabdruck", "?") if isinstance(finding, dict) else "?"
+            def invalid(reason):
+                raise ValueError(f"Fund {index} ({fingerprint}): {reason}")
             if not isinstance(finding, dict):
-                raise ValueError("Ungültiger Sicherheitsfund")
+                invalid("Ungültiger Sicherheitsfund")
             required = ("fingerabdruck", "status", "datei", "zeile", "beschreibung")
             if any(not finding.get(key) for key in required):
-                raise ValueError("Sicherheitsfund ohne Pflichtfelder")
+                invalid("Sicherheitsfund ohne Pflichtfelder")
             if any(not isinstance(finding[key], str) for key in
                    ("fingerabdruck", "status", "datei", "beschreibung")):
-                raise ValueError("Ungültiger Sicherheitsfund")
+                invalid("Ungültiger Sicherheitsfund")
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", finding["fingerabdruck"]):
-                raise ValueError("Ungültiger Fundfingerabdruck")
-            if finding["status"] not in ("offen", "erledigt", "verworfen"):
-                raise ValueError("Ungültiger Fundstatus")
+                invalid("Ungültiger Fundfingerabdruck")
+            if fingerprint in seen:
+                invalid("Doppelter Fundfingerabdruck")
+            seen.add(fingerprint)
+            if finding["status"] not in ("offen", "bedingt", "erledigt", "verworfen"):
+                invalid("Ungültiger Fundstatus")
             if finding["status"] == "offen" and finding.get("severity") not in (
                 "BLOCKER", "HIGH", "MEDIUM", "LOW"
             ):
-                raise ValueError("Offener Fund ohne Severity")
-            if not isinstance(finding["zeile"], int) or finding["zeile"] < 1:
-                raise ValueError("Ungültige Fundzeile")
-            file_path = Path(finding["datei"])
-            if (file_path.is_absolute() or ".." in file_path.parts or
-                    re.search(r"[\x00-\x1f|]", finding["datei"])):
-                raise ValueError("Fundpfad muss projekt-relativ sein")
+                invalid("Offener Fund ohne Severity")
+            if finding["status"] == "offen" and any(not isinstance(finding.get(key), str) or
+                    not finding[key].strip() for key in ("angreifer", "grenze", "wirkung")):
+                invalid("Offener Fund ohne Angreifer, Grenze oder Wirkung")
+            if finding["status"] == "bedingt":
+                if "severity" in finding:
+                    invalid("Bedingter Fund darf keine Severity haben")
+                if not isinstance(finding.get("offene_voraussetzung"), str) or not finding["offene_voraussetzung"].strip():
+                    invalid("Bedingter Fund ohne offene Voraussetzung")
+            if finding["status"] in ("erledigt", "verworfen") and (
+                    not isinstance(finding.get("begründung"), str) or not finding["begründung"].strip()):
+                invalid("Abgeschlossener Fund ohne Begründung")
+            if type(finding["zeile"]) is not int or finding["zeile"] < 1:
+                invalid("Ungültige Fundzeile")
+            if not valid_relative(finding["datei"]):
+                invalid("Fundpfad muss projekt-relativ sein")
+            if project and finding["status"] in ("offen", "bedingt"):
+                target = project / finding["datei"]
+                if not target.is_file() or not target.resolve().is_relative_to(project.resolve()):
+                    invalid("Funddatei existiert nicht im Projekt")
+                with target.open("rb") as source:
+                    if finding["zeile"] > sum(1 for _ in source):
+                        invalid("Fundzeile liegt hinter Dateiende")
+            if "belege" in finding:
+                if not isinstance(finding["belege"], list) or any(
+                        not isinstance(item, str) or not re.fullmatch(r"(.+):([1-9][0-9]*)", item) or
+                        not valid_relative(item.rsplit(":", 1)[0]) for item in finding["belege"]):
+                    invalid("Ungültige Belege; erwartet projekt-relative Pfade mit Zeile")
 
 
-def prompt(stage, output, workspace):
+def validate_units(units, project, minimum=0, existing=()):
+    if not isinstance(units, list) or len(units) < minimum:
+        raise ValueError(f"Coverage-Ledger benötigt mindestens {minimum} Einheiten")
+    seen = set(existing)
+    for unit in units:
+        if not isinstance(unit, dict) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", str(unit.get("id", ""))):
+            raise ValueError("Ungültige Coverage-ID")
+        if unit["id"] in seen:
+            raise ValueError(f"Doppelte Coverage-ID: {unit['id']}")
+        seen.add(unit["id"])
+        if any(not isinstance(unit.get(key), str) or not unit[key].strip() for key in
+               ("oberflaeche", "grenze", "angriffsklasse")) or type(unit.get("prioritaet")) is not int or unit["prioritaet"] not in (1, 2, 3):
+            raise ValueError(f"Ungültige Coverage-Einheit: {unit['id']}")
+        files = unit.get("dateien")
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"Coverage-Einheit ohne Dateien: {unit['id']}")
+        for name in files:
+            if not valid_relative(name) or not (project / name).is_file() or not (project / name).resolve().is_relative_to(project.resolve()):
+                raise ValueError(f"Ungültige Coverage-Datei: {name}")
+
+
+def source_hash(project, files):
+    digest = hashlib.sha256()
+    for name in sorted(set(files)):
+        content = (project / name).read_bytes()
+        digest.update(len(name.encode()).to_bytes(8, "big") + name.encode())
+        digest.update(len(content).to_bytes(8, "big") + content)
+    return digest.hexdigest()
+
+
+def prepare_units(units, project, previous):
+    prior = {unit.get("id"): unit for unit in previous if isinstance(unit, dict)}
+    for unit in units:
+        unit["quellhash"] = source_hash(project, unit["dateien"])
+        old = prior.get(unit["id"], {})
+        same = old.get("quellhash") == unit["quellhash"]
+        if same and old.get("status") == "abgedeckt":
+            unit["prioritaet"] = 3
+        elif old and (not same or old.get("status") in ("offen", "blockiert", "zurückgestellt")):
+            unit["prioritaet"] = min(unit["prioritaet"], 2)
+        unit["status"] = "offen"
+        unit["letzter_lauf"] = date.today().isoformat()
+
+
+def search_batch(agent, project, workspace, baseline, selected, units, label):
+    output = workspace / f"{uuid.uuid4()}.json"
+    ids = [unit["id"] for unit in units]
+    message = prompt("suche", output, workspace, selected, True) + (
+        "\n\nBearbeite ausschließlich diese Coverage-Einheiten: " + json.dumps(units, ensure_ascii=False) +
+        '. Schreibe ein JSON-Objekt {"einheiten":[{"id":"...","status":"abgedeckt|kandidat|blockiert","begründung":"..."}],"kandidaten":[]}. '
+        "Jede bearbeitete ID genau einmal; ungelöste Einheiten auslassen."
+    )
+    code, details = call_agent(agent, label, project, output, message)
+    return output, ids, code, details
+
+
+def collect_batch(result, agent, project, ledger, candidates):
+    output, ids, code, details = result
+    check_agent_result(agent, "suche", code, details)
+    data = json.loads(output.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("einheiten"), list) or not isinstance(data.get("kandidaten"), list):
+        raise ValueError("Ungültiges Such-Batch-Ergebnis")
+    seen = set()
+    for item in data["einheiten"]:
+        if not isinstance(item, dict) or item.get("id") not in ids or item["id"] in seen or item.get("status") not in ("abgedeckt", "kandidat", "blockiert") or not isinstance(item.get("begründung"), str) or not item["begründung"].strip():
+            raise ValueError("Ungültige oder doppelte Coverage-ID im Such-Batch")
+        seen.add(item["id"])
+        ledger[item["id"]]["status"] = item["status"]
+    candidates.extend(data["kandidaten"])
+
+
+def ledger_search(agent, project, workspace, baseline, selected, units, wave=1):
+    ledger = {unit["id"]: unit for unit in units}
+    ordered = sorted(units, key=lambda unit: (unit["prioritaet"], unit["id"]))
+    groups = [ordered[i::4] for i in range(4)] if wave == 1 else [ordered]
+    jobs = [(group, f"suche-{i}" if wave == 1 else "suche-5") for i, group in enumerate(groups, 1) if group]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda job: search_batch(agent, project, workspace, baseline, selected, *job), jobs))
+    if snapshot(project) != baseline:
+        print("UNSAFE SIDE EFFECT nach Stufe suche", file=sys.stderr)
+        return 3, []
+    candidates = []
+    for result in results:
+        collect_batch(result, agent, project, ledger, candidates)
+        print("Stufe suche: vorhanden")
+    return 0, candidates
+
+
+def prompt(stage, output, workspace, selected=(), deep=False):
     references = Path(__file__).resolve().parents[1] / "references"
     common = (
         "Führe ausschließlich eine statische Sicherheitsprüfung des gesamten Projekts aus. "
@@ -99,12 +268,20 @@ def prompt(stage, output, workspace):
         "plan": "Plane konkrete statische Suchpfade über das gesamte Projekt anhand von Historie und Bedrohungsmodell. Nenne auch Migrationen und Altdaten. Keine Reproduktion.",
         "suche": "Suche entlang des Plans nach belegbaren Sicherheitsverdachten im gesamten Projekt. Schreibe eine JSON-Liste von Objekten; bei keinen Kandidaten []. Jeder Kandidat nennt Datei, Zeile und Codepfad.",
         "dubletten": "Führe Kandidaten mit derselben Ursache und Behebung zusammen. Schreibe eine JSON-Liste; bei keinen Kandidaten [].",
-        "gegenpruefung": f"Prüfe jeden Kandidaten nach {references / 'semantic-review.md'}, Abschnitt 'Gegenprüfung von Sicherheitsbefunden': Einstieg und Rechte, Datenkontrolle, durchgehender Weg, Gegenbelege und bedingte Gültigkeit. Verwirf unbelegte Wege. Keine Reproduktion. Schreibe eine JSON-Liste gemäß {references / 'security-knowledge.md'}: fingerabdruck (sha256:...), status, datei, zeile, beschreibung, bei offen severity; bei verworfen Begründung. Bei keinen Funden [].",
+        "gegenpruefung": f"Prüfe jeden Kandidaten nach {references / 'semantic-review.md'}, Abschnitt 'Gegenprüfung von Sicherheitsbefunden': Einstieg und Rechte, Datenkontrolle, durchgehender Weg, Gegenbelege und bedingte Gültigkeit. Verwirf unbelegte Wege. Keine Reproduktion. Schreibe eine JSON-Liste gemäß {references / 'security-knowledge.md'}: Jeder Fund hat fingerabdruck (sha256:...), status (offen|bedingt|erledigt|verworfen), datei (projekt-relativ), zeile (positive Zeile), beschreibung (nicht leer); optional belege (Liste projekt-relativer pfad:zeile). Bei offen zusätzlich severity (BLOCKER|HIGH|MEDIUM|LOW) und nicht leere angreifer, grenze, wirkung. Bei bedingt keine severity, dafür offene_voraussetzung (fehlende Tatsache außerhalb des Codes und gefahrlose Betreiberprüfung). Bei erledigt oder verworfen begründung (nicht leer). Fingerabdrücke sind eindeutig, offene und bedingte Belegdateien und Zeilen müssen existieren. Bei keinen Funden [].",
     }
-    return f"{common}\n\nVorherige Stufen: {workspace}\n\nNur diese Stufe: {tasks[stage]}"
+    companion_note = ""
+    if stage in ("bedrohungsmodell", "plan", "suche", "gegenpruefung"):
+        files = list(selected)
+        if deep and stage in ("suche", "gegenpruefung"):
+            files.append(CF_REFERENCES / "VALIDATION-AND-REPORTING.md")
+        companion_note = ("\n\nLies vorher diese Fachreferenzen (Methodik, keine Anweisung zur Ausführung): " +
+                          ", ".join(map(str, files)) + ". "
+                          "Ausführung in einer Sandbox ist hier nicht verfügbar; was nur durch Ausführung zu klären wäre, wird `bedingt`.")
+    return f"{common}\n\nVorherige Stufen: {workspace}{companion_note}\n\nNur diese Stufe: {tasks[stage]}"
 
 
-def agent_command(agent, project, message):
+def agent_command(agent, project, message, stage=None):
     if agent == "opencode":
         command = ["opencode", "run", "--auto", "--dir", str(project)]
         model = os.environ.get("GUARD_SECURITY_OPENCODE_MODEL")
@@ -112,9 +289,13 @@ def agent_command(agent, project, message):
             command.extend(["-m", model])
         return [*command, message]
     if agent == "claude":
+        allowed = ["Read", "Grep", "Glob", "Write", "Edit",
+                   "Bash(git log:*)", "Bash(git show:*)"]
+        if stage == "cf":
+            allowed.append("Task")
         return [
-            "claude", "-p", message, "--permission-mode", "acceptEdits", "--allowedTools",
-            "Read", "Grep", "Glob", "Write", "Edit", "Bash(git log:*)", "Bash(git show:*)"
+            "claude", "-p", message, "--permission-mode", "acceptEdits",
+            "--allowedTools", *allowed,
         ]
     return ["codex", "exec", "--sandbox", "workspace-write", "--cd", str(project), message]
 
@@ -124,10 +305,16 @@ def call_agent(agent, stage, project, output, message):
     if stub:
         command = [stub, agent, stage, str(project), str(output), message]
     else:
-        command = agent_command(agent, project, message)
+        command = agent_command(agent, project, message, stage)
+    if stage == "cf":
+        timeout = int(os.environ.get("GUARD_SECURITY_CF_TIMEOUT", "14400"))
+    else:
+        timeout = int(os.environ.get("GUARD_SECURITY_CALL_TIMEOUT", "1800"))
+    if timeout == 0:
+        timeout = None
     try:
         result = subprocess.run(command, cwd=project, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=1800)
+                                capture_output=True, text=True, timeout=timeout)
         return result.returncode, result.stdout + result.stderr
     except subprocess.TimeoutExpired:
         return 124, "Zeitlimit überschritten"
@@ -144,12 +331,12 @@ def check_agent_result(agent, stage, code, details):
     raise ValueError(f"Agentenaufruf für {stage} fehlgeschlagen (Exit {code})")
 
 
-def deep_search(agent, project, workspace, baseline):
+def deep_search(agent, project, workspace, baseline, selected):
     """Vier isolierte Suchaufrufe prüfen je sechs Untersuchungen aus dem Plan."""
     jobs = []
     for batch in range(1, 5):
         output = workspace / f"{uuid.uuid4()}.json"
-        message = prompt("suche", output, workspace) + (
+        message = prompt("suche", output, workspace, selected, True) + (
             f"\n\nGroßer Scan, Batch {batch}/4: Bearbeite ausschließlich die "
             f"Untersuchungen {(batch - 1) * 6 + 1} bis {batch * 6} aus 03-plan.md. "
             "Lies gezielt die betroffenen Dateien und ihre Aufrufketten, nicht "
@@ -189,7 +376,11 @@ def load_previous(finding_file):
             raise ValueError(f"Ungültiger gespeicherter Fund in Zeile {number}") from error
         if not isinstance(item, dict) or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", str(item.get("fingerabdruck", ""))
-        ) or item.get("status") not in ("offen", "erledigt", "verworfen"):
+        ) or item.get("status") not in ("offen", "bedingt", "erledigt", "verworfen"):
+            raise ValueError(f"Ungültiger gespeicherter Fund in Zeile {number}")
+        if item["status"] == "bedingt" and ("severity" in item or
+                not isinstance(item.get("offene_voraussetzung"), str) or
+                not item["offene_voraussetzung"].strip()):
             raise ValueError(f"Ungültiger gespeicherter Fund in Zeile {number}")
         previous[item["fingerabdruck"]] = item
     return previous
@@ -207,9 +398,13 @@ def merge_findings(previous, findings):
         existing = merged.get(fingerprint)
         if not existing:
             merged[fingerprint] = finding
-        elif existing.get("status") == "offen" and finding["status"] in ("erledigt", "verworfen"):
-            # Ein offener Fund darf ausdrücklich abgeschlossen werden.
+        elif existing.get("status") in ("offen", "bedingt") and finding["status"] != existing["status"]:
+            # Offene und bedingte Funde dürfen ihren Status wechseln.
             merged[fingerprint] = {**existing, **finding}
+            if finding["status"] != "offen":
+                merged[fingerprint].pop("severity", None)
+            if finding["status"] != "bedingt":
+                merged[fingerprint].pop("offene_voraussetzung", None)
         else:
             # Bereits erledigte oder verworfene Funde bleiben endgültig so.
             # Auch ein erneut offener Fund behält seine geprüften Metadaten.
@@ -217,26 +412,103 @@ def merge_findings(previous, findings):
     return list(merged.values())
 
 
-def write_results(project, findings, report_path="docs/quality-report.md"):
+def cf_to_findings(records):
+    findings = []
+    for record in records:
+        verdict = record["verdict"]
+        trace = record.get("trace") or []
+        evidence = record.get("evidence") or []
+        location = evidence[0] if evidence else trace[0]
+        fingerprint = record["fingerprint"]
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint):
+            fingerprint = "sha256:" + hashlib.sha256(fingerprint.encode()).hexdigest()
+        finding = {"fingerabdruck": fingerprint, "status": {
+            "confirmed": "offen", "needs_validation": "bedingt", "rejected": "verworfen"
+        }[verdict], "datei": location["file"], "zeile": location["line"],
+            "beschreibung": record["description"]}
+        if verdict == "confirmed":
+            finding.update(severity={"critical": "BLOCKER", "high": "HIGH", "medium": "MEDIUM",
+                                     "low": "LOW", "informational": "LOW"}[record["severity"]["overall_severity"]],
+                           angreifer=record["execution"]["attacker_perspective"],
+                           grenze=record["intended_behavior"],
+                           wirkung=record["execution"]["observed_result"])
+        elif verdict == "needs_validation":
+            finding["offene_voraussetzung"] = "; ".join(record["blockers"])
+        else:
+            finding["begründung"] = record["reason"]
+        findings.append(finding)
+    return findings
+
+
+def cf_run(agent, project, workspace, baseline, profile):
+    root = workspace / "cf"
+    root.mkdir(parents=True, exist_ok=True)
+    number = 1
+    while (root / f"run-{number}").exists():
+        number += 1
+    run = root / f"run-{number}"
+    run.mkdir()
+    prior = sorted(root.glob("run-*"))
+    prior = [path for path in prior if path != run]
+    message = (f"Lies {CF_REFERENCES / 'SKILL.md'} und führe Full audit mode mit Profil {profile} "
+               f"für {project} aus. Ausgabeverzeichnis: {run}. Frühere Läufe: " +
+               ", ".join(map(str, prior)) + ". Keine Ausführung von Projektcode, Builds oder Tests. "
+               "Die geforderte Sandbox gilt als nicht verfügbar; betroffene Fragen sind needs_validation. "
+               "Keine Netzwerkzugriffe. Schreibe findings.json und coverage-ledger.json in das Ausgabeverzeichnis.")
+    code, details = call_agent(agent, "cf", project, run / "findings.json", message)
+    if snapshot(project) != baseline:
+        print("UNSAFE SIDE EFFECT nach Stufe cf", file=sys.stderr)
+        return 3
+    check_agent_result(agent, "cf", code, details)
+    findings_file = run / "findings.json"
+    ledger_file = run / "coverage-ledger.json"
+    if not findings_file.is_file() or not ledger_file.is_file():
+        raise ValueError("cf-Ergebnis fehlt: findings.json oder coverage-ledger.json")
+    if shutil.which("node"):
+        for validator, path in (("validate-findings.cjs", findings_file), ("validate-coverage-ledger.cjs", ledger_file)):
+            checked = subprocess.run(["node", str(CF_REFERENCES / validator), str(path)], cwd=project,
+                                     capture_output=True, text=True)
+            if checked.returncode:
+                raise ValueError(f"cf-Validierung fehlgeschlagen: {validator}: {checked.stdout}{checked.stderr}")
+    else:
+        print("Hinweis: node fehlt; cf-Schemavalidierung übersprungen", flush=True)
+    findings = cf_to_findings(json.loads(findings_file.read_text(encoding="utf-8")))
+    adapted = workspace / "06-gegenpruefung.json"
+    adapted.write_text(json.dumps(findings, ensure_ascii=False) + "\n", encoding="utf-8")
+    validate("gegenpruefung", adapted, project)
+    return findings
+
+
+def write_results(project, findings, report_path="docs/quality-report.md", ledger=None):
     finding_file = project / "docs/security/findings.jsonl"
     report_file = project / report_path
     merged = merge_findings(load_previous(finding_file), findings)
     finding_file.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in merged), encoding="utf-8")
     opened = [item for item in merged if item["status"] == "offen"]
+    conditional = [item for item in merged if item["status"] == "bedingt"]
     verdict = "RED" if any(item["severity"] in ("BLOCKER", "HIGH") for item in opened) else (
-        "YELLOW" if opened else "GREEN"
+        "YELLOW" if opened or conditional else "GREEN"
     )
     lines = [
         "# Qualitäts-Report — Sicherheits-Audit", "", f"**Verdikt:** {verdict}",
         "**Prüfung:** Statischer Sicherheits-Tiefenscan über das gesamte Projekt", "",
-        "## Übersicht", "", f"{len(opened)} offene Sicherheitsfunde nach Gegenprüfung.", "",
+        "## Übersicht", "", f"{len(opened)} offene und {len(conditional)} bedingte Sicherheitsfunde nach Gegenprüfung.", "",
         "## Sicherheitsfunde", "", "| ID | Schwere | Beleg |", "|---|---|---|",
     ]
     for finding in opened:
         identifier = finding["fingerabdruck"]
         location = f"{finding['datei']}:{finding['zeile']}"
         lines.append(f"| {identifier} | {finding['severity']} | {location} |")
+    lines.extend(["", "## Offene Voraussetzungen", "", "| ID | Beleg |", "|---|---|"])
+    for finding in conditional:
+        lines.append(f"| {finding['fingerabdruck']} | {finding['datei']}:{finding['zeile']} |")
     lines.extend(["", "Details: `docs/security/findings.jsonl` (lokal).", ""])
+    if ledger is not None:
+        lines.extend(["## Abdeckung", ""])
+        for status in ("abgedeckt", "kandidat", "blockiert", "offen", "zurückgestellt"):
+            ids = sorted(unit["id"] for unit in ledger if unit["status"] == status)
+            lines.append(f"- {status}: {len(ids)}" + (f" ({', '.join(ids)})" if ids else ""))
+        lines.extend(["", "Ein Lauf deckt das Projekt nie vollständig ab; offene und zurückgestellte Einheiten folgen im nächsten Lauf.", ""])
     report_file.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -245,54 +517,108 @@ def main():
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--agent", choices=("opencode", "claude", "codex"))
     parser.add_argument("--deep", action="store_true")
+    parser.add_argument("--profile", choices=("quick", "standard", "deep"), default="quick")
+    parser.add_argument("--engine", choices=("guard", "cf"), default="guard")
     parser.add_argument("--weekly-report", action="store_true",
                         help="Separater Report für den monatlichen Turnus")
     args = parser.parse_args()
-    if args.deep and args.agent == "opencode":
-        parser.error("--deep unterstützt nur claude oder codex")
-    args.agent = args.agent or ("claude" if args.deep else "opencode")
+    if args.deep:
+        args.profile = "deep"
+    if args.profile != "quick" and args.agent == "opencode":
+        parser.error("standard/deep unterstützt nur claude oder codex")
+    if args.engine == "cf" and args.agent == "opencode":
+        parser.error("cf unterstützt nur claude oder codex")
+    args.agent = args.agent or ("claude" if args.profile != "quick" or args.engine == "cf" else "opencode")
     project = args.project.resolve()
     workspace = project / "docs/.guard/security-audit"
     try:
         git(project, "rev-parse", "--show-toplevel")
-        if git(project, "ls-files", "--", "docs/security/findings.jsonl").strip():
-            raise ValueError("docs/security/findings.jsonl ist versioniert")
-        if subprocess.run(["git", "check-ignore", "-q", "docs/security/findings.jsonl"], cwd=project).returncode:
-            ignore_file = project / "docs/security/.gitignore"
-            ignore_file.parent.mkdir(parents=True, exist_ok=True)
-            existed = ignore_file.exists()
-            previous = ignore_file.read_text(encoding="utf-8") if existed else ""
-            ignore_file.write_text(previous + ("\n" if previous and not previous.endswith("\n") else "") +
-                                   "findings.jsonl\n", encoding="utf-8")
-            action = "ergänzt" if existed else "angelegt"
-            print(f"docs/security/.gitignore {action}: findings.jsonl wird lokal ignoriert")
+        for name in ("findings.jsonl", "coverage-ledger.json"):
+            relative = f"docs/security/{name}"
+            if git(project, "ls-files", "--", relative).strip():
+                raise ValueError(f"{relative} ist versioniert")
+            if subprocess.run(["git", "check-ignore", "-q", relative], cwd=project).returncode:
+                ignore_file = project / "docs/security/.gitignore"
+                ignore_file.parent.mkdir(parents=True, exist_ok=True)
+                existed = ignore_file.exists()
+                previous = ignore_file.read_text(encoding="utf-8") if existed else ""
+                ignore_file.write_text(previous + ("\n" if previous and not previous.endswith("\n") else "") + name + "\n", encoding="utf-8")
+                print(f"docs/security/.gitignore {'ergänzt' if existed else 'angelegt'}: {name} wird lokal ignoriert")
         baseline = snapshot(project)
+        selected = companions(project, args.profile == "deep")
+        print("Fachreferenzen: " + ", ".join(path.name for path in selected), flush=True)
         workspace.mkdir(parents=True, exist_ok=True)
         (project / "docs/.guard/.gitignore").write_text("*\n", encoding="utf-8")
-        if args.deep:
-            print("Kostenschätzung für --deep: ca. 1,4 Mio. Tokens und 45 Minuten "
+        if args.profile == "deep":
+            print("Kostenschätzung für --deep: bis zu 11 Aufrufe, ca. 1,4 Mio. Tokens und 45 Minuten "
                   "für ein mittleres Projekt; tatsächlicher Verbrauch kann abweichen.", flush=True)
             if args.agent == "codex":
                 print("Codex-Kontingent vor dem Start prüfen; bei Erschöpfung bricht der Lauf ab.",
                       flush=True)
+        if args.engine == "cf":
+            findings = cf_run(args.agent, project, workspace, baseline, args.profile)
+            if findings == 3:
+                return 3
+            write_results(project, findings, "docs/security/audit-report.md" if args.weekly_report else "docs/quality-report.md")
+            print(f"Sicherheits-Audit abgeschlossen: {len(findings)} geprüfte Funde")
+            return 0
+        ledger = None
+        ledger_file = project / "docs/security/coverage-ledger.json"
+        previous = (json.loads(ledger_file.read_text(encoding="utf-8"))
+                    if args.profile != "quick" and ledger_file.is_file() else [])
+        if not isinstance(previous, list):
+            raise ValueError("Ungültiger vorheriger Coverage-Ledger")
         for stage, filename in STAGES:
             output = workspace / filename
             output.unlink(missing_ok=True)
-            if args.deep and stage == "suche":
-                result = deep_search(args.agent, project, workspace, baseline)
+            if args.profile != "quick" and stage == "suche":
+                result, candidates = ledger_search(args.agent, project, workspace, baseline, selected, ledger)
                 if result:
                     return result
+                (workspace / filename).write_text(json.dumps(candidates, ensure_ascii=False) + "\n", encoding="utf-8")
+                criticism = workspace / "05a-kritik.json"
+                criticism.unlink(missing_ok=True)
+                message = (f"Lies {workspace / '02-bedrohungsmodell.md'}, {workspace / '03-ledger.json'} "
+                           f"und {CF_REFERENCES / 'HUNTING.md'} (Coverage-Critic-Wellen). "
+                           f"Suche statisch nach übersehenen Oberflächen. Schreibe neue Coverage-Einheiten "
+                           f"im selben Schema als JSON-Liste nach {criticism}; falls keine fehlen: []. "
+                           "Keinen Projektcode ausführen, keine Netzwerkzugriffe.")
+                code, details = call_agent(args.agent, "kritik", project, criticism, message)
+                if snapshot(project) != baseline:
+                    print("UNSAFE SIDE EFFECT nach Stufe kritik", file=sys.stderr)
+                    return 3
+                check_agent_result(args.agent, "kritik", code, details)
+                validate("kritik", criticism, project)
+                extra = json.loads(criticism.read_text(encoding="utf-8"))
+                validate_units(extra, project, existing=(unit["id"] for unit in ledger))
+                prepare_units(extra, project, previous)
+                ledger.extend(extra)
+                if args.profile == "deep" and extra:
+                    result, more = ledger_search(args.agent, project, workspace, baseline, selected, extra, wave=2)
+                    if result:
+                        return result
+                    for unit in extra:
+                        if unit["status"] == "offen":
+                            unit["status"] = "zurückgestellt"
+                    candidates.extend(more)
+                    (workspace / filename).write_text(json.dumps(candidates, ensure_ascii=False) + "\n", encoding="utf-8")
+                elif extra:
+                    for unit in extra:
+                        unit["status"] = "zurückgestellt"
+                print("Stufe kritik: vorhanden")
                 continue
-            message = prompt(stage, output, workspace)
-            if args.deep and stage == "plan":
-                message += (
-                    "\n\nGroßer Scan: Schreibe mindestens 24 nummerierte, konkrete "
-                    "Untersuchungsfragen (1 bis 24), verteilt auf vier Gruppen zu "
-                    "je sechs. Jede Frage benennt Einstieg, Datenfluss oder "
-                    "Vertrauensgrenze und die über mehrere Dateien zu prüfenden "
-                    "Aufrufketten. Plane gezielte Lesezugriffe statt ganze Dateien."
+            message = prompt(stage, output, workspace, selected, args.profile != "quick")
+            if args.profile != "quick" and stage == "plan":
+                message = message.replace(
+                    "Ändere keine Projektdatei außer der angegebenen Ausgabedatei.",
+                    "Schreibe ausschließlich die angegebenen Ausgabedateien 03-plan.md und 03-ledger.json."
                 )
-            if args.deep and stage == "gegenpruefung":
+                message += (f"\n\nSchreibe zusätzlich {workspace / '03-ledger.json'} als JSON-Liste mit mindestens 8 "
+                            'Coverage-Einheiten: {"id","oberflaeche","grenze","angriffsklasse","dateien":[...],"prioritaet":1..3}. '
+                            f"Vorheriger Ledger: {ledger_file if ledger_file.is_file() else 'keiner'}. "
+                            "Unverändert abgedeckte Einheiten sichtbar halten; geänderte und offene erneut planen. "
+                            f"Lies {CF_REFERENCES / 'RECONNAISSANCE.md'} (Coverage-Einheiten).")
+            if args.profile == "deep" and stage == "gegenpruefung":
                 message += (
                     "\n\nGroßer Scan: Prüfe jeden Fund gründlich gegen den echten "
                     "Code über alle betroffenen Dateien und dokumentiere "
@@ -303,17 +629,21 @@ def main():
                 print(f"UNSAFE SIDE EFFECT nach Stufe {stage}", file=sys.stderr)
                 return 3
             check_agent_result(args.agent, stage, code, details)
-            validate(stage, output)
-            if args.deep and stage == "plan":
-                numbers = set(map(int, re.findall(r"(?m)^\s*(\d{1,2})[.)]\s+", output.read_text(encoding="utf-8"))))
-                if not set(range(1, 25)).issubset(numbers):
-                    raise ValueError("Großer Scan benötigt 24 nummerierte Untersuchungen im Plan")
+            validate(stage, output, project)
+            if args.profile != "quick" and stage == "plan":
+                planned = workspace / "03-ledger.json"
+                validate("plan-ledger", planned, project)
+                ledger = json.loads(planned.read_text(encoding="utf-8"))
+                prepare_units(ledger, project, previous)
+                planned.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             print(f"Stufe {stage}: vorhanden")
         findings = json.loads((workspace / STAGES[-1][1]).read_text(encoding="utf-8"))
-        write_results(project, findings, "docs/security/audit-report.md" if args.weekly_report else "docs/quality-report.md")
+        write_results(project, findings, "docs/security/audit-report.md" if args.weekly_report else "docs/quality-report.md", ledger)
+        if ledger is not None:
+            ledger_file.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"Sicherheits-Audit abgeschlossen: {len(findings)} geprüfte Funde")
         return 0
-    except (OSError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError, KeyError, TypeError) as error:
         print(f"Sicherheits-Audit abgebrochen: {error}", file=sys.stderr)
         return 2
 

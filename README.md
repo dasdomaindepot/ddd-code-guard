@@ -125,6 +125,10 @@ did not start (`--boot`).
 Die Stufen orientieren sich methodisch an
 [google/mantis](https://github.com/google/mantis) (Apache-2.0). Code Guard
 verwendet dafür einen eigenen, rein statischen Ablauf.
+Methodik und Fachreferenzen aus
+[cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill) (MIT),
+unverändert unter `references/cf-security/`. Passende Fachreferenzen werden je
+Projekt ausgewählt; im normalen Lauf höchstens drei, mit `--deep` auch weitere.
 
 `code-guard --security-audit --project DIR` prüft das gesamte Projekt in sechs
 getrennten Agentenstufen: Historie, Bedrohungsmodell, Plan, Suche, Dubletten und
@@ -140,23 +144,49 @@ muss eine Ausgabedatei unter `docs/.guard/security-audit/` liefern, sonst bricht
 der Lauf ab. Der öffentliche Report unter `docs/quality-report.md` enthält zu Funden
 nur ID, Schwere und Datei:Zeile. Details stehen lokal in
 `docs/security/findings.jsonl`; diese Datei muss im Projekt ignoriert sein.
+Bei einer noch offenen Voraussetzung außerhalb des Codes erhält der Fund den
+Status `bedingt` ohne Severity. Der Report zeigt solche Funde unter „Offene
+Voraussetzungen“ und bleibt mindestens YELLOW.
 
 Für Tests ersetzt `GUARD_SECURITY_AGENT_STUB` den Modellaufruf durch ein
 ausführbares Testprogramm. Es erhält Agent, Stufe, Projektpfad, Ausgabepfad und
-Prompt als fünf Argumente.
+Prompt als fünf Argumente. Die Zeitgrenzen je Agentenaufruf steuern die
+Umgebungsvariablen `GUARD_SECURITY_CALL_TIMEOUT` (Vorgabe 1800 Sekunden für alle
+Stufen außer dem cf-Engine) und `GUARD_SECURITY_CF_TIMEOUT` (Vorgabe
+14400 Sekunden für den cf-Engine); ein Wert von 0 lässt den Lauf unbegrenzt
+laufen.
 
-`code-guard --security-audit --deep` startet den großen Scan ausdrücklich.
-Vorgabe ist Claude; `--deep --agent codex` nutzt Codex. Ornith ist im
-Deep-Modus nicht zulässig. Der normale Ornith-Lauf beansprucht vor allem lokale
-Rechenzeit; bei anderen Agenten hängen die Kosten vom gewählten Modell und Tarif
-ab. Vor dem ersten Modellaufruf im Deep-Modus erscheint eine
-Kostenschätzung von etwa 1,4 Mio. Tokens und 45 Minuten für ein mittleres
-Projekt. Der Plan muss 24 nummerierte Untersuchungsfragen über mehrere
-Dateien enthalten. Vier parallele Such-Batches bearbeiten jeweils sechs
-Fragen und schreiben in eigene UUID-Dateien unter
-`docs/.guard/security-audit/`; danach werden die Kandidaten gemeinsam auf
-Dubletten und gegen den echten Code geprüft. Bei erschöpftem Codex-Kontingent
-bricht der Lauf mit Fehlermeldung und Exit-Code 2 ab.
+`--profile quick|standard|deep` wählt die Prüftiefe; `quick` ist die Vorgabe
+mit sechs Stufen und Ornith. `standard` und `deep` verwenden Claude oder Codex.
+`--deep` ist ein Alias für `--profile deep`. Der Plan schreibt einen
+Coverage-Ledger mit mindestens acht Einheiten. Vier Such-Batches prüfen die
+Einheiten, ein Kritiker ergänzt übersehene Oberflächen. `deep` bearbeitet neue
+Einheiten in genau einer weiteren Suchwelle; `standard` stellt sie zurück.
+Der lokale Ledger `docs/security/coverage-ledger.json` speichert Status,
+Quellhash und Laufdatum. Unveränderte abgedeckte Einheiten bleiben sichtbar,
+geänderte und offene Einheiten erhalten Vorrang. Der öffentliche Report nennt
+nur Abdeckungs-IDs und Zähler. Deep kostet für ein mittleres Projekt ungefähr
+1,4 Mio. Tokens und 45 Minuten bei bis zu elf Agentenaufrufen. Ein erschöpftes
+Codex-Kontingent beendet den Lauf mit Exit 2.
+
+`--engine cf` startet den vollständigen Ablauf der unveränderten
+Cloudflare-Referenz in einem Agentenaufruf. Ergebnisse liegen lokal unter
+`docs/.guard/security-audit/cf/run-N`; die öffentlichen Funde werden über
+denselben Gegenprüfungs- und Reportweg übernommen. Die Engine benötigt Claude
+oder Codex. Projektcode, Builds, Tests und Netzwerkzugriffe sind im Audit
+untersagt; fehlende Sandbox-Belege bleiben `bedingt`.
+
+Der monatliche Sicherheits-Turnus akzeptiert `--security-profile` und
+`--security-engine`. Für einen Deep-Lauf über mehrere Projekte führt
+`bin/guard-security-all` eine Liste absoluter Pfade nacheinander aus
+(Vorgabe `~/.config/code-guard/projects.txt`). Beispiel-Crontab:
+
+```cron
+0 3 1 * * /pfad/zum/repo/claude/skills/code-quality/bin/guard-security-all --security-profile deep --agent claude >> /var/log/guard-security-all.log 2>&1
+```
+
+`--dry-run` zeigt die geplanten Aufrufe. Ein Projektfehler stoppt die weiteren
+Projekte nicht; die Zusammenfassung enthält jeden Exit-Code.
 
 #### Weekly run
 
