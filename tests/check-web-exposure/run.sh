@@ -10,6 +10,7 @@
 # sonst eine Meldung und Exit 1.
 
 set -euo pipefail
+python3 "$(dirname "${BASH_SOURCE[0]}")/../profile-exceptions.py" web-exposure
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "$HERE/../.." && pwd)"
@@ -122,7 +123,8 @@ expect_not "wird ausgeliefert"
 port="$(start_server "debug")"
 run_script "http://127.0.0.1:$port"
 expect 1 "Debug-Modus"
-expect_not "zeigt einen Stacktrace"
+expect 1 "nur im Dev-Modus, prod zeigt die normale Fehlerseite"
+expect_not "BEFUND   Fehlerseite zeigt einen Stacktrace"
 
 # --- cookies: fehlende Flags -----------------------------------------------
 port="$(start_server "cookies")"

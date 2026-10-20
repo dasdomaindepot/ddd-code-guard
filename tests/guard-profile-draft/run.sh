@@ -83,6 +83,29 @@ else
     bad "leer: Ausgabe nicht YAML-parsebar"
 fi
 
+# --- internes Werkzeug: ausschließlich OIDC, Startseite geschützt --------
+INTERN_DIR="$(mktemp -d)"
+mkdir -p "$INTERN_DIR/config/packages"
+cat > "$INTERN_DIR/config/packages/security.yaml" <<'YAML'
+security:
+  firewalls:
+    main:
+      custom_authenticators: [App\Security\OidcAuthenticator]
+  access_control:
+    - { path: '^/', roles: ROLE_USER }
+YAML
+INTERN="$(python3 "$SCRIPT" "$INTERN_DIR")"
+contains "$INTERN" "projekt_art: intern" "intern: OIDC und geschützte Startseite"
+cat > "$INTERN_DIR/config/packages/security.yaml" <<'YAML'
+security:
+  firewalls:
+    main:
+      custom_authenticators: [App\Security\OidcAuthenticator]
+YAML
+UNSICHER="$(python3 "$SCRIPT" "$INTERN_DIR")"
+contains "$UNSICHER" "intern hinter SSO möglich" "intern: ohne Schutzbeleg nur Kommentar"
+rm -rf "$INTERN_DIR"
+
 # --- Nutzungsfehler -------------------------------------------------------
 
 python3 "$SCRIPT" eine zwei >/dev/null 2>&1; RC=$?

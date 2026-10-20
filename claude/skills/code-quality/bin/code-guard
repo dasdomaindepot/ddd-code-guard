@@ -19,7 +19,7 @@
 #
 set -uo pipefail
 
-VERSION="1.27.0"
+VERSION="1.28.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Der Tiefenscan hat einen eigenen, rein statischen Ablauf und verwendet keine
@@ -419,9 +419,9 @@ CHECK_DEFS=(
   "npm-build|Asset-Build|frontend|expensive|npm run build|npm:build"
   "web-hardening|Web-Haertung|security|normal|$SCRIPT_DIR/check-web-hardening $WEB_URL|web-url"
   "legal|Rechtstexte|legal|normal|$SCRIPT_DIR/check-legal $WEB_URL|web-url,bin:python3"
-  "web-exposure|Angriffsflaeche|security|normal|$SCRIPT_DIR/check-web-exposure $WEB_URL|web-url,bin:python3"
-  "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL|web-url,bin:python3"
-  "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL|web-url,bin:python3"
+  "web-exposure|Angriffsflaeche|security|normal|$SCRIPT_DIR/check-web-exposure $WEB_URL .|web-url,bin:python3"
+  "web-content|Seiteninhalt|frontend|normal|$SCRIPT_DIR/check-web-content $WEB_URL .|web-url,bin:python3"
+  "form-protection|Formularschutz|security|normal|$SCRIPT_DIR/check-form-protection $WEB_URL .|web-url,bin:python3"
   "favicon|Favicons|frontend|normal|$SCRIPT_DIR/check-favicon $WEB_URL|web-url,bin:python3"
   "web-resources|Links und Bilder|frontend|normal|$SCRIPT_DIR/check-web-resources $WEB_URL|web-url,bin:python3"
   "third-party|Drittanbieter|legal|normal|$SCRIPT_DIR/check-third-party $WEB_URL .|web-url,bin:python3"

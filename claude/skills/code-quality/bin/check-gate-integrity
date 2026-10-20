@@ -45,6 +45,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from guard_profile import Profile
+
 PHPS_CONFIGS = ("phpstan.neon", "phpstan.neon.dist", "phpstan.dist.neon")
 PHPCS_CONFIGS = (".phpcs.xml", "phpcs.xml", ".phpcs.xml.dist", "phpcs.xml.dist")
 PHPUNIT_CONFIGS = ("phpunit.xml", "phpunit.xml.dist", "phpunit.dist.xml")
@@ -79,6 +82,8 @@ G8_PATTERNS = (
 
 # (Typ, Meldung). „finding" wird als Befund ausgegeben, „ok"/"hint" als Hinweis.
 results = []
+profile = Profile("", "gate-integrity")
+exception_targets = {}
 
 
 
@@ -297,7 +302,12 @@ def part_g3(rel: str, before: str, after: str) -> None:
     be = phpcs_excludes(before)
     ae = phpcs_excludes(after)
     if ae > be:
-        finding(f"{rel}: {ae} exclude-Pattern/-sniffs (vorher {be})")
+        message = f"{rel}: {ae} exclude-Pattern/-sniffs (vorher {be})"
+        finding(message)
+        old = set(re.findall(r"<exclude-pattern[^>]*>([^<]+)</exclude-pattern>", before))
+        new = set(re.findall(r"<exclude-pattern[^>]*>([^<]+)</exclude-pattern>", after))
+        targets = new - old
+        exception_targets[_rid() + message] = sorted(targets) if targets else [rel]
     br = len(re.findall(r"<rule ref=", before))
     ar = len(re.findall(r"<rule ref=", after))
     if br > ar:
@@ -491,7 +501,9 @@ def main() -> int:
         )
         return 2
 
+    global profile
     project = os.path.abspath(sys.argv[1])
+    profile = Profile(project, "gate-integrity")
     basis = sys.argv[2]
 
     if not os.path.isdir(project):
@@ -531,7 +543,10 @@ def main() -> int:
             break
 
     items = collect_changed(project, base)
+    invalid = profile.initial()
     if not items:
+        if invalid:
+            return 1
         print(f"ok       keine Änderungen gegenüber {basis}")
         return 0
 
@@ -560,7 +575,7 @@ def main() -> int:
         if name.lower() == "makefile":
             part_g7(path, after, added)
 
-    nfind = sum(1 for t, _ in results if t == "finding")
+    nfind = invalid
 
     if exception_line is not None:
         print(f"Hinweis  Guard-Ausnahme gefunden: {exception_line}")
@@ -571,10 +586,26 @@ def main() -> int:
                 print(f"ok       {msg}")
             else:
                 print(f"Hinweis  {msg}")
-        return 0
+        return 1 if invalid else 0
 
     for typ, msg in results:
         if typ == "finding":
+            match = re.match(r"\[gate-integrity/(G[1-8])\] ([^:]+):", msg)
+            key = match.group(1) if match else ""
+            targets = exception_targets.get(msg, [match.group(2) if match else ""])
+            reasons = []
+            expired = []
+            for target in targets:
+                reason, notes = profile.decide(key, target)
+                if reason:
+                    reasons.append(reason)
+                expired.extend(notes)
+            for note_text in set(expired):
+                print(f"Hinweis  {note_text}")
+            if reasons and len(reasons) == len(targets):
+                print(f"Hinweis  bewusst ausgenommen: {msg} — Grund: {reasons[0]}")
+                continue
+            nfind += 1
             print(f"BEFUND   {msg}")
         elif typ == "ok":
             print(f"ok       {msg}")

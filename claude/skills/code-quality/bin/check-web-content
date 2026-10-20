@@ -46,6 +46,9 @@ import os
 import re
 import ssl
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from guard_profile import Profile, is_dev
 from html.parser import HTMLParser
 import urllib.error
 import urllib.parse
@@ -60,6 +63,9 @@ VOID_ELEMENTS = {"img", "input", "br", "meta", "link", "hr", "source", "area", "
 IGNORE_TAGS = {"script", "style", "template", "noscript"}
 
 findings = 0
+profile = Profile("", "web-content")
+page_dev = False
+last_dev = False
 MAX_PAGES = 50
 try:
     MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
@@ -67,10 +73,23 @@ except (TypeError, ValueError):
     MAX_PAGES = 50
 
 
-def finding(msg: str) -> None:
+def finding(msg: str, key="", path="") -> None:
     global findings
-    findings += 1
-    print(f"BEFUND   {msg}")
+    if profile.project_supplied:
+        msg = f"[web-content/{key}] {msg}"
+    reason, expired = profile.decide(key, path, page_dev)
+    for note in expired:
+        hint(note)
+    if reason:
+        hint(f"bewusst ausgenommen: {msg} — Grund: {reason}")
+    elif profile.art == "intern" and key in SEO_KEYS and not expired:
+        hint(f"{msg} — entfällt bei projekt_art: intern")
+    else:
+        findings += 1
+        print(f"BEFUND   {msg}")
+
+
+SEO_KEYS = {"meta-description", "canonical", "h1", "title-unique", "description-unique"}
 
 
 def ok(msg: str) -> None:
@@ -84,8 +103,11 @@ def hint(msg: str) -> None:
 def fetch(url: str) -> tuple[int, str, str]:
     """(Status, Content-Type, Body). Folgt Weiterleitungen."""
     req = urllib.request.Request(url, headers={"User-Agent": "code-guard-web-content"})
+    global last_dev
+    last_dev = False
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT, context=CTX) as r:
+            last_dev = is_dev(r.headers.items())
             ct = r.headers.get("Content-Type", "")
             return r.status, ct, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
@@ -417,10 +439,10 @@ def _examples(items, limit=5) -> str:
 def check_page(path: str, p: PageParser, raw: str = "", https: bool = False) -> None:
     # 1. lang
     if p.lang is None or not p.lang.strip():
-        finding(f"{path}: <html> ohne lang-Attribut")
+        finding(f"{path}: <html> ohne lang-Attribut", "lang", path)
     # 2. title
     if not p.has_title or not p.title_text.strip():
-        finding(f"{path}: <title> fehlt oder ist leer")
+        finding(f"{path}: <title> fehlt oder ist leer", "title", path)
     # 3./4. Nur für indexierbare Seiten: Eine Seite mit <meta name="robots"
     # content="noindex"> (Login, interne App) braucht weder Description noch
     # Canonical. Der X-Robots-Tag-Header zählt bewusst nicht — Symfony setzt ihn
@@ -429,34 +451,34 @@ def check_page(path: str, p: PageParser, raw: str = "", https: bool = False) -> 
         pass
     # 3. description
     elif not p.has_meta_description or not (p.meta_description_content or "").strip():
-        finding(f'{path}: <meta name="description"> fehlt oder ist leer')
+        finding(f'{path}: <meta name="description"> fehlt oder ist leer', "meta-description", path)
     # 4. canonical
     if not p.noindex and (not p.has_canonical or not (p.canonical_href or "").strip()):
-        finding(f'{path}: <link rel="canonical"> fehlt')
+        finding(f'{path}: <link rel="canonical"> fehlt', "canonical", path)
     # 5. viewport
     if not p.has_viewport:
-        finding(f'{path}: <meta name="viewport"> fehlt')
+        finding(f'{path}: <meta name="viewport"> fehlt', "viewport", path)
     # 6. Zoom
     elif zoom_text(p.viewport_content or ""):
-        finding(f"{path}: viewport verbietet das Zoomen {zoom_text(p.viewport_content or '')}")
+        finding(f"{path}: viewport verbietet das Zoomen {zoom_text(p.viewport_content or '')}", "viewport-zoom", path)
     # 7. h1
     if not p.h1_texts:
-        finding(f"{path}: <h1> fehlt")
+        finding(f"{path}: <h1> fehlt", "h1", path)
     elif len(p.h1_texts) > 1:
-        finding(f"{path}: {len(p.h1_texts)} <h1> statt genau einem")
+        finding(f"{path}: {len(p.h1_texts)} <h1> statt genau einem", "h1", path)
     elif not p.h1_texts[0].strip():
-        finding(f"{path}: <h1> ist leer")
+        finding(f"{path}: <h1> ist leer", "h1", path)
     # 8. img ohne alt
     no_alt = [src if src else "(kein src)" for src, alt in p.images if alt is None]
     if no_alt:
-        finding(f"{path}: {len(no_alt)} Bild(er) ohne alt-Attribut: {_examples(no_alt)}")
+        finding(f"{path}: {len(no_alt)} Bild(er) ohne alt-Attribut: {_examples(no_alt)}", "alt", path)
     # 9. alt als Platzhalter
     ph = [alt for src, alt in p.images if alt is not None and is_placeholder_alt(alt)]
     if ph:
-        finding(f"{path}: {len(ph)} Bild(er) mit Platzhalter als alt-Text: {_examples(ph)}")
+        finding(f"{path}: {len(ph)} Bild(er) mit Platzhalter als alt-Text: {_examples(ph)}", "alt-placeholder", path)
     # 10. zugänglicher Name
     if p.accessible_missing:
-        finding(f"{path}: {len(p.accessible_missing)} Link(s)/Button(s) ohne zugänglichen Namen: {_examples(p.accessible_missing)}")
+        finding(f"{path}: {len(p.accessible_missing)} Link(s)/Button(s) ohne zugänglichen Namen: {_examples(p.accessible_missing)}", "accessible-name", path)
     # 11. Formularfelder ohne Label
     missing_label = []
     for f in p.fields:
@@ -464,45 +486,45 @@ def check_page(path: str, p: PageParser, raw: str = "", https: bool = False) -> 
         if not has_label:
             missing_label.append(f["name"] if f["name"] else (f["id"] or f["tag"]))
     if missing_label:
-        finding(f"{path}: {len(missing_label)} Formularfeld(er) ohne Label: {_examples(missing_label)}")
+        finding(f"{path}: {len(missing_label)} Formularfeld(er) ohne Label: {_examples(missing_label)}", "label", path)
     # 12. doppelte ids
     seen_ids: dict[str, int] = {}
     for i in p.ids:
         seen_ids[i] = seen_ids.get(i, 0) + 1
     dups = [k for k, n in seen_ids.items() if n > 1]
     if dups:
-        finding(f"{path}: doppelte id: {_examples(dups)}")
+        finding(f"{path}: doppelte id: {_examples(dups)}", "duplicate-id", path)
     # 13. Doctype
     if not DOCTYPE_RE.search(raw):
-        finding(f"{path}: <!DOCTYPE html> fehlt am Anfang")
+        finding(f"{path}: <!DOCTYPE html> fehlt am Anfang", "doctype", path)
     # 14. Zeichensatz
     m = CHARSET_RE.search(raw)
     if not m:
-        finding(f'{path}: <meta charset="utf-8"> fehlt')
+        finding(f'{path}: <meta charset="utf-8"> fehlt', "charset", path)
     elif m.start() > 1024:
-        finding(f"{path}: <meta charset> steht nicht in den ersten 1024 Bytes")
+        finding(f"{path}: <meta charset> steht nicht in den ersten 1024 Bytes", "charset-position", path)
     # 15. Mixed Content
     if https:
         mixed = mixed_content(p)
         forms = [u for k, u in mixed if k == "form"]
         loads = [u for k, u in mixed if k != "form"]
         if loads:
-            finding(f"{path}: lädt {_examples(loads, 3)} über unverschlüsseltes HTTP (Mixed Content)")
+            finding(f"{path}: lädt {_examples(loads, 3)} über unverschlüsseltes HTTP (Mixed Content)", "mixed-content", path)
         if forms:
-            finding(f"{path}: Formular sendet an {_examples(forms, 3)} (unverschlüsselt)")
+            finding(f"{path}: Formular sendet an {_examples(forms, 3)} (unverschlüsselt)", "mixed-form", path)
     # 16. Hauptbereich
     if p.mains == 0:
-        finding(f"{path}: kein <main>-Bereich")
+        finding(f"{path}: kein <main>-Bereich", "main", path)
     elif p.mains > 1:
-        finding(f"{path}: {p.mains} <main>-Bereiche statt einem")
+        finding(f"{path}: {p.mains} <main>-Bereiche statt einem", "main", path)
     # 17. Passwortfelder
     if p.pw_autocomplete_off:
-        finding(f'{path}: Passwortfeld mit autocomplete="off" — blockiert Passwortmanager (ASVS 6.2.7)')
+        finding(f'{path}: Passwortfeld mit autocomplete="off" — blockiert Passwortmanager (ASVS 6.2.7)', "password-autocomplete", path)
     if p.pw_onpaste:
-        finding(f"{path}: Passwortfeld verbietet Einfügen (onpaste)")
+        finding(f"{path}: Passwortfeld verbietet Einfügen (onpaste)", "password-paste", path)
     # 18. JSON-LD
     for problem in ld_json_problems(p.ld_json):
-        finding(f"{path}: {problem}")
+        finding(f"{path}: {problem}", "json-ld", path)
     # H1 Skip-Link — gemeinsames Layout, deshalb nur einmal pro Lauf
     global skip_link_reported
     ids = set(p.ids)
@@ -542,17 +564,20 @@ def collect_paths(base: str) -> tuple[list[str], int]:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("Verwendung: check-web-content <https://lokale-url>", file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print("Verwendung: check-web-content <https://lokale-url> [projektverzeichnis]", file=sys.stderr)
         return 2
+    global profile, findings, page_dev
     base = sys.argv[1].rstrip("/")
+    profile = Profile(sys.argv[2] if len(sys.argv) == 3 else "", "web-content")
+    findings += profile.initial()
 
     # Wie check-legal: Ohne 200 auf / antwortet evtl. nur ein Catch-all des
     # Reverse-Proxys — dann messen wir nicht die App.
     status, _, _ = fetch(base + "/")
     if status != 200:
         print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
-        return 77
+        return 1 if findings else 77
 
     paths, total = collect_paths(base)
     if total > len(paths):
@@ -566,6 +591,7 @@ def main() -> int:
         status, ct, body = fetch(base + path)
         if status != 200 or "text/html" not in ct.lower():
             continue
+        page_dev = last_dev or is_dev((), body)
         p = PageParser()
         p.feed(body)
         if not p.visible():
@@ -593,7 +619,7 @@ def main() -> int:
         for text, where in seen.items():
             if len(where) > 1:
                 short = text if len(text) <= 60 else text[:57] + "…"
-                finding(f"{label} \"{short}\" auf {len(where)} Seiten: {_examples(where)}")
+                finding(f"{label} \"{short}\" auf {len(where)} Seiten: {_examples(where)}", "title-unique" if label == "Titel" else "description-unique", where[0])
 
     print()
     if findings:

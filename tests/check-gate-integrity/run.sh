@@ -11,6 +11,7 @@
 # sonst eine Meldung und Exit 1.
 
 set -euo pipefail
+python3 "$(dirname "${BASH_SOURCE[0]}")/../profile-exceptions.py" gate-integrity
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "$HERE/../.." && pwd)"

@@ -199,6 +199,19 @@ agent (`opencode`, `claude` or `none`) write the report text and commits only
 per expensive check (`--expensive-timeout N`, `0` = unlimited) and no overall
 limit (`--guard-timeout N` to set one).
 
+### Project profile for web checks
+
+`.ai/guard-profile.yml` can hold justified exceptions (`ausnahmen:` with
+`check`, optional `befund`, `pfad`/`muster`, mandatory `grund`, optional
+`ablaufdatum` and `nur_umgebung: dev`) for `form-protection`, `web-content`,
+`web-exposure` and `gate-integrity`. Every suppressed finding stays visible as a
+hint; an exception without a reason or past its expiry date counts as a finding.
+`projekt_art: intern` marks an internal tool behind SSO: SEO and form spam
+protection findings are skipped with a hint, accessibility and favicons stay
+active. A stack trace on the error page is only a hint while the local instance
+runs in Symfony dev mode. Keys and examples:
+`claude/skills/code-quality/references/project-profile.md`.
+
 ### Policy
 
 Thresholds live in `claude/skills/code-quality/guard-policy.yml`.

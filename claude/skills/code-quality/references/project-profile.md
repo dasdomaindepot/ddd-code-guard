@@ -21,7 +21,7 @@ Nur ein ausdrücklicher Wert schaltet eine Achse ab: `mandanten: keine`.
 ```yaml
 version: 1
 
-# webseite | webanwendung | api | cli
+# webseite | webanwendung | intern | api | cli
 projekt_art: webanwendung
 
 # formular | oidc | api_token | http_basic | keine — mehrere möglich
@@ -118,6 +118,67 @@ Mandantentrennung aus `src/Entity/…` abgeleitet“.
 
 ## Ausnahmen
 
-Eine Ausnahme gilt nur mit Achse bzw. Regel-ID, Pfad **und** Grund. Trifft ein Befund auf eine
-Ausnahme, wird er im Report unter „Bewusste Ausnahmen“ mit dem Grund geführt,
-nicht verschwiegen und nicht gezählt. Eine Ausnahme ohne Grund ist ungültig.
+Bestehende Review-Ausnahmen mit `achse:` oder `regel:` bleiben gültig. Für die
+Checks `form-protection`, `web-content`, `web-exposure` und `gate-integrity`
+verwendet derselbe Abschnitt `check:` und optional `befund:`. Ohne `befund`
+gilt der Eintrag für alle Befunde des Checks. `pfad:` bezeichnet bei Web-Checks
+den URL-Pfad und bei Gate Integrity einen Dateipfad oder ein Verzeichnispräfix;
+`muster:` ist alternativ ein Glob. Ohne beide Ziele gilt die Ausnahme für jeden
+passenden Befund. `grund:` ist Pflicht: Fehlt er, erscheint „Ausnahme ohne
+Begründung“ als eigener Befund. Unterdrückte Befunde erscheinen mit „bewusst
+ausgenommen“ und Grund als Hinweis und zählen nicht für den Exit-Code.
+
+`ablaufdatum: JJJJ-MM-TT` beendet die Ausnahme nach dem angegebenen Tag. Danach
+erscheint der ursprüngliche Befund wieder und ein Hinweis „Ausnahme abgelaufen
+seit …“. `nur_umgebung: dev` verlangt einen X-Debug-Token-Header oder die
+Symfony-Toolbar in der lokalen Antwort. Bei `gate-integrity` ist dieses Feld
+wirkungslos, da kein Webserver geprüft wird. Eine `Guard-Ausnahme:`-Commit-Zeile
+funktioniert weiterhin.
+
+```yaml
+ausnahmen:
+  - check: form-protection
+    befund: honeypot
+    pfad: /dev-login
+    nur_umgebung: dev
+    grund: Entwicklungsformular ist nur lokal erreichbar.
+  - check: gate-integrity
+    befund: G3
+    pfad: config/reference.php
+    grund: Von Symfony generierte Referenzdatei.
+  - check: web-content
+    befund: canonical
+    muster: /hilfe/*
+    ablaufdatum: 2027-12-31
+    grund: Dokumentationsseiten werden später vereinheitlicht.
+```
+
+Ein internes Werkzeug hinter SSO kann so beschrieben werden:
+
+```yaml
+version: 1
+projekt_art: intern
+auth: [oidc]
+ausnahmen: []
+```
+
+Bei `intern` entfallen SEO-Befunde (`web-content`: `meta-description`,
+`canonical`, `h1`, `title-unique`, `description-unique`) und der gesamte
+Formular-Spamschutz (`form-protection`) mit sichtbarem Hinweis. Barrierefreiheit
+(darunter `title` als Seitentitel nach WCAG 2.4.2, `lang`, `label`, `main`,
+Skip-Link) und Favicons bleiben aktiv. Der Profilentwurf schlägt
+`intern` nur bei eindeutig geschützter Startseite und ausschließlicher OIDC-
+Anmeldung vor.
+
+### Befund-Schlüssel
+
+| Check | Schlüssel |
+|---|---|
+| `form-protection` | `honeypot` |
+| `web-content` | `lang`, `title`, `meta-description`, `canonical`, `viewport`, `viewport-zoom`, `h1`, `alt`, `alt-placeholder`, `accessible-name`, `label`, `duplicate-id`, `doctype`, `charset`, `charset-position`, `mixed-content`, `mixed-form`, `main`, `password-autocomplete`, `password-paste`, `json-ld`, `title-unique`, `description-unique` |
+| `web-exposure` | `secret-file`, `http-status`, `stacktrace`, `cookie-flags`, `https-redirect`, `cors` |
+| `gate-integrity` | `G1`, `G2`, `G3`, `G4`, `G5`, `G6`, `G7`, `G8` |
+
+Für G3 verweist `pfad:` bei einem neuen `exclude-pattern` auf den ausgeschlossenen
+Dateipfad, etwa `config/reference.php`. Für andere G3-Befunde gilt die
+Konfigurationsdatei als Ziel.

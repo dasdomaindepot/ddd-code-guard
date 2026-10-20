@@ -347,9 +347,17 @@ def derive_projekt_art(project_path: str, auth):
     names = _composer_package_names(project_path)
     if "api-platform/core" in names:
         return "api", "# api-platform/core in composer.lock"
+    if auth == ["oidc"]:
+        data = _load_yaml(os.path.join(project_path, "config", "packages", "security.yaml"))
+        sec = data.get("security", {}) if isinstance(data, dict) else {}
+        rules = sec.get("access_control", []) if isinstance(sec, dict) else []
+        if isinstance(rules, list) and rules and isinstance(rules[0], dict) \
+                and rules[0].get("path") in ("^/", "^/.*") \
+                and str(rules[0].get("roles", "")).startswith("ROLE_"):
+            return "intern", "# ausschließlich OIDC und Startseite durch access_control geschützt"
     if auth:  # auth ist eine Liste ungleich [] => Anmeldung erkannt
-        return "webanwendung", "# security.yaml Anmeldung"
-    return None, "# unbekannt – bitte ausfüllen"
+        return "webanwendung", "# security.yaml Anmeldung; intern hinter SSO möglich – prüfen"
+    return None, "# unbekannt – bitte ausfüllen; intern hinter SSO möglich"
 
 
 # --- Hauptprogramm -----------------------------------------------------

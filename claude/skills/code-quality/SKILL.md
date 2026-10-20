@@ -591,3 +591,13 @@ Nützlich von Hand: `guard-weekly --status` zeigt, was ein Lauf jetzt täte,
   abbrach, ins Timeout lief oder gar nicht startete.
 
 Antworte auf Deutsch.
+
+## Projektbezogene Web-Ausnahmen und interne Werkzeuge
+
+Die Web-Checks lesen bei Übergabe des Projektpfads `.ai/guard-profile.yml`.
+`projekt_art: intern` kennzeichnet ein internes Werkzeug hinter SSO: SEO und
+Formular-Spamschutz entfallen mit Hinweis; Barrierefreiheit und Favicons bleiben
+aktiv. `ausnahmen:` mit `check:`, optionalem `befund:`, `pfad:` oder `muster:`
+und verpflichtendem `grund:` gelten für einzelne Check-Befunde. Ablaufdatum
+und Dev-Bindung sind möglich. Format, Beispiele und alle stabilen
+Befund-Schlüssel stehen in `references/project-profile.md`.

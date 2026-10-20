@@ -27,8 +27,12 @@ Exit-Codes:
     77  nicht messbar (nicht erreichbar)
 """
 
+import os
 import ssl
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+from guard_profile import Profile, is_dev
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,6 +45,8 @@ TIMEOUT = 15
 UA = "code-guard-web-exposure"
 
 findings = 0
+profile = Profile("", "web-exposure")
+dev_mode = False
 
 base = ""
 base_host = ""
@@ -58,10 +64,18 @@ _STACK_MARKERS = ("Stack trace", "vendor/symfony/", "Traceback (most recent call
 _SESSION_MARKERS = ("sess", "session", "auth", "token", "remember")
 
 
-def finding(msg: str) -> None:
+def finding(msg: str, key="", path="/") -> None:
     global findings
-    findings += 1
-    print(f"BEFUND   {msg}")
+    if profile.project_supplied:
+        msg = f"[web-exposure/{key}] {msg}"
+    reason, expired = profile.decide(key, path, dev_mode)
+    for note in expired:
+        hint(note)
+    if reason:
+        hint(f"bewusst ausgenommen: {msg} — Grund: {reason}")
+    else:
+        findings += 1
+        print(f"BEFUND   {msg}")
 
 
 def ok(msg: str) -> None:
@@ -168,7 +182,7 @@ def check_secrets() -> None:
                 matched = True
                 continue
             leaked += 1
-            finding("%s wird ausgeliefert (HTTP %d, %d Bytes) — gehört nicht ins Webroot" % (path, status, len(body)))
+            finding("%s wird ausgeliefert (HTTP %d, %d Bytes) — gehört nicht ins Webroot" % (path, status, len(body)), "secret-file", path)
     if leaked == 0:
         ok("keine geheimen Dateien erreichbar (%d Pfade geprüft)" % len(SECRET_PATHS))
     if matched:
@@ -176,22 +190,26 @@ def check_secrets() -> None:
 
 
 def check_unknown_path() -> None:
+    global dev_mode
     status, headers, body = request(base + FALLBACK)
     text = body.decode("utf-8", "replace")
     stack = any(m in text for m in _STACK_MARKERS)
-    has_xdebug = any(k.lower() == "x-debug-token" for k, _ in headers)
+    dev = is_dev(headers, text)
+    dev_mode = dev_mode or dev
     if status in (404, 410):
         ok("unbekannter Pfad liefert 404")
     elif 500 <= status <= 599:
-        finding("unbekannter Pfad liefert HTTP %d statt 404 — Fehlerhandling prüfen" % status)
+        finding("unbekannter Pfad liefert HTTP %d statt 404 — Fehlerhandling prüfen" % status, "http-status")
     elif status == 200:
         hint("unbekannter Pfad liefert HTTP 200 (SPA-Fallback oder Soft-404?) — für Suchmaschinen sollte es 404 sein")
     elif 300 <= status <= 399:
         hint("unbekannter Pfad leitet weiter (HTTP %d) statt 404" % status)
-    if stack and not has_xdebug:
-        finding("Fehlerseite zeigt einen Stacktrace")
-    elif has_xdebug:
-        hint("App läuft im Debug-Modus (X-Debug-Token) — Stacktrace-Prüfung übersprungen")
+    if stack and dev:
+        hint("App läuft im Debug-Modus — Fehlerseite zeigt einen Stacktrace nur im Dev-Modus, prod zeigt die normale Fehlerseite – bitte prod-Fehlerseite prüfen")
+    elif stack:
+        finding("Fehlerseite zeigt einen Stacktrace", "stacktrace", FALLBACK)
+    elif dev:
+        hint("App läuft im Debug-Modus — Stacktrace-Prüfung ohne Befund")
 
 
 def check_cookies() -> None:
@@ -212,7 +230,7 @@ def check_cookies() -> None:
         name = cookie_name(sc)
         problems = cookie_problems(sc, is_https)
         for problem in problems:
-            finding("Cookie %s %s" % (name, problem))
+            finding("Cookie %s %s" % (name, problem), "cookie-flags")
         if not problems:
             clean += 1
     if clean == len(set_cookies):
@@ -230,7 +248,7 @@ def check_redirect_https() -> None:
     if kind == "ok":
         ok(msg)
     elif kind == "finding":
-        finding(msg)
+        finding(msg, "https-redirect")
     else:
         hint(msg)
 
@@ -245,32 +263,35 @@ def check_cors() -> None:
         ok("CORS nicht zu offen")
         return
     if acao == "*" and aacc == "true":
-        finding("CORS erlaubt jede Herkunft mit Zugangsdaten")
+        finding("CORS erlaubt jede Herkunft mit Zugangsdaten", "cors")
     elif acao == "https://example.com" and aacc == "true":
-        finding("CORS spiegelt beliebige Herkunft mit Zugangsdaten zurück")
+        finding("CORS spiegelt beliebige Herkunft mit Zugangsdaten zurück", "cors")
     else:
         ok("CORS nicht zu offen")
 
 
 def main() -> int:
-    global base, base_host, is_https
-    if len(sys.argv) != 2:
-        print("Verwendung: check-web-exposure <https://lokale-url>", file=sys.stderr)
+    global base, base_host, is_https, profile, findings, dev_mode
+    if len(sys.argv) not in (2, 3):
+        print("Verwendung: check-web-exposure <https://lokale-url> [projektverzeichnis]", file=sys.stderr)
         return 2
     base = sys.argv[1].rstrip("/")
+    profile = Profile(sys.argv[2] if len(sys.argv) == 3 else "", "web-exposure")
+    findings += profile.initial()
     parsed = urllib.parse.urlparse(base)
     base_host = parsed.netloc
     is_https = parsed.scheme.lower() == "https"
 
     # Weiterleitung (Login) und 401/403 sind normale Startseiten. Keine Verbindung
     # oder 5xx heißt: Die App läuft nicht richtig — dann misst hier nichts etwas.
-    status, _, _ = request(base + "/")
+    status, home_headers, home_body = request(base + "/")
+    dev_mode = is_dev(home_headers, home_body.decode("utf-8", "replace"))
     if status == 0 or status >= 500:
         print(f"Startseite {base}/ liefert HTTP {status} — Instanz läuft nicht oder ist nicht die App.")
-        return 77
+        return 1 if findings else 77
 
-    check_secrets()
     check_unknown_path()
+    check_secrets()
     check_cookies()
     check_redirect_https()
     check_cors()
