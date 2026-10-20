@@ -73,6 +73,8 @@ def run_web(name, key, path, message):
 sys.path.insert(0, str(BIN / "lib"))
 from guard_profile import Profile, is_dev
 assert is_dev([("X-Debug-Token", "abc")])
+assert is_dev([("X-Debug-Exception", "No route")])
+assert not is_dev([("Server", "nginx")], body="")
 assert is_dev(body="<div class='sf-toolbar'>Debug</div>")
 assert not is_dev(body="<main>Produktion</main>")
 with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +86,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert probe.decide("probe", "/kontakt")[0] is None
     profile(root, [{"check": CHECK, "befund": "probe", "grund": "Global"}])
     assert Profile(root, CHECK).decide("probe", "/beliebig")[0] == "Global"
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    profile(root, [{"check": "gate-integrity", "befund": "G3", "pfad": "config/reference.php",
+                    "grund": "Generierte Symfony-Referenz"}])
+    probe = Profile(root, "gate-integrity")
+    assert probe.decide("G3", "(^|/)config/reference\\.php$")[0] == "Generierte Symfony-Referenz"
 if CHECK == "form-protection":
     m = run_web("check-form-protection", "honeypot", "/dev-login", "/dev-login: Formular ohne Honeypot")
     with tempfile.TemporaryDirectory() as tmp:

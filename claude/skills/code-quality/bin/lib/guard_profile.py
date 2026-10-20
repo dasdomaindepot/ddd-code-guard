@@ -3,15 +3,16 @@
 from datetime import date
 from fnmatch import fnmatchcase
 from pathlib import Path
+import re
 
 
 def is_dev(headers=(), body=""):
     """Lokale Symfony-Entwicklungsinstanz an Header oder Toolbar erkennen."""
-    return any(str(k).lower() == "x-debug-token" for k, _ in headers) or any(
-        marker in body for marker in ('id="sfwdt', "id='sfwdt", 'id="sfToolbar',
-                                      "id='sfToolbar", 'class="sf-toolbar',
-                                      "class='sf-toolbar")
-    )
+    header_names = {str(k).lower() for k, _ in headers}
+    return ("x-debug-token" in header_names or "x-debug-exception" in header_names
+            or any(marker in body for marker in ('id="sfwdt', "id='sfwdt", 'id="sfToolbar',
+                                                  "id='sfToolbar", 'class="sf-toolbar',
+                                                  "class='sf-toolbar")))
 
 
 class Profile:
@@ -64,7 +65,15 @@ class Profile:
             target = entry.get("pfad")
             pattern = entry.get("muster")
             if target and not (path == target or path.startswith(str(target).rstrip("/") + "/")):
-                continue
+                if self.check == "gate-integrity":
+                    try:
+                        re_match = re.search(path, str(target))
+                    except re.error:
+                        re_match = None
+                    if re_match is None:
+                        continue
+                else:
+                    continue
             if pattern and not fnmatchcase(path, str(pattern)):
                 continue
             if entry.get("nur_umgebung") == "dev" and self.check != "gate-integrity" and not dev:

@@ -88,6 +88,7 @@ page_dev = False
 last_dev = False
 HONEYPOT_HINT = False
 FORM_FOUND = False
+INTERN_SEEN: set[tuple[str, str]] = set()
 MAX_PAGES = 50
 try:
     MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
@@ -338,7 +339,9 @@ def check_forms(path: str, p: FormParser) -> None:
         if profile.art == "intern":
             FORM_FOUND = True
             label = f["action"] or f["id"] or "(ohne action)"
-            hint(f"{path}: Formular {label} — entfällt bei projekt_art: intern")
+            if (path, label) not in INTERN_SEEN:
+                INTERN_SEEN.add((path, label))
+                hint(f"{path}: Formular {label} — entfällt bei projekt_art: intern")
             continue
         checked, kind = _classify(f, path)
         if not checked:
