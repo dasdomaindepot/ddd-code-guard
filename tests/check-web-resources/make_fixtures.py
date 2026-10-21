@@ -64,8 +64,10 @@ def index_html(title, head, text, body=""):
 
 def build_gut(d):
     write_png(os.path.join(d, "logo.png"), 50, 50)
+    write_png(os.path.join(d, "bürger-logo.png"), 50, 50)
     head = '<link rel="icon" href="/logo.png">'
     body = """<a href="/kontakt/">Zum Kontakt</a>
+<img src="/bürger-logo.png" width="50" height="50" alt="Logo mit Umlaut im Dateinamen">
 <a href="mailto:test@example.com">E-Mail</a>
 <a href="#top">Nach oben</a>
 <a href="/logout">Abmelden</a>

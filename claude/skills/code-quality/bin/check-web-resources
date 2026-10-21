@@ -121,7 +121,8 @@ def fetch_redirect(url: str) -> tuple[int, int, str, bytes]:
     current = url
     while sprünge <= 10:
         try:
-            req = urllib.request.Request(current, headers={"User-Agent": UA})
+            # Umlaute u. ä. in Pfaden prozentkodieren, sonst scheitert http.client an ASCII.
+            req = urllib.request.Request(urllib.parse.quote(current, safe=":/?#[]@!$&'()*+,;=%~"), headers={"User-Agent": UA})
             with opener.open(req, timeout=TIMEOUT) as r:
                 status = r.status
                 ct = r.headers.get("Content-Type", "")
