@@ -58,6 +58,15 @@ if [ "$1" = compose ] && [ "$2" = exec ] && [ "$3" = -T ] && \
     exit "${FAKE_TRUE_RC:-0}"
 fi
 
+# Besitzer von var/cache bzw. var/: compose exec -T php sh -c "stat ..."
+if [ "$1" = compose ] && [ "$2" = exec ] && [ "$3" = -T ] && \
+   [ "$4" = php ] && [ "$5" = sh ]; then
+    if [ -n "${FAKE_OWNER:-}" ]; then
+        printf '%s\n' "$FAKE_OWNER"
+    fi
+    exit 0
+fi
+
 # Befehle nach --no-interaction sammeln
 args=()
 after=0
@@ -135,7 +144,7 @@ reset_env() {
     export GUARD_DOCKER="$WORK/docker"
     export FAKE_CASE="${1:-all-green}"
     export FAKE_LOG
-    unset FAKE_TRUE_RC
+    unset FAKE_TRUE_RC FAKE_OWNER
     : > "$FAKE_LOG"
 }
 
@@ -269,6 +278,27 @@ reset_env deprecation-stderr
 run_script "$LAST_FIXTURE"
 expect 0 "Keine Befunde."
 expect_not 0 "bootet nicht"
+
+# --- var/ gehört www-data → Konsole läuft als dieser Benutzer,
+# damit der Guard keine root-eigenen Cache-Dateien hinterlässt
+LAST_FIXTURE="$(mktemp -d "$WORK/fixture.XXXXXX")"
+make_fixture "$LAST_FIXTURE"
+reset_env all-green
+export FAKE_OWNER="33:33"
+run_script "$LAST_FIXTURE"
+expect 0 "Keine Befunde." "Konsole läuft als 33:33"
+expect_log "exec -T -u 33:33 php php bin/console --no-interaction list"
+expect_log "exec -T -u 33:33 php php bin/console --no-interaction lint:container"
+
+# --- var/ gehört root → Aufruf unverändert ohne -u
+LAST_FIXTURE="$(mktemp -d "$WORK/fixture.XXXXXX")"
+make_fixture "$LAST_FIXTURE"
+reset_env all-green
+export FAKE_OWNER="0:0"
+run_script "$LAST_FIXTURE"
+expect 0 "Keine Befunde."
+expect_not 0 "Konsole läuft als"
+expect_log_not " -u "
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: alle Fälle bestanden"

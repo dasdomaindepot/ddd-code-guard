@@ -12,6 +12,11 @@ ausgeführt sind – doctrine:schema:validate --skip-mapping. Er ruft niemals
 schreibende Befehle auf (keine migrations:migrate, kein schema:update, kein
 cache:clear) und startet keinen Container.
 
+Die Konsole läuft als Besitzer von var/cache (ersatzweise var/) im Container.
+Als root angelegte Cache-Dateien kann der eigentliche App-Benutzer (etwa
+www-data) danach nicht mehr überschreiben; der Guard würde sonst genau den
+Fehler erzeugen, den er finden soll. Gehört var/ root, bleibt es bei root.
+
 Nicht messbar (Exit 77), wenn bin/console fehlt, kein compose-File vorhanden
 ist oder der php-Container nicht antwortet.
 
@@ -32,6 +37,7 @@ findings = 0
 commands = set()
 PROJECT = "."
 DOCKER = os.environ.get("GUARD_DOCKER", "docker")
+EXEC_USER: list = []
 
 
 def finding(msg: str) -> None:
@@ -71,7 +77,8 @@ def console_raw(args, timeout: int = 180):
     und hinter dem JSON von `list --format=json` angehängt machten sie die
     Ausgabe unlesbar – der Check meldete dann „bootet nicht“ bei laufender App.
     """
-    cmd = [DOCKER, "compose", "exec", "-T", "php", "php", "bin/console", "--no-interaction", *args]
+    cmd = [DOCKER, "compose", "exec", "-T", *EXEC_USER, "php", "php", "bin/console",
+           "--no-interaction", *args]
     try:
         proc = subprocess.run(
             cmd, cwd=PROJECT, stdin=subprocess.DEVNULL,
@@ -82,6 +89,27 @@ def console_raw(args, timeout: int = 180):
     except OSError:
         return 127, "", "docker nicht aufrufbar"
     return proc.returncode, strip_ansi(proc.stdout), strip_ansi(proc.stderr)
+
+
+def detect_exec_user() -> list:
+    """`-u uid:gid` des Besitzers von var/cache bzw. var/ im Container.
+
+    Leer, wenn der Besitzer root ist oder sich nicht ermitteln lässt; dann
+    läuft die Konsole wie bisher als Standardbenutzer des Containers.
+    """
+    probe = "stat -c %u:%g var/cache 2>/dev/null || stat -c %u:%g var"
+    try:
+        proc = subprocess.run(
+            [DOCKER, "compose", "exec", "-T", "php", "sh", "-c", probe],
+            cwd=PROJECT, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    owner = proc.stdout.strip()
+    if proc.returncode != 0 or not re.fullmatch(r"\d+:\d+", owner) or owner.startswith("0:"):
+        return []
+    return ["-u", owner]
 
 
 def console(args, timeout: int = 180):
@@ -179,7 +207,7 @@ def part_doctrine_schema(project_path: str) -> None:
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
-    global PROJECT, DOCKER, commands
+    global PROJECT, DOCKER, EXEC_USER, commands
 
     if len(sys.argv) > 2:
         print("Verwendung: check-symfony-lint [projektverzeichnis]", file=sys.stderr)
@@ -215,6 +243,10 @@ def main() -> int:
     if alive.returncode != 0:
         print("php-Container läuft nicht — nicht messbar.")
         return 77
+
+    EXEC_USER = detect_exec_user()
+    if EXEC_USER:
+        hint(f"Konsole läuft als {EXEC_USER[1]} (Besitzer von var/)")
 
     # Verfügbare Befehle ermitteln.
     rc, stdout, stderr = console_raw(["list", "--format=json"])
