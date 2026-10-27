@@ -204,6 +204,53 @@ if [ "$befund_count" -ne 1 ]; then
 fi
 rm -rf "$VENDOR"
 
+# --- S4: Sulu-Projekt mit public/build/admin → kein Befund ----------------
+# Sulu liefert das Admin-Frontend vorgebaut aus (bin/console sulu:admin:update-build)
+# und erwartet, dass public/build/admin versioniert wird.
+SULU="$(new_project)"
+(
+    cd "$SULU"
+    git init -q
+    printf '{"require": {"sulu/sulu": "^3.0"}}\n' > composer.json
+    mkdir -p public/build/admin
+    printf 'x\n' > public/build/admin/main.js
+    printf 'x\n' > public/build/admin/main.css
+    git add -A
+)
+run_script "$SULU"
+expect 0 "public/build/admin/ ist bei Sulu bewusst versioniert"
+expect_not 0 "BEFUND"
+rm -rf "$SULU"
+
+# --- S4: Sulu-Projekt mit weiteren Dateien in public/build → Befund ------
+SULU2="$(new_project)"
+(
+    cd "$SULU2"
+    git init -q
+    printf '{"require": {"sulu/sulu": "^3.0"}}\n' > composer.json
+    mkdir -p public/build/admin public/build/website
+    printf 'x\n' > public/build/admin/main.js
+    printf 'x\n' > public/build/website/app.js
+    git add -A
+)
+run_script "$SULU2"
+expect 1 "public/build/ ist versioniert (1 Dateien)"
+rm -rf "$SULU2"
+
+# --- S4: public/build/admin ohne Sulu → weiterhin Befund ----------------
+NOSULU="$(new_project)"
+(
+    cd "$NOSULU"
+    git init -q
+    printf '{"require": {"symfony/framework-bundle": "^7.4"}}\n' > composer.json
+    mkdir -p public/build/admin
+    printf 'x\n' > public/build/admin/main.js
+    git add -A
+)
+run_script "$NOSULU"
+expect 1 "public/build/ ist versioniert (1 Dateien)"
+rm -rf "$NOSULU"
+
 # --- S4: persönlicher IDE-Zustand mit absolutem Home-Pfad → Hinweis -----
 IDE_DIR="$(new_project)"
 (
