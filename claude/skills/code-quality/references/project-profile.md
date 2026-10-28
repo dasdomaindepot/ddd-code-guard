@@ -78,6 +78,19 @@ ausnahmen:
   - regel: app-static/H8
     pfad: src/Legacy/
     grund: Altcode, wird mit dem Umbau Q1/2027 ersetzt.
+
+# Ganze deterministische Checks abschalten.
+checks_aus:
+  - check: apple-design
+    grund: Internes Admin-Werkzeug ohne Design-Anspruch.
+    ablaufdatum: 2027-06-30
+
+# Projektdateien aus dateibasierten Checks nehmen.
+dateien_aus:
+  - muster: public/legacy/**
+    grund: Eingekauftes Theme.
+  - pfad: src/Generated/
+    grund: Generierter Code.
 ```
 
 Alle Schlüssel sind optional. Ein Projekt ohne Profil ist erlaubt — dann ist
@@ -98,6 +111,7 @@ alles unbekannt.
 | 9 Integrationen und Wiederholungen | der Diff externe Dienste, Webhooks oder Messenger-Handler berührt | — |
 | 10 Fehlerbehandlung | der Diff `try`/`catch`, Fehlerpfade oder Fallbacks enthält | — |
 | 11 Nebenläufigkeit und Datenintegrität | der Diff Schreibpfade berührt | — |
+| 12 Design nach Apple HIG | der Diff UI-Dateien berührt | `projekt_art: intern` oder `apple-design` in `checks_aus` |
 
 ## Unbekanntes aus dem Code auflösen
 
@@ -115,6 +129,36 @@ Fehlt ein Wert, bestimme ihn — und nenne im Report die Quelle:
 Findest du Hinweise auf Mandanten, aber kein Profil, prüfe Achse 6 — im Zweifel
 lieber prüfen als eine Lücke übersehen. Im Report steht dann: „Profil fehlt,
 Mandantentrennung aus `src/Entity/…` abgeleitet“.
+
+## Ganze Checks abschalten: `checks_aus`
+
+Jeder Eintrag braucht eine bekannte `check`-ID und einen nichtleeren `grund`.
+Fehlt der Grund, wird der Eintrag ignoriert und das Profil meldet einen Befund.
+Unbekannte IDs geben einen Hinweis. `ablaufdatum` funktioniert wie bei
+`ausnahmen`; abgelaufene Einträge gelten nicht und werden mit Datum gemeldet.
+Der Guard zeigt abgeschaltete Checks auch bei `--only` als `SKIPPED` mit Grund
+in der Konsole und in `results.json`. `--list` nennt den Grund ebenfalls.
+`projekt_art: intern` schaltet `apple-design` implizit ab, sofern der Check
+nicht bereits ausdrücklich in `checks_aus` steht.
+
+Neue Abschaltungen blockierender Checks bewacht `gate-integrity` als G9.
+Beratende Checks sind davon ausgenommen. Eine `Guard-Ausnahme: <Grund>`-Zeile
+im Commit macht einen G9-Befund zum Hinweis.
+
+## Dateien ausschließen: `dateien_aus`
+
+`muster` ist ein Glob; `**` greift auch über Verzeichnisgrenzen. `pfad` ist
+ein Dateipfad oder Verzeichnispräfix. Jeder Eintrag braucht `grund`; fehlende
+Gründe und abgelaufene Einträge gelten nicht. Die dateibasierten Checks
+(`apple-design`, `app-static`, `error-visibility`, `migrations`,
+`house-rules`) überspringen betroffene Dateien und melden einmal die Anzahl.
+`secrets`, `gate-integrity`, `auth-policy` und `versions` berücksichtigen
+`dateien_aus` ausdrücklich nicht, damit Geheimnisse, Abschwächungen von Gates,
+Login-Regeln und Supportende sichtbar bleiben. Wer einen davon nicht will,
+schaltet ihn über `checks_aus` ab, und das bewacht G9. Make-basierte
+Werkzeuge wie PHPStan, phpcs und Tests nutzen ihre eigene Konfiguration.
+Neue `dateien_aus`-Einträge meldet G9 als Hinweis. Im semantischen Review
+gelten die Dateiausschlüsse für alle Achsen und stehen im Report.
 
 ## Ausnahmen
 
@@ -177,7 +221,7 @@ Anmeldung vor.
 | `form-protection` | `honeypot` |
 | `web-content` | `lang`, `title`, `meta-description`, `canonical`, `viewport`, `viewport-zoom`, `h1`, `alt`, `alt-placeholder`, `accessible-name`, `label`, `duplicate-id`, `doctype`, `charset`, `charset-position`, `mixed-content`, `mixed-form`, `main`, `password-autocomplete`, `password-paste`, `json-ld`, `title-unique`, `description-unique` |
 | `web-exposure` | `secret-file`, `http-status`, `stacktrace`, `cookie-flags`, `https-redirect`, `cors` |
-| `gate-integrity` | `G1`, `G2`, `G3`, `G4`, `G5`, `G6`, `G7`, `G8` |
+| `gate-integrity` | `G1`, `G2`, `G3`, `G4`, `G5`, `G6`, `G7`, `G8`, `G9` |
 
 Für G3 verweist `pfad:` bei einem neuen `exclude-pattern` auf den ausgeschlossenen
 Dateipfad, etwa `config/reference.php`. Für andere G3-Befunde gilt die

@@ -59,6 +59,9 @@ import os
 import re
 import sys
 from diff_lines import added_lines, base_commit
+from lib.guard_profile import FileExclusions
+
+EXCLUSIONS = None
 
 try:
     import yaml
@@ -120,6 +123,8 @@ def hint(msg: str) -> None:
 # --- Hilfsfunktionen ---------------------------------------------------
 
 def load_top_level_yaml(path: str):
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             return yaml.load(f, Loader=_Loader)
@@ -128,6 +133,8 @@ def load_top_level_yaml(path: str):
 
 
 def load_top_level_json(path: str):
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
@@ -136,6 +143,8 @@ def load_top_level_json(path: str):
 
 
 def _read_text(path: str):
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
@@ -155,7 +164,7 @@ def php_files_under_src(project_path: str):
         if "DataFixtures" in rel_root.split(os.sep):
             continue
         for name in files:
-            if name.endswith(".php"):
+            if name.endswith(".php") and (not EXCLUSIONS or EXCLUSIONS.allowed(os.path.join(root, name))):
                 result.append(os.path.join(root, name))
     return result
 
@@ -228,7 +237,7 @@ def _walk_skip(root: str, suffixes: tuple) -> list:
             continue
         dirs[:] = [d for d in dirs if d not in skip]
         for f in files:
-            if f.endswith(suffixes):
+            if f.endswith(suffixes) and (not EXCLUSIONS or EXCLUSIONS.allowed(os.path.join(r, f))):
                 result.append(os.path.join(r, f))
     return result
 
@@ -363,7 +372,8 @@ def _find_dockerfiles(project_path: str):
         for f in files:
             if f == "Dockerfile" and len(parts) + 1 <= 3:
                 p = os.path.join(root, f)
-                results.append((p, _whole_copy_line(p)))
+                if not EXCLUSIONS or EXCLUSIONS.allowed(p):
+                    results.append((p, _whole_copy_line(p)))
     return results
 
 
@@ -377,7 +387,7 @@ def part_s4_dockerignore(project_path: str) -> None:
     di = None
     di_path = os.path.join(project_path, ".dockerignore")
     if os.path.isfile(di_path):
-        di = [l.strip() for l in _read_text(di_path).splitlines()]
+        di = [l.strip() for l in (_read_text(di_path) or "").splitlines()]
     need_git = True
     need_env = True
     if di is not None:
@@ -855,7 +865,8 @@ def _dockerfiles_for_hardening(project_path: str) -> list:
         return results
     root_df = os.path.join(project_path, "Dockerfile")
     if os.path.isfile(root_df):
-        results.append(root_df)
+        if not EXCLUSIONS or EXCLUSIONS.allowed(root_df):
+            results.append(root_df)
     docker_dir = os.path.join(project_path, "docker")
     if os.path.isdir(docker_dir):
         skip = ("node_modules", "vendor", "public", "var", ".git")
@@ -863,7 +874,9 @@ def _dockerfiles_for_hardening(project_path: str) -> list:
             dirs[:] = [d for d in dirs if d not in skip]
             for f in files:
                 if _is_dockerfile_name(f):
-                    results.append(os.path.join(root, f))
+                    path = os.path.join(root, f)
+                    if not EXCLUSIONS or EXCLUSIONS.allowed(path):
+                        results.append(path)
     return results
 
 
@@ -1795,6 +1808,7 @@ def part_h12_php_output(project_path: str) -> None:
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
+    global EXCLUSIONS
     if len(sys.argv) > 3:
         print("Verwendung: check-app-static [projektverzeichnis] [basis-ref]", file=sys.stderr)
         return 2
@@ -1802,6 +1816,7 @@ def main() -> int:
     project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
     if len(sys.argv) == 3:
         project_path = os.path.abspath(sys.argv[1])
+    EXCLUSIONS = FileExclusions(project_path)
     global BASE
     BASE = base_commit(project_path, sys.argv[2]) if len(sys.argv) == 3 else None
     if not os.path.isdir(project_path):
@@ -1843,6 +1858,7 @@ def main() -> int:
     part_h11_frontend_html(project_path)
     part_h12_php_output(project_path)
     part_h13_public_token(project_path)
+    EXCLUSIONS.announce()
 
     print()
     if findings:

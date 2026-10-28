@@ -42,7 +42,7 @@ severity:
   low:
     allowed: unlimited
     beschreibung: >
-      Stil, Kommentare, Kleinigkeiten. Werden berichtet, blockieren nie.
+      Stil, Kommentare, Kleinigkeiten und Apple-HIG-Hinweise. Werden berichtet, blockieren nie.
 
 # Wenn eine Achse gar nicht geprueft werden konnte, zaehlt sie nicht als gruen.
 unpruefbar_ist_nicht_gruen: true

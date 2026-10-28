@@ -112,6 +112,26 @@ git -C "$d" checkout -q -b feature
 run_script "$d" main
 expect 0 "keine Änderungen"
 
+# --- G9: neue Check-Abschaltung blockiert, beratender Check bleibt Hinweis ---
+d="$(new_repo)"
+writef "$d" "README.md" "Basis\n"
+commit_base "$d" "Basis"
+git -C "$d" checkout -q -b feature
+writef "$d" ".ai/guard-profile.yml" "version: 1\nchecks_aus:\n  - check: phpstan\n    grund: Test.\n"
+run_script "$d" main
+expect 1 "[gate-integrity/G9]"
+writef "$d" ".ai/guard-profile.yml" "version: 1\nchecks_aus:\n  - check: apple-design\n    grund: Test.\n"
+run_script "$d" main
+expect 0 "beratender Check"
+writef "$d" ".ai/guard-profile.yml" "version: 1\ndateien_aus:\n  - pfad: src/Generated/\n    grund: Test.\n"
+run_script "$d" main
+expect 0 "neuer dateien_aus-Eintrag"
+writef "$d" ".ai/guard-profile.yml" "version: 1\nchecks_aus:\n  - check: phpstan\n    grund: Test.\n"
+git -C "$d" add -A
+git -C "$d" commit -q -m "Guard-Ausnahme: Abschaltung für Test"
+run_script "$d" main
+expect 0 "Guard-Ausnahme"
+
 # --- G1: level 8 → 6 gesenkt ---
 d="$(new_repo)"
 writef "$d" "phpstan.neon" "parameters:\n    level: 8\n"

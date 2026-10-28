@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Beratender Quelltext-Check für Apple-HIG-Muster.
+
+Aufruf: check-apple-design <projektverzeichnis>
+Rein lesend; untersucht höchstens 5000 kleine UI-Dateien und Übersetzungen.
+
+Regeln:
+    AD1 Apple-Pay-Glyphe, Icon-Nachbau oder falsche Schreibweise
+    AD2 UIDesignRequiresCompatibility in einer Plist
+    AD3 Bildschirmmaße statt Fenstermaße
+    AD4 Layout nach Geräteklasse
+    AD5 feste Gerätebreiten
+    AD6 Glas oder Blur ohne reduzierte Transparenz
+    AD7 Bewegung ohne reduzierte Bewegung
+    AD8 entfällt: check-web-content prüft gesperrtes Viewport-Zoomen bereits.
+    AD9 Schrift kleiner als 11
+    AD10 erzwungener heller App-Modus
+
+Exit-Codes: 0 keine Befunde oder kein UI-Code; 1 Befunde; 2 Nutzungsfehler.
+Der Guard behandelt Exit 1 dieses Checks dauerhaft als WARN.
+"""
+
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from lib.guard_profile import FileExclusions
+
+CHECK_ID = "apple-design"
+RULE = ""
+HITS = defaultdict(list)
+SEEN = set()
+UI_EXT = {".css", ".scss", ".sass", ".less", ".vue", ".twig", ".html", ".htm", ".jsx", ".tsx", ".js", ".ts", ".svelte", ".swift", ".plist", ".dart"}
+WEB_EXT = {".css", ".scss", ".sass", ".less", ".vue", ".twig", ".html", ".htm", ".jsx", ".tsx", ".js", ".ts", ".svelte"}
+CSS_HTML_EXT = {".css", ".scss", ".sass", ".less", ".vue", ".twig", ".html", ".htm", ".svelte"}
+JS_EXT = {".js", ".ts", ".jsx", ".tsx"}
+SKIP_DIR = {"vendor", "vendors", "node_modules", "bower_components", "plugins", "third_party", "third-party", "var", "build", "dist", "Pods", ".dart_tool", "android", "docs", "tests", "test", ".superpowers"}
+HIG = {
+    "AD1": "apple-pay.md › Apple Pay mark / Referring to Apple Pay",
+    "AD2": "liquid-glass.md › SwiftUI, UIKit, and AppKit (Kompatibilitätsmodus zeigt das alte Design)",
+    "AD3": "designing-for-iphone-duo.md › Best practices",
+    "AD4": "designing-for-iphone-duo.md › Device poses",
+    "AD5": "designing-for-iphone-duo.md › Best practices",
+    "AD6": "liquid-glass.md › Review checklist; accessibility.md › Vision",
+    "AD7": "motion.md › Best practices; accessibility.md › Vision",
+    "AD9": "typography.md › Specifications (Mindestgröße 11 pt iOS)",
+    "AD10": "dark-mode.md › Best practices",
+}
+
+
+def _rid() -> str:
+    rid = f"{CHECK_ID}/{RULE}" if RULE else CHECK_ID
+    log = os.environ.get("GUARD_RULE_LOG")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as stream:
+                stream.write(rid + "\n")
+        except OSError:
+            pass
+    return f"[{rid}] "
+
+
+def finding(message: str) -> None:
+    print(f"BEFUND   {_rid()}{message}")
+
+
+def hint(message: str) -> None:
+    print(f"Hinweis  {_rid()}{message}")
+
+
+def paths(project: str, exclusions=None):
+    try:
+        result = subprocess.run(["git", "-C", project, "ls-files", "-co", "--exclude-standard", "-z"], capture_output=True, check=False)
+    except OSError:
+        result = None
+    if result and result.returncode == 0:
+        names = sorted(set(os.fsdecode(x) for x in result.stdout.split(b"\0") if x))
+    else:
+        names = []
+        for root, dirs, files in os.walk(project):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIR and d != ".git" and not (os.path.relpath(os.path.join(root, d), project).replace(os.sep, "/") == "public/build"))
+            names.extend(os.path.relpath(os.path.join(root, f), project) for f in files)
+        names.sort()
+    count = 0
+    for name in names:
+        rel = name.replace(os.sep, "/")
+        parts = rel.split("/")
+        if any(p in SKIP_DIR or p == ".git" for p in parts[:-1]) or rel.startswith("public/build/"):
+            continue
+        if rel.endswith((".min.css", ".min.js")):
+            continue
+        ext = os.path.splitext(rel)[1].lower()
+        translation = ext in {".yaml", ".yml", ".json", ".xlf", ".arb", ".strings"} and (ext in {".arb", ".strings"} or any(p in {"translations", "locales", "i18n"} for p in parts[:-1]))
+        if ext not in UI_EXT and not translation and rel != "tauri.conf.json":
+            continue
+        full = os.path.join(project, name)
+        if exclusions and not exclusions.allowed(full):
+            continue
+        try:
+            if not os.path.isfile(full) or os.path.getsize(full) > 1024 * 1024:
+                continue
+            with open(full, encoding="utf-8", errors="replace") as stream:
+                body = stream.read()
+        except OSError:
+            continue
+        yield rel, ext, body, translation
+        count += 1
+        if count >= 5000:
+            break
+
+
+def add(rule, rel, line, detail):
+    key = (rule, rel, line)
+    if key in SEEN:
+        return
+    SEEN.add(key)
+    HITS[rule].append((rel, line, detail))
+
+
+def occurrences(pattern, body, flags=0):
+    for match in re.finditer(pattern, body, flags):
+        yield body.count("\n", 0, match.start()) + 1
+
+
+def numeric_hits(pattern, body, maximum=11):
+    for match in re.finditer(pattern, body):
+        if float(match.group(1)) < maximum:
+            yield body.count("\n", 0, match.start()) + 1
+
+
+def scan(files):
+    web = [(r, e, b) for r, e, b, _ in files if e in WEB_EXT]
+    swift = [(r, b) for r, e, b, _ in files if e == ".swift"]
+    js = [(r, b) for r, e, b, _ in files if e in JS_EXT]
+    dart = [(r, b) for r, e, b, _ in files if e == ".dart"]
+    web_text = "\n".join(b for _, _, b in web)
+    swift_text = "\n".join(b for _, b in swift)
+    js_text = "\n".join(b for _, b in js)
+    dart_text = "\n".join(b for _, b in dart)
+
+    RULE = "AD1"
+    for rel, ext, body, translation in files:
+        for match in re.finditer(r"\uf8ff|&#(?:x[fF]8[fF][fF]|63743);|\\u[fF]8[fF][fF]", body):
+            # In Regex-Bereichen ist U+F8FF lediglich eine Bereichsgrenze.
+            if match.group().startswith("\\u") and (
+                (match.start() > 0 and body[match.start() - 1] == "-")
+                or (match.end() < len(body) and body[match.end()] == "-")
+            ):
+                continue
+            add(RULE, rel, body.count("\n", 0, match.start()) + 1, "Apple-Pay-Glyphe oder Icon-Nachbau")
+        if ext not in {".css", ".scss", ".sass", ".less"}:
+            for match in re.finditer(r"\b(?:fa-apple-pay|fa-cc-apple-pay|faApplePay|faCcApplePay|siApplepay|siApplePay)\b", body):
+                # CSS-Klassenselektoren in <style> sind keine verwendeten Icons.
+                if match.start() > 0 and body[match.start() - 1] == ".":
+                    continue
+                add(RULE, rel, body.count("\n", 0, match.start()) + 1, "Apple-Pay-Icon-Nachbau")
+        if ext in {".twig", ".vue", ".html", ".htm", ".arb", ".strings"} or translation:
+            for line in occurrences(r"\b(?:ApplePay|Apple pay|APPLE PAY)\b", body):
+                add(RULE, rel, line, "Apple Pay falsch geschrieben")
+
+    RULE = "AD2"
+    for rel, ext, body, _ in files:
+        if ext == ".plist":
+            for line in occurrences(r"<key>\s*UIDesignRequiresCompatibility\s*</key>\s*<true\s*/>", body, re.I):
+                add(RULE, rel, line, "Kompatibilitätsmodus aktiviert")
+
+    RULE = "AD3"
+    for rel, body in swift:
+        for line in occurrences(r"\bUIScreen\.main\b", body):
+            add(RULE, rel, line, "Bildschirm statt Fenster verwendet")
+    for rel, body in js:
+        for line in occurrences(r"\bDimensions\.get\s*\(\s*['\"]screen['\"]\s*\)", body):
+            add(RULE, rel, line, "Bildschirm statt Fenster verwendet")
+
+    RULE = "AD4"
+    for rel, body in swift:
+        for line in occurrences(r"\buserInterfaceIdiom\s*==\s*\.(?:phone|pad)\b", body):
+            add(RULE, rel, line, "Layout nach Geräteklasse")
+    for rel, body in js:
+        for line in occurrences(r"\bPlatform\.isPad\b", body):
+            add(RULE, rel, line, "Layout nach Geräteklasse")
+
+    RULE = "AD5"
+    for rel, body in swift:
+        for match in re.finditer(r"\.frame\s*\(\s*(?:minWidth|width)\s*:\s*(\d+(?:\.\d+)?)\b", body):
+            if 320 <= float(match.group(1)) <= 440:
+                add(RULE, rel, body.count("\n", 0, match.start()) + 1, "feste Gerätebreite 320–440")
+    for rel, ext, body, _ in files:
+        if ext in {".swift", ".dart"} | JS_EXT:
+            for line in occurrences(r"\b(?:screen|device)(?:Width|W)\s*[:=]\s*\d{3}\b", body, re.I):
+                add(RULE, rel, line, "feste Gerätebreiten-Konstante")
+
+    RULE = "AD6"
+    if not re.search(r"\b(?:accessibilityReduceTransparency|isReduceTransparencyEnabled)\b", swift_text):
+        for rel, body in swift:
+            for line in occurrences(r"\b(?:glassEffect\s*\(|UIGlassEffect\b|NSGlassEffectView\b|UIVisualEffectView\b)", body):
+                add(RULE, rel, line, "Glas ohne reduzierte Transparenz")
+    if not re.search(r"\bisReduceTransparencyEnabled\b", js_text):
+        for rel, body in js:
+            for line in occurrences(r"\bBlurView\b", body):
+                add(RULE, rel, line, "Blur ohne reduzierte Transparenz")
+    if "prefers-reduced-transparency" not in web_text:
+        for rel, ext, body in web:
+            if ext in CSS_HTML_EXT:
+                for line in occurrences(r"\bbackdrop-filter\s*:", body):
+                    add(RULE, rel, line, "Backdrop-Filter ohne reduzierte Transparenz")
+
+    RULE = "AD7"
+    motion = [
+        ("Web", web, "prefers-reduced-motion" in web_text, r"@keyframes\b|\banimation\s*:\s*(?!none\b)\S", None),
+        ("Swift", [(r, ".swift", b) for r, b in swift], bool(re.search(r"\b(?:accessibilityReduceMotion|isReduceMotionEnabled)\b", swift_text)), r"\bwithAnimation\b|\.animation\s*\(", None),
+        ("React Native", [(r, ".js", b) for r, b in js], bool(re.search(r"\b(?:isReduceMotionEnabled|useReducedMotion)\b", js_text)), r"\bAnimated\.", None),
+        ("Flutter", [(r, ".dart", b) for r, b in dart], "disableAnimations" in dart_text, r"\bAnimationController\b", None),
+    ]
+    for stack, entries, reduced, pattern, _ in motion:
+        if reduced:
+            continue
+        affected = [(rel, next(occurrences(pattern, body))) for rel, _, body in entries if re.search(pattern, body)]
+        if affected:
+            rel, line = affected[0]
+            extra = f"; {len(affected) - 1} weitere Dateien" if len(affected) > 1 else ""
+            add(RULE, rel, line, f"{stack}: Bewegung ohne reduzierte Bewegung{extra}")
+
+    RULE = "AD9"
+    for rel, ext, body, _ in files:
+        if ext in CSS_HTML_EXT:
+            for line in numeric_hits(r"\bfont-size\s*:\s*(\d+(?:\.\d+)?)px\b", body):
+                add(RULE, rel, line, "Schrift kleiner als 11 px")
+        if ext == ".swift":
+            for line in numeric_hits(r"\.system\s*\(\s*size\s*:\s*(\d+(?:\.\d+)?)\b", body):
+                add(RULE, rel, line, "Schrift kleiner als 11 pt")
+        if ext in {".dart"} | JS_EXT:
+            for line in numeric_hits(r"\bfontSize\s*:\s*(\d+(?:\.\d+)?)\b", body):
+                add(RULE, rel, line, "Schrift kleiner als 11")
+
+    RULE = "AD10"
+    for rel, ext, body, _ in files:
+        patterns = []
+        if rel == "Info.plist" or rel.endswith("/Info.plist"):
+            patterns.append(r"<key>\s*UIUserInterfaceStyle\s*</key>\s*<string>\s*Light\s*</string>")
+        if ext == ".swift":
+            patterns += [r"\.preferredColorScheme\s*\(\s*\.light\s*\)", r"\boverrideUserInterfaceStyle\s*=\s*\.light\b"]
+        if ext in JS_EXT:
+            patterns.append(r"\bnativeTheme\.themeSource\s*=\s*['\"]light['\"]")
+        if ext == ".dart":
+            patterns.append(r"\bthemeMode\s*:\s*ThemeMode\.light\b")
+        for pattern in patterns:
+            for line in occurrences(pattern, body, re.I):
+                add(RULE, rel, line, "Dark Mode ausgeschaltet")
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or not os.path.isdir(sys.argv[1]):
+        print("Verwendung: check-apple-design <projektverzeichnis>", file=sys.stderr)
+        return 2
+    project = os.path.abspath(sys.argv[1])
+    exclusions = FileExclusions(project)
+    files = list(paths(project, exclusions))
+    exclusions.announce()
+    if not any(ext in UI_EXT or rel == "tauri.conf.json" for rel, ext, _, _ in files):
+        print("ok       kein UI-Code gefunden")
+        return 0
+    scan(files)
+    global RULE
+    for rule in ("AD1", "AD2", "AD3", "AD4", "AD5", "AD6", "AD7", "AD9", "AD10"):
+        RULE = rule
+        for rel, line, detail in HITS[rule][:10]:
+            finding(f"{rel}:{line}: {detail} — HIG: {HIG[rule]}. Vertiefung: /apple-design")
+        if len(HITS[rule]) > 10:
+            hint(f"… und {len(HITS[rule]) - 10} weitere — HIG: {HIG[rule]}. Vertiefung: /apple-design")
+    if any(HITS.values()):
+        print(f"{sum(map(len, HITS.values()))} Befund(e).")
+        return 1
+    print("ok       Keine Befunde.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

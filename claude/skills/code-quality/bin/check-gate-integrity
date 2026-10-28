@@ -18,6 +18,7 @@ Git-Zugriffe laufen per subprocess gegen das Projektverzeichnis, ein
 misslungener Aufruf zählt als „kein Befund" undürzt nie.
 
 Ausgenommem werden `vendor/`, `node_modules/`, `var/` und `docs/.guard/`.
+`dateien_aus` gilt hier bewusst nicht: Das Gate bewacht auch ausgeschlossene Dateien.
 
 Regeln:
     G1  PHPStan-Konfiguration (level gesenkt, ignoreErrors/excludePaths gewachsen)
@@ -28,6 +29,7 @@ Regeln:
     G6  CI (.gitlab-ci.yml: allow_failure, geprüfter Job entfernt)
     G7  Makefile (Rezeptzeilen, die Fehler ignorieren)
     G8  PHP-Code in src/ (Platzhalter/TODO, leerer catch-Block)
+    G9  Neue Abschaltungen in .ai/guard-profile.yml
 
 Ausnahme: Enthält ein Commit im Bereich <base>..HEAD eine Zeile
 `Guard-Ausnahme: …`, werden alle Befunde dieses Laufs zu Hinweisen und der
@@ -44,6 +46,10 @@ import os
 import re
 import subprocess
 import sys
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from guard_profile import Profile
@@ -491,6 +497,36 @@ def part_g8(rel: str, after: str, added) -> None:
         note(f"{rel}: keine Platzhalter, keine leeren catch-Blöcke")
 
 
+def part_g9(rel: str, before: str, after: str) -> None:
+    global RULE
+    RULE = "G9"
+    if yaml is None:
+        hint(f"{rel}: PyYAML fehlt — Profiländerungen nicht messbar")
+        return
+    def entries(source, key):
+        try:
+            data = yaml.safe_load(source) or {}
+        except yaml.YAMLError:
+            return []
+        return data.get(key) or [] if isinstance(data, dict) else []
+    old = {e.get("check") for e in entries(before, "checks_aus") if isinstance(e, dict)}
+    advisory = set(os.environ.get("GUARD_ADVISORY_CHECKS", "web-hardening legal apple-design").split())
+    for entry in entries(after, "checks_aus"):
+        if not isinstance(entry, dict):
+            continue
+        check = entry.get("check")
+        if check and check not in old:
+            message = f"{rel}: neuer checks_aus-Eintrag für {check}"
+            if check in advisory:
+                hint(message + " (beratender Check)")
+            else:
+                finding(message)
+    old_files = {repr(e) for e in entries(before, "dateien_aus") if isinstance(e, dict)}
+    for entry in entries(after, "dateien_aus"):
+        if isinstance(entry, dict) and repr(entry) not in old_files:
+            hint(f"{rel}: neuer dateien_aus-Eintrag für {entry.get('pfad') or entry.get('muster')}")
+
+
 # --- Hauptprogramm ------------------------------------------------------
 
 def main() -> int:
@@ -574,6 +610,8 @@ def main() -> int:
             part_g6(path, before, after, added)
         if name.lower() == "makefile":
             part_g7(path, after, added)
+        if path == ".ai/guard-profile.yml":
+            part_g9(path, before, after)
 
     nfind = invalid
 
@@ -590,7 +628,7 @@ def main() -> int:
 
     for typ, msg in results:
         if typ == "finding":
-            match = re.match(r"\[gate-integrity/(G[1-8])\] ([^:]+):", msg)
+            match = re.match(r"\[gate-integrity/(G[1-9])\] ([^:]+):", msg)
             key = match.group(1) if match else ""
             targets = exception_targets.get(msg, [match.group(2) if match else ""])
             reasons = []

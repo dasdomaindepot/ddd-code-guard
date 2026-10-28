@@ -43,6 +43,7 @@ rather than improvising:
 | `versions` | PHP (Dockerfile) and Symfony (`composer.lock`) against endoflife.date: out of security support is a finding, end of support within 6 months a hint; cached for 7 days, no network is never red; `composer outdated --direct --major-only` in the running container as hints | `bin/check-versions` (blocking, python3) |
 | `npm-audit`, `npm-lint`, `npm-typecheck`, `npm-test`, `npm-build` | Frontend | `package.json` scripts |
 | `web-hardening` | Security headers including opt-in CSP guidance, robots.txt, sitemap, compression, cache headers of the running local instance | `bin/check-web-hardening` (advisory) |
+| `apple-design` | Statische Apple-HIG-Muster in Web- und App-Code; alle Befunde bleiben dauerhaft Hinweise. Optionaler Vertiefungs-Skill: [dickwu/apple-design-skill](https://github.com/dickwu/apple-design-skill). Das semantische Review prüft UI-Diffs ergänzend auf Achse 12. | `bin/check-apple-design` (advisory, python3) |
 | `app-static` | S11 meldet neue zustandsändernde Controller-Routen ohne `methods` als Befund. H2 meldet neues `app.flashes|raw`, H11 neue HTML-Sinks mit `data-*`-Werten als Befund; Bestand bleibt Hinweis. H13 weist auf öffentliche Token-Routen mit Datensatzsuche hin. | `bin/check-app-static` (Befunde und Hinweise; python3 + PyYAML) |
 | `house-rules` | Rules learned in operation, no running instance. R1: phpcs ruleset that does not fit phpcs 4 (`exclude-pattern type="relative"` silently ignored, comma-separated array properties, Slevomat sniffs without `slevomat/coding-standard` installed); R2: no unescaped `$NAME` in `.env` values (Docker Compose interpolates and truncates silently); R3: `ENV TZ=Europe/Berlin` in the PHP Dockerfile plus a matching `date.timezone`; R4: `trusted_proxies` behind a reverse proxy plus nginx `real_ip_header` (no fixed CIDR/`private_ranges`, no `%env(default::…)%`, no `x-forwarded-host`/`-prefix`); R5: GitLab deploy jobs whose `needs` skip the test jobs; R6: `composer.lock` tracked and the Composer platform matching the Dockerfile PHP version; R7: Messenger `failure_transport` (finding), `max_retries` and worker limits (hints); R8: cron commands without a lock (hint); R9: `DATABASE_URL` as `root` in production files (finding); R10: compose services without healthcheck, upload directories without a volume (hints) | `bin/check-house-rules` (blocking, python3) |
 | `symfony-lint` | Read-only Symfony self-checks in the running `php` container: `lint:container`, `lint:twig`, `lint:yaml --parse-tags`, Doctrine mapping, and schema drift when all migrations are applied (entity changed without a migration); pending local migrations are a hint | `bin/check-symfony-lint` (blocking, python3, running container) |
@@ -199,7 +200,7 @@ agent (`opencode`, `claude` or `none`) write the report text and commits only
 per expensive check (`--expensive-timeout N`, `0` = unlimited) and no overall
 limit (`--guard-timeout N` to set one).
 
-### Project profile for web checks
+### Project profile
 
 `.ai/guard-profile.yml` can hold justified exceptions (`ausnahmen:` with
 `check`, optional `befund`, `pfad`/`muster`, mandatory `grund`, optional
@@ -211,6 +212,10 @@ protection findings are skipped with a hint, accessibility and favicons stay
 active. A stack trace on the error page is only a hint while the local instance
 runs in Symfony dev mode. Keys and examples:
 `claude/skills/code-quality/references/project-profile.md`.
+`checks_aus` disables whole checks with a reason; `dateien_aus` excludes
+project files from file-based checks and semantic review. `secrets` and
+`gate-integrity` always inspect them. New blocking-check disablements are
+guarded by gate-integrity rule G9.
 
 ### Policy
 

@@ -109,6 +109,10 @@ mit `bin/guard-profile-draft` erzeugt werden kann.
 
 ## Achsen
 
+Achse 12 (Apple HIG) ist bei UI-Diffs beratend. Ihre LOW-Hinweise und ein
+fehlender optionaler Skill ändern das Verdikt nie. Fehlt der Skill, lautet
+der Grund „nicht geprüft — Skill apple-design nicht installiert“.
+
 Jede Achse bekommt genau einen Status. Eine Achse, die nicht gelaufen ist, ist
 nie `pass`.
 

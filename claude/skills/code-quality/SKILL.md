@@ -95,7 +95,9 @@ weil Fehlalarme möglich sind: SQL mit eingesetzter Variable (ASVS 1.2.4), `|raw
 `md5`/`sha1`/`rand` für Sicherheitszwecke, `eval`/`exec`/`shell_exec` und `unserialize`
 ohne `allowed_classes`, `outline: none` ohne `:focus-visible`, Animationen ohne
 `prefers-reduced-motion`, `tsconfig.json` ohne `strict`. Einzeln fahrbar:
-`bin/check-app-static . origin/develop`. S11 meldet neue Controller-Routen ohne
+`bin/check-app-static . origin/develop`. Der dauerhaft beratende
+`bin/check-apple-design .` prüft Apple-HIG-Muster in UI-Quelltexten; Befunde
+werden als WARN protokolliert und blockieren nie. S11 meldet neue Controller-Routen ohne
 `methods`, deren Aktion `remove()`, `persist()`, `flush()` oder Mailversand
 aufruft, als Befund. Bestand ist ein Hinweis.
 
@@ -397,7 +399,9 @@ Weg steht in `references/frontend.md`.
    der Werkzeuge und `CLAUDE.md`/`AGENTS.md` auf Regeln ohne Durchsetzung.
 4. **Semantisch prüfen.** Erst das Projektprofil (`.ai/guard-profile.yml`, siehe
    `references/project-profile.md`), dann die Achsen aus `references/semantic-review.md`,
-   ausschließlich auf dem Diff. Die Bereichs-Referenzen unten liest du dabei,
+   ausschließlich auf dem Diff. Achse 12 prüft bei UI-Diffs Apple-HIG-Prinzipien
+nur als LOW-Hinweise; ohne optionalen Skill `apple-design` bleibt sie ungeprüft,
+ohne das Verdikt zu ändern. Die Bereichs-Referenzen unten liest du dabei,
    sobald der jeweilige Bereich dran ist — nicht auf Vorrat.
 5. **Policy anwenden.** `guard-policy.yml` entscheidet über das Verdikt, nicht
    dein Gefühl. Ein Projekt darf sie über `.ai/guard-policy.yml` überschreiben.
@@ -592,7 +596,7 @@ Nützlich von Hand: `guard-weekly --status` zeigt, was ein Lauf jetzt täte,
 
 Antworte auf Deutsch.
 
-## Projektbezogene Web-Ausnahmen und interne Werkzeuge
+## Projektprofil: Ausnahmen, Abschaltungen und interne Werkzeuge
 
 Die Web-Checks lesen bei Übergabe des Projektpfads `.ai/guard-profile.yml`.
 `projekt_art: intern` kennzeichnet ein internes Werkzeug hinter SSO: SEO und
@@ -601,3 +605,9 @@ aktiv. `ausnahmen:` mit `check:`, optionalem `befund:`, `pfad:` oder `muster:`
 und verpflichtendem `grund:` gelten für einzelne Check-Befunde. Ablaufdatum
 und Dev-Bindung sind möglich. Format, Beispiele und alle stabilen
 Befund-Schlüssel stehen in `references/project-profile.md`.
+`checks_aus` schaltet ganze Checks mit Grund und optionalem Ablaufdatum ab;
+`intern` schaltet `apple-design` implizit ab. `dateien_aus` überspringt
+Dateien mit `muster` oder `pfad` in dateibasierten Checks und allen Achsen des
+semantischen Reviews. `secrets` und `gate-integrity` bleiben davon ausgenommen.
+Im Review-Report die ausgelassenen Dateien und Gründe nennen. Neue
+Abschaltungen blockierender Checks bewacht `gate-integrity` als G9.

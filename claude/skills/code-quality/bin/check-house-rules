@@ -111,6 +111,9 @@ import os
 import re
 import subprocess
 import sys
+from lib.guard_profile import FileExclusions
+
+EXCLUSIONS = None
 
 try:
     import yaml
@@ -170,6 +173,8 @@ def hint(msg: str) -> None:
 # --- Hilfsfunktionen ---------------------------------------------------
 
 def _read_text(path: str):
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
@@ -203,6 +208,8 @@ def _load_phpcs_info(project_path: str):
     """
 
     lock_path = os.path.join(project_path, "composer.lock")
+    if EXCLUSIONS and not EXCLUSIONS.allowed(lock_path):
+        return None, False
     try:
         with open(lock_path, encoding="utf-8") as f:
             lock = json.load(f)
@@ -516,6 +523,8 @@ def _read_framework_trusted_yaml(path: str):
     sind und nicht innerhalb von framework: stehen.
     """
 
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None, None
     try:
         with open(path, encoding="utf-8") as f:
             data = yaml.load(f, Loader=_R4Loader)
@@ -803,6 +812,8 @@ def part_r5_deploy_needs(project_path: str) -> None:
     global RULE
     RULE = "R5"
     ci_path = os.path.join(project_path, ".gitlab-ci.yml")
+    if EXCLUSIONS and not EXCLUSIONS.allowed(ci_path):
+        return
     if not os.path.isfile(ci_path):
         ok("keine .gitlab-ci.yml: Regel R5 entfällt")
         return
@@ -899,6 +910,8 @@ def part_r5_deploy_needs(project_path: str) -> None:
 # --- R6: Composer-Plattform und Lock passen zum Container --------------
 
 def _read_json(path: str):
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
@@ -1102,6 +1115,8 @@ def part_r7_messenger(project_path: str) -> None:
     global RULE
     RULE = "R7"
     messenger_path = os.path.join(project_path, "config", "packages", "messenger.yaml")
+    if EXCLUSIONS and not EXCLUSIONS.allowed(messenger_path):
+        return
     if not os.path.isfile(messenger_path):
         ok("keine messenger.yaml: Regel R7 entfällt")
         return
@@ -1541,6 +1556,7 @@ def part_r10_compose(project_path: str) -> None:
         hint("PyYAML fehlt — Regel R10 nicht gemessen")
         return
 
+    compose_paths = [p for p in compose_paths if not EXCLUSIONS or EXCLUSIONS.allowed(p)]
     services = {}
     try:
         for path in compose_paths:
@@ -1614,11 +1630,13 @@ def part_r10_compose(project_path: str) -> None:
 # --- Hauptprogramm -----------------------------------------------------
 
 def main() -> int:
+    global EXCLUSIONS
     if len(sys.argv) > 2:
         print("Verwendung: check-house-rules [projektverzeichnis]", file=sys.stderr)
         return 2
 
     project_path = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else ".")
+    EXCLUSIONS = FileExclusions(project_path)
     if not os.path.isdir(project_path):
         print(f"{project_path}: Verzeichnis existiert nicht", file=sys.stderr)
         return 2
@@ -1637,6 +1655,7 @@ def main() -> int:
     part_r8_cron_overlap(project_path)
     part_r9_db_root(project_path)
     part_r10_compose(project_path)
+    EXCLUSIONS.announce()
 
     print()
     if findings:

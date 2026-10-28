@@ -9,6 +9,8 @@ Grundlage ist immer der **Diff**, nicht das ganze Projekt:
 `git diff <base>...HEAD` plus die uncommitteten Änderungen. Die Basis und die
 Liste der geänderten Dateien stehen in `docs/.guard/results.json` unter
 `git.base_ref` und `git.changed_files`.
+Lies `.ai/guard-profile.yml` vor allen Achsen: Dateien unter `dateien_aus`
+überspringst du in jeder Achse und nennst Pfad und Grund im Report.
 
 Jeder Befund braucht Pfad, Zeile und eine Severity aus `guard-policy.yml`.
 Ohne Codebeleg für den behaupteten Fehler ist es kein Befund. Eine offene
@@ -485,6 +487,35 @@ sind beim selben Wert ein Befund.
 
 Beleg ist der Ablauf mit zwei gleichzeitigen Requests, nicht die bloße
 Abwesenheit eines Locks.
+
+## Achse 12 — Design nach Apple HIG (nur Hinweise)
+
+Bei `projekt_art: intern` oder einem gültigen `apple-design`-Eintrag in
+`checks_aus` entfällt diese Achse. Im Report steht „im Projekt abgeschaltet:
+<grund>“; ein ausdrücklicher Eintrag hat Vorrang vor `projekt_art: intern`.
+`dateien_aus` gilt für alle Review-Achsen: Ausgeschlossene Dateien nicht
+prüfen und die übersprungenen Pfade mit Grund im Report erwähnen.
+
+Diese Achse läuft, wenn der Diff UI-Dateien berührt: Web, Swift, Flutter,
+React Native, Electron oder Tauri. Ist `apple-design` unter
+`~/.claude/skills/apple-design`, `~/.config/opencode/skills/apple-design` oder
+über das Skill-Werkzeug verfügbar, folge dessen `SKILL.md`: Lade immer
+`accessibility.md`, `layout.md`, `typography.md`, `color.md` und die passende
+Plattformseite (`designing-for-ios.md` oder `designing-for-macos.md`). Ergänze
+je nach Diff passende Seiten aus der Tabelle im Skill; insgesamt höchstens
+ungefähr zehn Dateien. Für Web, Vue und Twig ist `references/cross-platform.md`
+nicht nötig. Dort gelten HIG-Vorgaben als Designprinzipien: Kontrast,
+Touch-Ziele ≥ 44 pt, Typografie, Dark Mode, Bewegung und Fokus.
+
+Nimm `WARN`-Befunde von `apple-design` aus `docs/.guard/results.json` als
+Ausgangspunkt und bestätige sie am Code. Zitiere `datei.md › Abschnitt`.
+Ein Befund trägt `review/A12`, Severity **immer LOW** und die Kennzeichnung
+„Hinweis (Apple HIG)“. Diese Achse erzeugt nie BLOCKER, HIGH oder MEDIUM
+und ändert das Verdikt nie. Formuliere keine Geschmacksurteile ohne HIG-Fundstelle;
+eigene Einschätzungen kennzeichnest du ausdrücklich als solche.
+
+Fehlt der Skill, weise die Achse als „nicht geprüft — Skill apple-design nicht
+installiert“ aus. Das Verdikt bleibt davon unberührt.
 
 ## Was du nicht tust
 

@@ -47,6 +47,9 @@ import json
 import subprocess
 import sys
 from diff_lines import added_lines as shared_added_lines, base_commit
+from lib.guard_profile import FileExclusions
+
+EXCLUSIONS = None
 
 EXCLUDED_PREFIXES = ("vendor/", "node_modules/", "var/", "docs/.guard/")
 
@@ -135,6 +138,8 @@ def git_run(project: str, args) -> str:
 
 
 def read_file(path: str):
+    if EXCLUSIONS and not EXCLUSIONS.allowed(path):
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
@@ -172,7 +177,7 @@ def changed_files(project: str, base: str):
 
     items = []
     for path, unv in entries.items():
-        if not (path.startswith("src/") and path.endswith(".php")):
+        if not (path.startswith("src/") and path.endswith(".php")) or (EXCLUSIONS and not EXCLUSIONS.allowed(os.path.join(project, path))):
             continue
         before = ""
         if not unv:
@@ -199,6 +204,8 @@ def all_src_files(project: str):
             if not fn.endswith(".php"):
                 continue
             full = os.path.join(root, fn)
+            if EXCLUSIONS and not EXCLUSIONS.allowed(full):
+                continue
             rel = os.path.relpath(full, project)
             after = read_file(full)
             after = after if after is not None else ""
@@ -549,6 +556,7 @@ def render_events(path: str, events):
 
 
 def main() -> int:
+    global EXCLUSIONS
     if not (len(sys.argv) == 2 or len(sys.argv) == 3):
         print(
             "Verwendung: check-error-visibility <projektverzeichnis> [<basis-ref>]",
@@ -557,6 +565,7 @@ def main() -> int:
         return 2
 
     project = os.path.abspath(sys.argv[1])
+    EXCLUSIONS = FileExclusions(project)
     basis = sys.argv[2] if len(sys.argv) == 3 else None
 
     if not os.path.isdir(project):
@@ -573,6 +582,7 @@ def main() -> int:
         return 77
 
     analyze(project, base)
+    EXCLUSIONS.announce()
 
     nfind = sum(1 for t, _ in output if t == "finding")
 

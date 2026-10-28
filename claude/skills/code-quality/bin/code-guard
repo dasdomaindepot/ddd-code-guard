@@ -19,7 +19,7 @@
 #
 set -uo pipefail
 
-VERSION="1.28.4"
+VERSION="1.30.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Der Tiefenscan hat einen eigenen, rein statischen Ablauf und verwendet keine
@@ -348,6 +348,31 @@ resolve_npm() {
 }
 resolve_npm
 
+# Legt das Projekt per .nvmrc eine Node-Version fest und hat nvm sie installiert,
+# laufen die `npm run`-Checks mit dieser statt mit dem System-Node. Sonst brach
+# z. B. vitest in einem Projekt mit ERR_REQUIRE_ESM ab (System-Node v18).
+# nvm.sh wird nicht geladen (langsam, verbiegt die Shell), nur der passende
+# Ordner unter $NVM_DIR/versions/node vorn in PATH gesetzt.
+NODE_WHERE=""
+resolve_node_version() {
+    [ -f .nvmrc ] || return
+    local wanted nvm_dir best
+    wanted="$(tr -d '[:space:]' < .nvmrc)"
+    wanted="${wanted#v}"
+    [ -n "$wanted" ] || return
+    nvm_dir="${NVM_DIR:-$HOME/.nvm}/versions/node"
+    [ -d "$nvm_dir" ] || return
+    # "22" passt auf v22.x.y, "22.22.0" nur genau darauf; die höchste gewinnt.
+    best="$(ls -1 "$nvm_dir" 2>/dev/null | grep -E "^v${wanted//./\\.}(\.|$)" | sort -V | tail -1)"
+    if [ -n "$best" ] && [ -x "$nvm_dir/$best/bin/node" ]; then
+        export PATH="$nvm_dir/$best/bin:$PATH"
+        NODE_WHERE="$best laut .nvmrc"
+    else
+        NODE_WHERE=".nvmrc verlangt $wanted, per nvm nicht installiert – System-Node"
+    fi
+}
+resolve_node_version
+
 # ----------------------------------------------------------------- Git-Lage ---
 
 IS_GIT=0
@@ -399,6 +424,7 @@ CHECK_DEFS=(
   "npm-audit|NPM-Sicherheit|security|cheap|$NPM_AUDIT_BIN audit --omit=dev --audit-level=high|npm-audit-bin,file:package-lock.json"
   "auth-policy|Login und Passwoerter|security|cheap|$SCRIPT_DIR/check-auth-policy .|file:config/packages/security.yaml,bin:python3"
   "app-static|Statische Regeln|security|cheap|$SCRIPT_DIR/check-app-static . \"$BASE_REF\"|bin:python3"
+  "apple-design|Apple-Design (HIG)|frontend|cheap|$SCRIPT_DIR/check-apple-design .|bin:python3"
   "house-rules|Hausregeln|config|cheap|$SCRIPT_DIR/check-house-rules .|file:composer.json,bin:python3"
   "secrets|Geheimnisse im Repo|security|normal|$SCRIPT_DIR/check-secrets . \"$BASE_REF\"|bin:python3,bin:git"
   "symfony-lint|Symfony-Selbstpruefung|static|normal|$SCRIPT_DIR/check-symfony-lint .|file:bin/console,bin:python3"
@@ -509,9 +535,27 @@ CHECK_DEFS=(
 # nach Klick (Zwei-Klick-Loesung), Bibliotheken und Schriften kommen lokal.
 # Bewusste Ausnahmen je Host mit Grund in .ai/guard-profile.yml (externe_quellen).
 #
+# apple-design (seit 1.29.0) ist bewusst dauerhaft beratend: HIG-Muster sind
+# Gestaltungshinweise, keine Fehler. Nie scharf schalten.
+#
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.
-ADVISORY_CHECKS=" web-hardening legal "
+ADVISORY_CHECKS=" web-hardening legal apple-design "
+export GUARD_ADVISORY_CHECKS="$ADVISORY_CHECKS"
+GUARD_CHECK_IDS=""
+for def in "${CHECK_DEFS[@]}"; do GUARD_CHECK_IDS+=" ${def%%|*}"; done
+export GUARD_CHECK_IDS
+declare -A DISABLED_CHECKS=()
+PROFILE_PROBLEMS=()
+PROFILE_HINTS=()
+while IFS=$'\t' read -r key value; do
+    case "$key" in
+        PROBLEM) PROFILE_PROBLEMS+=("$value") ;;
+        HINWEIS) PROFILE_HINTS+=("$value") ;;
+        '') ;;
+        *) DISABLED_CHECKS["$key"]="$value" ;;
+    esac
+done < <(python3 "$SCRIPT_DIR/lib/guard_profile.py" checks-aus "$PROJECT_DIR")
 
 # `make coverage-check` haelt eine Mindestschwelle ein, `make coverage` misst nur.
 # Wo die Ratsche existiert, wird sie gefahren -- eine Messung ohne Schwelle kann
@@ -641,7 +685,9 @@ if [ "$LIST_ONLY" -eq 1 ]; then
     echo
     for def in "${CHECK_DEFS[@]}"; do
         IFS='|' read -r id label area cost cmd reqs <<< "$def"
-        if requirement_met "$reqs"; then
+        if [ -n "${DISABLED_CHECKS[$id]:-}" ]; then
+            marker="${C_DIM}abgeschaltet — ${DISABLED_CHECKS[$id]}${C_RESET}"
+        elif requirement_met "$reqs"; then
             marker="${C_GREEN}vorhanden${C_RESET}"
             [ "$cost" = "expensive" ] && marker="${C_GREEN}vorhanden${C_RESET} ${C_DIM}(nur mit --full)${C_RESET}"
         else
@@ -676,6 +722,7 @@ RUN_START=$(date +%s)
     WHERE_LINE=""
     [ -n "$COMPOSER_WHERE" ] && WHERE_LINE="composer: $COMPOSER_WHERE"
     [ -n "$NPM_WHERE" ] && WHERE_LINE="${WHERE_LINE:+$WHERE_LINE · }npm audit: $NPM_WHERE"
+    [ -n "$NODE_WHERE" ] && WHERE_LINE="${WHERE_LINE:+$WHERE_LINE · }node: $NODE_WHERE"
     [ -n "$WHERE_LINE" ] && echo "${C_DIM}$WHERE_LINE${C_RESET}"
     echo
 }
@@ -723,10 +770,25 @@ print_row() {
     [ "$QUIET" -eq 1 ] || printf '  %s%-8s%s %-22s %s\n' "$color" "$status" "$C_RESET" "$label" "${C_DIM}${detail}${C_RESET}"
 }
 
+for problem in "${PROFILE_PROBLEMS[@]}"; do
+    emit "project-profile" "Projektprofil" "config" "FAIL" "" "" "$problem" 1 0
+    print_row "FAIL" "Projektprofil" "$problem"
+done
+for hint in "${PROFILE_HINTS[@]}"; do
+    [ "$QUIET" -eq 1 ] || printf '  Hinweis  Projektprofil: %s\n' "$hint"
+done
+
 for def in "${CHECK_DEFS[@]}"; do
     IFS='|' read -r id label area cost cmd reqs <<< "$def"
 
     if [ -n "$ONLY_CHECKS" ] && [[ ",$ONLY_CHECKS," != *",$id,"* ]]; then
+        continue
+    fi
+
+    if [ -n "${DISABLED_CHECKS[$id]:-}" ]; then
+        note="im Projekt abgeschaltet: ${DISABLED_CHECKS[$id]}"
+        emit "$id" "$label" "$area" "SKIPPED" "$cmd" "" "$note" 0 0
+        print_row "SKIPPED" "$label" "$note"
         continue
     fi
 
