@@ -26,6 +26,11 @@ lokale Instanz umgeschrieben). Jede Verletzung ist ein Befund:
   11. jedes Formularfeld hat eine Beschriftung.
   12. Kein id-Wert kommt mehrfach vor.
 
+Nur Hinweise für indexierbare Seiten: <title> mit weniger als 15 oder mehr als
+60 Zeichen, Meta-Description mit weniger als 70 oder mehr als 160 Zeichen,
+fehlende Open-Graph-Angaben (og:title, og:description, og:image) und ein
+og:image ohne absolute URL. Eine fehlende sitemap.xml meldet web-hardening.
+
 Ignoriert werden <script>, <style>, <template>, <noscript> sowie die
 Symfony-Debug-Toolbar (id mit sfwdt/sfToolbar oder class sf-toolbar) — sie wird
 im Dev-Modus injiziert und ist nicht Teil der App — und alles mit hidden oder
@@ -152,6 +157,7 @@ class PageParser(HTMLParser):
         self.has_title = False
         self.has_meta_description = False
         self.meta_description_content: str | None = None
+        self.open_graph: dict[str, str] = {}
         self.noindex = False
         self.has_viewport = False
         self.viewport_content: str | None = None
@@ -312,6 +318,9 @@ class PageParser(HTMLParser):
                 self.personal_no_autocomplete.append(self._first(attrs, "name") or t)
         elif tag == "meta":
             name = (self._first(attrs, "name") or "").lower()
+            prop = (self._first(attrs, "property") or "").strip().lower()
+            if prop in ("og:title", "og:description", "og:image"):
+                self.open_graph[prop] = (self._first(attrs, "content") or "").strip()
             if name == "description":
                 self.has_meta_description = True
                 self.meta_description_content = self._first(attrs, "content")
@@ -455,6 +464,20 @@ def check_page(path: str, p: PageParser, raw: str = "", https: bool = False) -> 
     # 4. canonical
     if not p.noindex and (not p.has_canonical or not (p.canonical_href or "").strip()):
         finding(f'{path}: <link rel="canonical"> fehlt', "canonical", path)
+    if not p.noindex:
+        title_length = len(p.title_text.strip())
+        if title_length and not 15 <= title_length <= 60:
+            hint(f"{path}: <title> hat {title_length} Zeichen (empfohlen: 15–60)")
+        description_length = len((p.meta_description_content or "").strip())
+        if description_length and not 70 <= description_length <= 160:
+            hint(f"{path}: Meta-Description hat {description_length} Zeichen (empfohlen: 70–160)")
+        missing_og = [key for key in ("og:title", "og:description", "og:image") if not p.open_graph.get(key)]
+        if missing_og:
+            hint(f"{path}: Open Graph fehlt: {', '.join(missing_og)}")
+        image_url = p.open_graph.get("og:image", "")
+        if image_url and not (urllib.parse.urlparse(image_url).scheme in ("http", "https")
+                              and urllib.parse.urlparse(image_url).netloc):
+            hint(f"{path}: og:image ist keine absolute URL")
     # 5. viewport
     if not p.has_viewport:
         finding(f'{path}: <meta name="viewport"> fehlt', "viewport", path)

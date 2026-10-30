@@ -19,7 +19,7 @@
 #
 set -uo pipefail
 
-VERSION="1.30.0"
+VERSION="1.31.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Der Tiefenscan hat einen eigenen, rein statischen Ablauf und verwendet keine
@@ -452,6 +452,7 @@ CHECK_DEFS=(
   "web-resources|Links und Bilder|frontend|normal|$SCRIPT_DIR/check-web-resources $WEB_URL|web-url,bin:python3"
   "third-party|Drittanbieter|legal|normal|$SCRIPT_DIR/check-third-party $WEB_URL .|web-url,bin:python3"
   "browser-audit|Browser-Audit|frontend|expensive|$SCRIPT_DIR/check-browser-audit $WEB_URL|web-url,bin:node"
+  "first-impression|Erster Eindruck (5 Sekunden)|frontend|expensive|$SCRIPT_DIR/check-first-impression $WEB_URL .|web-url,bin:python3"
 )
 
 # Beratende Checks: Ein Befund wird WARN statt FAIL und blockiert nicht.
@@ -540,7 +541,9 @@ CHECK_DEFS=(
 #
 # browser-audit (seit 1.9.0, nur --full): axe-core im echten Browser, "critical"
 # und "serious" blockieren. Lighthouse-Werte sind nur Hinweise.
-ADVISORY_CHECKS=" web-hardening legal apple-design "
+# first-impression (seit 1.31.0, nur --full): LLM-Urteile sind nicht
+# deterministisch -- dauerhaft beratend, niemals scharf schalten.
+ADVISORY_CHECKS=" web-hardening legal apple-design first-impression "
 export GUARD_ADVISORY_CHECKS="$ADVISORY_CHECKS"
 GUARD_CHECK_IDS=""
 for def in "${CHECK_DEFS[@]}"; do GUARD_CHECK_IDS+=" ${def%%|*}"; done

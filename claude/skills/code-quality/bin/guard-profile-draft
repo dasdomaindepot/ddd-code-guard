@@ -389,6 +389,7 @@ def build_yaml(project_path: str) -> str:
         "version: 1",
         "",
         f"projekt_art: {_scalar_or_empty(projekt_art)}  {projekt_art_quelle}",
+        "# angebot: Was wird auf der Startseite angeboten oder verkauft, und für wen?",
         "",
     ]
 

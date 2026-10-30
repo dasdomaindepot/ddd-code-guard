@@ -143,6 +143,44 @@ assert ("img", "http://example.com/a.png") in got and ("form", "http://example.c
 PY
 then echo "FEHLER: mixed_content()" >&2; fail=1; fi
 
+# --- SEO-Hinweise sind pro indexierbarer Seite und niemals Befunde ------
+if ! python3 - "$SCRIPT" <<'PY'
+import contextlib, importlib.machinery, importlib.util, io, sys
+loader = importlib.machinery.SourceFileLoader("cwc_seo", sys.argv[1])
+spec = importlib.util.spec_from_loader("cwc_seo", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+def inspect(title, description, og='', noindex=''):
+    html = (f'<!doctype html><html lang="de"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width"><title>{title}</title>'
+            f'<meta name="description" content="{description}">'
+            f'<meta name="robots" content="{noindex}">'
+            f'<link rel="canonical" href="https://example.com/">{og}</head>'
+            '<body><a href="#main">Zum Inhalt</a><main id="main"><h1>Hallo</h1></main></body></html>')
+    p = m.PageParser(); p.feed(html)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        m.check_page('/', p, html)
+    return out.getvalue(), m.findings
+m.findings = 0
+out, count = inspect('Kurz', 'Kurz')
+assert count == 0, out
+assert '<title> hat 4 Zeichen' in out, out
+assert 'Meta-Description hat 4 Zeichen' in out, out
+assert 'Open Graph fehlt: og:title, og:description, og:image' in out, out
+m.findings = 0
+out, count = inspect('T' * 61, 'D' * 161,
+    '<meta property="og:title" content="Hallo"><meta property="og:description" content="Beschreibung"><meta property="og:image" content="/bild.png">')
+assert count == 0, out
+assert '<title> hat 61 Zeichen' in out and 'Meta-Description hat 161 Zeichen' in out, out
+assert 'og:image ist keine absolute URL' in out, out
+assert 'Open Graph fehlt' not in out, out
+m.findings = 0
+out, count = inspect('Kurz', 'Kurz', noindex='noindex')
+assert count == 0 and 'Open Graph' not in out and 'Zeichen' not in out, out
+PY
+then echo "FEHLER: SEO-Hinweise" >&2; fail=1; fi
+
 # --- nicht erreichbar: Port ohne Server ----------------------------------
 dead_port="$(free_port)"
 run_script "http://127.0.0.1:$dead_port"

@@ -265,7 +265,10 @@ Mixed Content (`http://`-Ressourcen oder Formularziele auf einer https-Seite), g
 gültiges JSON-LD mit `@context`/`@type`, und kein `<title>` oder keine Description
 doppelt über mehrere Seiten. Nur Hinweise: fehlender Skip-Link (einmal pro Lauf),
 Überschriften-Sprünge (h2 → h4), Felder für persönliche Daten ohne `autocomplete`
-(WCAG 1.3.5). Die Symfony-Toolbar
+(WCAG 1.3.5), Titel außerhalb 15–60 Zeichen, Description außerhalb 70–160 Zeichen,
+fehlende `og:title`, `og:description`, `og:image` und eine nicht absolute `og:image`-URL.
+Eine fehlende `sitemap.xml` meldet bereits `web-hardening` als Hinweis.
+Diese SEO-Hinweise gelten nur für indexierbare Seiten. Die Symfony-Toolbar
 und alles mit `hidden` oder `aria-hidden="true"` werden ausgeblendet (ein
 Honeypot-Feld gehört in ein solches Element). Seiten mit
 `<meta name="robots" content="noindex">` brauchen keine Description und kein
@@ -275,6 +278,19 @@ und stehen auf `MISSING`. Anders als `web-hardening` und `legal` blockiert diese
 Check sofort: Das sind Regeln, die seit zwanzig Jahren gelten und seit
 28.06.2025 nach BFSG für viele Seiten Pflicht sind. Einzeln fahrbar:
 `bin/check-web-content https://test.de`.
+
+**Erster Eindruck** (`first-impression`, seit 1.31.0, **dauerhaft beratend**, nur
+mit `--full`): Öffnet die Startseite in Chrome ohne Scrollen bei 1366×768 und
+390×844 (mobil DPR 2). Ein Vision-Modell liest beide Screenshots blind: Ist in
+5–10 Sekunden klar, was angeboten wird, für wen und welcher Schritt folgt?
+Falls `angebot:` im Projektprofil steht, folgt ein Soll-Ist-Vergleich mit
+Vorschlägen für Headline, Subline und CTA. Screenshots liegen unter
+`docs/.guard/first-impression/`. Einrichtung über `GUARD_VISION_URL` (Base-URL
+einschließlich `/v1`), `GUARD_VISION_MODEL` (ein beliebiges Vision-fähiges Modell)
+und bei Bedarf `GUARD_VISION_KEY`. Alternativ stehen dieselben KEY=VALUE-Zeilen
+in `${XDG_CONFIG_HOME:-~/.config}/ddd-code-guard/vision.env`; ENV hat Vorrang.
+Ohne URL oder Modell ist der Check nicht messbar. Einzeln fahrbar:
+`bin/check-first-impression <web-url> <projektverzeichnis>`.
 
 **Login und Passwörter** (`auth-policy`, seit 26.09.2026, **blockierend**): Liest
 `config/packages/security.yaml` (ohne `when@…`-Blöcke) und `src/`. Jede Firewall mit
@@ -403,6 +419,8 @@ Weg steht in `references/frontend.md`.
 nur als LOW-Hinweise; ohne optionalen Skill `apple-design` bleibt sie ungeprüft,
 ohne das Verdikt zu ändern. Die Bereichs-Referenzen unten liest du dabei,
    sobald der jeweilige Bereich dran ist — nicht auf Vorrat.
+   Bei Änderungen an Startseite, Hero oder Landingpages die 5-Sekunden-Regel
+   mitdenken: Angebot, Zielgruppe und nächster Schritt müssen sofort erkennbar sein.
 5. **Policy anwenden.** `guard-policy.yml` entscheidet über das Verdikt, nicht
    dein Gefühl. Ein Projekt darf sie über `.ai/guard-policy.yml` überschreiben.
 6. **Report schreiben** nach `references/report.md`.
@@ -606,7 +624,10 @@ und verpflichtendem `grund:` gelten für einzelne Check-Befunde. Ablaufdatum
 und Dev-Bindung sind möglich. Format, Beispiele und alle stabilen
 Befund-Schlüssel stehen in `references/project-profile.md`.
 `checks_aus` schaltet ganze Checks mit Grund und optionalem Ablaufdatum ab;
-`intern` schaltet `apple-design` implizit ab. `dateien_aus` überspringt
+`intern` schaltet `apple-design` und `first-impression` implizit ab. Das freie
+Feld `angebot:` beschreibt in einem Satz, was die Startseite verkauft oder
+anbietet; ohne dieses Feld entfällt nur der Soll-Ist-Vergleich.
+`dateien_aus` überspringt
 Dateien mit `muster` oder `pfad` in dateibasierten Checks und allen Achsen des
 semantischen Reviews. `secrets` und `gate-integrity` bleiben davon ausgenommen.
 Im Review-Report die ausgelassenen Dateien und Gründe nennen. Neue

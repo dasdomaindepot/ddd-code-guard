@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""check-first-impression — Fünf-Sekunden-Regel für den ersten Bildschirm prüfen.
+
+Aufgerufen vom Code Guard (Check "first-impression", nur mit --full), auch einzeln:
+    check-first-impression <web-url> <projektverzeichnis>
+
+Desktop (1366×768) und Mobil (390×844, DPR 2) werden ohne Scrollen beurteilt.
+Ein Vision-Modell liest beide Ansichten blind; mit `angebot` im Projektprofil
+folgt ein textbasierter Soll-Ist-Vergleich. Das Urteil bleibt beratend.
+
+Exit-Codes: 0 keine Befunde, 1 Befunde, 2 Nutzungsfehler, 77 nicht messbar.
+"""
+
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from guard_profile import Profile
+
+
+def vision_config():
+    """ENV hat Vorrang vor der optionalen KEY=VALUE-Datei."""
+    conf = {}
+    file = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "ddd-code-guard" / "vision.env"
+    if file.is_file():
+        for line in file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() in ("GUARD_VISION_URL", "GUARD_VISION_KEY", "GUARD_VISION_MODEL"):
+                conf[key.strip()] = value.strip().strip('"\'')
+    return {key: os.environ.get(key, conf.get(key, "")) for key in ("GUARD_VISION_URL", "GUARD_VISION_KEY", "GUARD_VISION_MODEL")}
+
+
+def parse_json(content):
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    content = str(content).strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, re.I | re.S)
+    return json.loads(match.group(1) if match else content)
+
+
+def chat(config, content):
+    payload = {
+        "model": config["GUARD_VISION_MODEL"],
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.2,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    request = urllib.request.Request(
+        config["GUARD_VISION_URL"].rstrip("/") + "/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + config["GUARD_VISION_KEY"]} if config["GUARD_VISION_KEY"] else {})},
+    )
+    with urllib.request.urlopen(request, timeout=300, context=ssl.create_default_context()) as response:
+        data = json.load(response)
+    return parse_json(data["choices"][0]["message"]["content"])
+
+
+def screenshots(url, project):
+    folder = project / "docs" / ".guard" / "first-impression"
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in ("desktop", "mobil"):
+        for ext in (".png", ".jpg", ".jpeg"):
+            (folder / f"{name}{ext}").unlink(missing_ok=True)
+    supplied = os.environ.get("GUARD_FIRST_IMPRESSION_SCREENSHOTS")
+    if supplied:
+        for name in ("desktop", "mobil"):
+            original = next((Path(supplied) / f"{name}{ext}" for ext in (".png", ".jpg", ".jpeg") if (Path(supplied) / f"{name}{ext}").is_file()), None)
+            if original is None:
+                raise RuntimeError(f"{name}: Test-Screenshot fehlt")
+            shutil.copyfile(original, folder / original.name)
+    else:
+        if not shutil.which("node"):
+            raise RuntimeError("Node.js nicht gefunden")
+        chrome = os.environ.get("GUARD_CHROME") or next((shutil.which(name) for name in ("google-chrome", "chromium", "chromium-browser") if shutil.which(name)), None)
+        if not chrome:
+            raise RuntimeError("Chrome/Chromium nicht gefunden (GUARD_CHROME setzen)")
+        deps = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "code-guard" / "browser-audit-1"
+        if not (deps / "node_modules" / "playwright-core").is_dir():
+            deps.mkdir(parents=True, exist_ok=True)
+            (deps / "package.json").write_text('{"name":"code-guard-first-impression","private":true,"dependencies":{"playwright-core":"1.63.0"}}', encoding="utf-8")
+            subprocess.run(["npm", "install", "--silent", "--no-audit", "--no-fund"], cwd=deps, check=True, timeout=300, stdout=subprocess.DEVNULL)
+        env = {**os.environ, "GUARD_CHROME": chrome, "GUARD_BROWSER_DEPS": str(deps)}
+        result = subprocess.run(["node", str(Path(__file__).resolve().parent / "lib" / "first-impression.mjs"), url, str(folder)], env=env, capture_output=True, text=True, timeout=120)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "Screenshot fehlgeschlagen")
+    return {name: next(folder / f"{name}{ext}" for ext in (".png", ".jpg", ".jpeg") if (folder / f"{name}{ext}").is_file()) for name in ("desktop", "mobil")}
+
+
+def main():
+    if len(sys.argv) != 3 or not re.match(r"^https?://[^/]+", sys.argv[1]) or not Path(sys.argv[2]).is_dir():
+        print("Verwendung: check-first-impression <web-url> <projektverzeichnis>", file=sys.stderr)
+        return 2
+    url, project = sys.argv[1], Path(sys.argv[2])
+    profile = Profile(str(project), "first-impression")
+    if reason := profile.disabled_checks().get("first-impression"):
+        print(f"Hinweis  first-impression abgeschaltet: {reason}")
+        return 0
+    config = vision_config()
+    if not config["GUARD_VISION_URL"] or not config["GUARD_VISION_MODEL"]:
+        print("Nicht messbar: GUARD_VISION_URL und GUARD_VISION_MODEL per ENV oder ${XDG_CONFIG_HOME:-~/.config}/ddd-code-guard/vision.env setzen (GUARD_VISION_KEY falls nötig).")
+        return 77
+    try:
+        images = screenshots(url, project)
+        readings = {}
+        for name, path in images.items():
+            print(f"Screenshot {name}: {path}")
+            if path.stat().st_size > 900000:
+                raise RuntimeError(f"{path.name}: Bild größer als 900 KiB")
+            mime = "image/png" if path.suffix == ".png" else "image/jpeg"
+            reading = chat(config, [
+                {"type": "text", "text": "Du bist ein unvoreingenommener Erstbesucher und kennst die Firma nicht. Beurteile ausschließlich den Screenshot des ersten Bildschirms ohne Scrollen: Was wird angeboten oder verkauft, für wen, und was sollst du als Nächstes tun? Ignoriere Cookie-Banner, erwähne aber, wenn sie Inhalt verdecken. Antworte nur als JSON mit angebot (ein Satz), zielgruppe, naechster_schritt, sicherheit (0–100), was_fehlt."},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"}},
+            ])
+            readings[name] = reading
+            print(f"{name.capitalize()}: Angebot: {reading.get('angebot', '—')}; Zielgruppe: {reading.get('zielgruppe', '—')}; nächster Schritt: {reading.get('naechster_schritt', '—')}; Sicherheit: {reading.get('sicherheit', '—')} %; es fehlt: {reading.get('was_fehlt', '—')}")
+        findings = [name for name, r in readings.items() if float(r.get("sicherheit", 0)) < 70 or not str(r.get("naechster_schritt", "")).strip()]
+        if profile.angebot:
+            comparison = chat(config, "Soll-Angebot: " + profile.angebot + "\nBlind-Lesarten: " + json.dumps(readings, ensure_ascii=False) + "\nVergleiche nur diese Texte. Maßstab: passt=ja, wenn jede Lesart die Kernleistung und die Zielgruppe des Soll-Angebots sinngemäß trifft — fehlende Details, Preise oder Referenzen sind kein Grund für teilweise. passt=teilweise, wenn Kernleistung oder Zielgruppe nur ungefähr oder nur in einer Ansicht stimmen; passt=nein, wenn eine Lesart etwas anderes beschreibt. Antworte nur als JSON mit passt (ja|teilweise|nein), begruendung, vorschlag_headline, vorschlag_subline, vorschlag_cta.")
+            reason = comparison.get("begruendung") or comparison.get("begründung") or "—"
+            print(f"Vergleich: {comparison.get('passt', '—')} — {reason}")
+            print(f"Vorschlag Headline: {comparison.get('vorschlag_headline', '—')}; Subline: {comparison.get('vorschlag_subline', '—')}; CTA: {comparison.get('vorschlag_cta', '—')}")
+            if comparison.get("passt") != "ja":
+                findings.append("Vergleich passt nicht")
+        else:
+            print("Hinweis  Im Projektprofil angebot: ergänzen; Soll-Ist-Vergleich entfällt.")
+        if findings:
+            print("BEFUND   5-Sekunden-Regel: " + ", ".join(findings))
+            return 1
+        print("Keine Befunde.")
+        return 0
+    except (OSError, RuntimeError, subprocess.SubprocessError, urllib.error.URLError, ValueError, KeyError, IndexError, TypeError, StopIteration) as exc:
+        print(f"Nicht messbar: {exc}")
+        return 77
+
+
+if __name__ == "__main__":
+    sys.exit(main())

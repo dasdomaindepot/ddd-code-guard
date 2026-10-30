@@ -7,7 +7,7 @@ import re
 import os
 import sys
 
-KNOWN_CHECKS = set("composer-validate composer-audit versions npm-audit auth-policy app-static apple-design house-rules secrets symfony-lint gate-integrity error-visibility migrations phpcs phpstan deptrac lint npm-lint npm-typecheck npm-test test coverage infection e2e npm-build web-hardening legal web-exposure web-content form-protection favicon web-resources third-party browser-audit".split())
+KNOWN_CHECKS = set("composer-validate composer-audit versions npm-audit auth-policy app-static apple-design first-impression house-rules secrets symfony-lint gate-integrity error-visibility migrations phpcs phpstan deptrac lint npm-lint npm-typecheck npm-test test coverage infection e2e npm-build web-hardening legal web-exposure web-content form-protection favicon web-resources third-party browser-audit".split())
 
 
 def is_dev(headers=(), body=""):
@@ -24,6 +24,7 @@ class Profile:
         self.check = check
         self.project_supplied = bool(project)
         self.art = None
+        self.angebot = None
         self.exceptions = []
         self.checks_out = []
         self.files_out = []
@@ -47,6 +48,7 @@ class Profile:
         if not isinstance(data, dict):
             return
         self.art = data.get("projekt_art")
+        self.angebot = data.get("angebot") if isinstance(data.get("angebot"), str) and data["angebot"].strip() else None
         for field, target in (("checks_aus", self.checks_out), ("dateien_aus", self.files_out)):
             for entry in data.get(field) or []:
                 if not isinstance(entry, dict):
@@ -92,6 +94,8 @@ class Profile:
         result = {str(entry["check"]): entry["grund"].strip() for entry in self.checks_out}
         if self.art == "intern" and "apple-design" not in result:
             result["apple-design"] = "projekt_art: intern — kein Design-Anspruch"
+        if self.art == "intern" and "first-impression" not in result:
+            result["first-impression"] = "projekt_art: intern — kein öffentliches Angebot"
         return result
 
     def file_excluded(self, rel_path):
